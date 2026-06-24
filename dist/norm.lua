@@ -2250,6 +2250,17 @@ function NormNanosAdapter:default_provider()
     return nil; -- fall back to the built-in provider
 end
 
+--- Nanos binds parameters with NUMBERED placeholders (`:0`, `:1`, ... 0-indexed),
+--- not `?`. Norm's SQL builder emits `?`, so the adapter rewrites them in order.
+--- Safe because the builder only ever emits `?` as a placeholder (never inside a
+--- string literal; identifiers are backtick-quoted).
+---@param query string
+---@return string
+local function to_nanos_placeholders(query)
+    local i = -1;
+    return (query:gsub("%?", function() i = i + 1; return ":" .. i; end));
+end
+
 --- Internal: run a SELECT (async if available, else synchronous).
 ---@param db table
 ---@param query string
@@ -2257,6 +2268,7 @@ end
 ---@param callback NormQueryCallback
 local function do_select(db, query, params, callback)
     params = params or {};
+    query = to_nanos_placeholders(query);
     if (type(db.SelectAsync) == "function") then
         -- Nanos signature: SelectAsync(query, callback?, parameters...) -- params are VARARGS.
         db:SelectAsync(query, function(rows) callback(nil, rows or {}); end, table.unpack(params));
@@ -2273,6 +2285,7 @@ end
 ---@param callback fun(err: any, affected?: number)
 local function do_execute(db, query, params, callback)
     params = params or {};
+    query = to_nanos_placeholders(query);
     if (type(db.ExecuteAsync) == "function") then
         -- Nanos signature: ExecuteAsync(query, callback?, parameters...) -- params are VARARGS.
         db:ExecuteAsync(query, function(affected) callback(nil, affected); end, table.unpack(params));
