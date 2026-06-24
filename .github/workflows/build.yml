@@ -1,0 +1,79 @@
+name: Build dist
+
+# Triggers on direct push to master AND on a PR merged into master.
+# (Merging a PR into master is itself a push to master, so the push
+#  trigger already covers it; the pull_request block is kept so the
+#  build also shows up as a check on the PR itself.)
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+    types: [closed]
+
+# Allow the workflow to commit the built dist/ back to the repo.
+permissions:
+  contents: write
+
+# Prevent two concurrent builds on the same ref (e.g. fast push + merge).
+concurrency:
+  group: build-dist-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    # Run only when ALL of the following hold:
+    #   - the event is a push to master, OR a PR that was actually merged
+    #     (not just closed without merging);
+    #   - the triggering commit was NOT authored by the bot itself.
+    # The author check is the primary guard against the bot re-triggering
+    # itself; the "[skip ci]" in the commit message is a second safety net.
+    if: >
+      (
+        github.event_name == 'push' ||
+        (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
+      ) &&
+      github.actor != 'github-actions[bot]'
+
+    steps:
+      # 1. Checkout WITH submodules (the build needs them).
+      #    Submodules are private, so we authenticate with a PAT that has
+      #    read access to those repositories. Store it as a repo secret
+      #    named SUBMODULES_PAT (Settings > Secrets and variables > Actions).
+      - name: Checkout (with private submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULES_PAT }}
+          fetch-depth: 0
+
+      # 2. Install Lua 5.4
+      - name: Install Lua 5.4
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lua5.4
+          lua5.4 -v
+
+      # 3. Run the build
+      - name: Run build.lua
+        run: lua5.4 build.lua
+
+      # 4. Commit + push dist/ only if it actually changed
+      - name: Commit dist/ if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Stage only the dist/ folder
+          git add dist/
+
+          # If nothing changed, exit cleanly (no empty commit)
+          if git diff --cached --quiet; then
+            echo "dist/ unchanged, nothing to commit."
+            exit 0
+          fi
+
+          git commit -m "build(dist): rebuild distribution files [skip ci]"
+          git push
