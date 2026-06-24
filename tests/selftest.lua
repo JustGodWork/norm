@@ -252,5 +252,98 @@ coroutine.wrap(function()
     check("await on auto-wrapped custom promise", r and r.name == "Z", r and r.name);
 end)();
 
+print("== Test group 8: relations (belongs_to / has_many, lazy + eager) ==");
+-- A mock that routes SELECTs by table name (returns all rows for that table;
+-- the relation attach logic filters by key, so this exercises it faithfully).
+local Routed = class.extend("RoutedAdapter", orm.Adapter);
+function Routed:__init(opts)
+    orm.Adapter.__init(self, opts);
+    self.rows = {};       -- table -> rows
+    self.queries = {};    -- recorded SELECTs
+end
+function Routed:raw_query(q, p, cb)
+    self.queries[#self.queries + 1] = q;
+    local tbl = q:match("FROM `([%w_]+)`");
+    local rows = self.rows[tbl] or {};
+    -- Honor a simple single-column WHERE (`= ?` or `IN (?, ...)`) via the params,
+    -- so lazy loads (which rely on the DB's WHERE) behave realistically.
+    local col = q:match("WHERE `([%w_]+)`");
+    if (col and #p > 0) then
+        local set = {};
+        for i = 1, #p do set[p[i]] = true; end
+        local filtered = {};
+        for i = 1, #rows do if (set[rows[i][col]]) then filtered[#filtered + 1] = rows[i]; end end
+        rows = filtered;
+    end
+    cb(nil, rows);
+end
+function Routed:raw_execute(q, p, cb)
+    self.queries[#self.queries + 1] = q;
+    cb(nil, { affectedRows = 1, insertId = 1 });
+end
+
+local rmock = Routed({ dialect = "mysql" });
+rmock.rows.users = { { id = 1, name = "Alice" }, { id = 2, name = "Bob" } };
+rmock.rows.posts = {
+    { id = 10, user_id = 1, title = "A1" },
+    { id = 11, user_id = 1, title = "A2" },
+    { id = 12, user_id = 2, title = "B1" },
+};
+
+local rdb = orm.new({ adapter = rmock, promise = orm.promise.builtin() });
+local Users = rdb:define("users", {
+    id    = orm.types.id(),
+    name  = orm.types.string({ length = 32 }),
+    posts = orm.types.hasMany("posts", { key = "user_id" }),
+});
+local Posts = rdb:define("posts", {
+    id      = orm.types.id(),
+    title   = orm.types.string({ length = 120 }),
+    user_id = orm.types.integer(),
+    author  = orm.types.belongsTo("users", { key = "user_id" }),
+});
+
+-- relations are separated from columns
+check("relation is not a column", Users.columns_by_name.posts == nil and Users.relations.posts ~= nil);
+check("create table omits relations", (function()
+    rdb:sync();
+    for _, q in ipairs(rmock.queries) do
+        if (q:find("CREATE TABLE", 1, true) and q:find("users", 1, true)) then
+            return q:find("posts", 1, true) == nil;
+        end
+    end
+    return false;
+end)());
+
+-- eager belongs_to: posts -> author, batched (1 main + 1 author query)
+rmock.queries = {};
+local posts;
+Posts:query():include("author"):all():next(function(r) posts = r; end);
+check("eager belongs_to count", posts and #posts == 3, posts and #posts);
+check("eager belongs_to attaches author", posts and posts[1].author and posts[1].author.name == "Alice",
+    posts and posts[1].author and posts[1].author.name);
+check("eager belongs_to second user", posts and posts[3].author and posts[3].author.name == "Bob");
+check("eager belongs_to has no N+1 (2 queries)", #rmock.queries == 2, #rmock.queries);
+
+-- eager has_many: users -> posts, batched (1 main + 1 posts query)
+rmock.queries = {};
+local users;
+Users:query():include("posts"):all():next(function(r) users = r; end);
+check("eager has_many groups children", users and #users[1].posts == 2 and #users[2].posts == 1,
+    users and (#users[1].posts .. "/" .. #users[2].posts));
+check("eager has_many has no N+1 (2 queries)", #rmock.queries == 2, #rmock.queries);
+
+-- lazy belongs_to
+local post = Posts:wrap({ id = 10, user_id = 1, title = "A1" });
+local author;
+post:load("author"):next(function(a) author = a; end);
+check("lazy belongs_to loads + caches", author and author.name == "Alice" and post.author == author);
+
+-- lazy has_many
+local user = Users:wrap({ id = 1, name = "Alice" });
+local ulist;
+user:load("posts"):next(function(l) ulist = l; end);
+check("lazy has_many loads + caches", ulist and #ulist == 2 and user.posts == ulist, ulist and #ulist);
+
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
 if (failed > 0) then error("self-test failed"); end
