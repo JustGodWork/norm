@@ -99,4 +99,72 @@ function types.date(options) return make("date", options); end
 ---@return NormColumn
 function types.json(options) return make("json", options); end
 
+-- ==========================================================================
+-- Relations. Declared inside a schema alongside columns; `define` separates
+-- them out. They create no SQL column, they describe how to load related rows.
+-- ==========================================================================
+
+---@class NormRelation
+---@field __relation true
+---@field kind "belongs_to"|"has_one"|"has_many"
+---@field target string The related table name.
+---@field key? string FK column (on this model for belongs_to, on the target otherwise).
+---@field otherKey? string Referenced column (defaults to the relevant primary key).
+---@field name? string Set by define() from the schema key.
+
+---@class NormRelationOptions
+---@field key? string
+---@field otherKey? string
+
+---@param kind string
+---@param target string
+---@param options? NormRelationOptions
+---@return NormRelation
+local function relation(kind, target, options)
+    options = options or {};
+    return {
+        __relation = true,
+        kind = kind,
+        target = target,
+        key = options.key,
+        otherKey = options.otherKey,
+    };
+end
+
+--- This record holds a foreign key pointing to one `target` row.
+--- `key` defaults to `<relationName>_id`, `otherKey` to the target's primary key.
+--- ```lua
+---     db:define("posts", {
+---         id      = Norm.types.id(),
+---         user_id = Norm.types.integer(),
+---         author  = Norm.types.belongsTo("users", { key = "user_id" }),
+---     })
+---     -- post:load("author"):await()  /  Post:query():include("author"):all():await()
+--- ```
+---@param target string
+---@param options? NormRelationOptions
+---@return NormRelation
+function types.belongsTo(target, options) return relation("belongs_to", target, options); end
+
+--- The `target` holds a foreign key pointing back to one of this model's rows.
+--- `key` defaults to `<thisTableSingular>_id`, `otherKey` to this primary key.
+---@param target string
+---@param options? NormRelationOptions
+---@return NormRelation
+function types.hasOne(target, options) return relation("has_one", target, options); end
+
+--- The `target` holds a foreign key pointing back to this model's rows (one-to-many).
+--- `key` defaults to `<thisTableSingular>_id`, `otherKey` to this primary key.
+--- ```lua
+---     db:define("users", {
+---         id    = Norm.types.id(),
+---         posts = Norm.types.hasMany("posts", { key = "user_id" }),
+---     })
+---     -- user:load("posts"):await()  /  User:query():include("posts"):all():await()
+--- ```
+---@param target string
+---@param options? NormRelationOptions
+---@return NormRelation
+function types.hasMany(target, options) return relation("has_many", target, options); end
+
 return types;

@@ -147,6 +147,62 @@ function NormRecord:reload()
     end);
 end
 
+--- Lazily load a declared relation, cache it on `self[name]`, and resolve with
+--- it. Returns a single record (belongs_to / has_one), nil, or an array (has_many).
+--- ```lua
+---     local author = post:load("author"):await()  -- also sets post.author
+---     local posts  = user:load("posts"):await()   -- also sets user.posts (array)
+--- ```
+---@param name string
+---@return NormPromise promise resolving to NormRecord | NormRecord[] | nil
+function NormRecord:load(name)
+    local model = self.__model;
+    local orm = model.orm;
+    local rel = model.relations[name];
+    utils.assert(rel, ("model '%s' has no relation '%s'"):format(model.table, name));
+    local target = orm:model(rel.target);
+    utils.assert(target, ("relation '%s': target model '%s' is not defined"):format(name, rel.target));
+    local d = orm.adapter:get_dialect();
+
+    if (rel.kind == "belongs_to") then
+        local other_key = rel.otherKey or target.primary_key;
+        local fk = self[rel.key];
+        if (fk == nil) then
+            self[name] = nil;
+            return orm.provider.resolve(nil);
+        end
+        local state = { table = target.table, limit = 1, wheres = { { column = other_key, op = "=", value = fk } } };
+        local statement, params = sqlmod.select(state, d);
+        return orm:_query_map(statement, params, function(rows)
+            local rec = rows[1] and target:wrap(rows[1]) or nil;
+            self[name] = rec;
+            return rec;
+        end);
+    end
+
+    -- has_one / has_many
+    local local_key = rel.localKey or model.primary_key;
+    local local_value = self[local_key];
+    if (local_value == nil) then
+        self[name] = (rel.kind == "has_many") and {} or nil;
+        return orm.provider.resolve(self[name]);
+    end
+    local state = { table = target.table, wheres = { { column = rel.key, op = "=", value = local_value } } };
+    if (rel.kind == "has_one") then state.limit = 1; end
+    local statement, params = sqlmod.select(state, d);
+    return orm:_query_map(statement, params, function(rows)
+        if (rel.kind == "has_one") then
+            local rec = rows[1] and target:wrap(rows[1]) or nil;
+            self[name] = rec;
+            return rec;
+        end
+        local list = {};
+        for i = 1, #rows do list[i] = target:wrap(rows[i]); end
+        self[name] = list;
+        return list;
+    end);
+end
+
 module.Record = NormRecord;
 
 -- ==========================================================================
@@ -158,6 +214,7 @@ module.Record = NormRecord;
 ---@field table string
 ---@field columns NormColumn[]
 ---@field columns_by_name table<string, NormColumn>
+---@field relations table<string, NormRelation>
 ---@field primary_key? string
 ---@field autoincrement_pk boolean
 ---@field record_class NormRecord
@@ -173,6 +230,7 @@ function NormModel:__init(orm, table_name, columns, record_class)
     self.table = table_name;
     self.columns = columns;
     self.columns_by_name = {};
+    self.relations = {};
     self.primary_key = nil;
     self.autoincrement_pk = false;
     self.record_class = record_class;
@@ -330,14 +388,21 @@ function module.define(orm, table_name, schema)
     utils.assert(type(table_name) == "string", "define: table name must be a string");
     utils.assert(type(schema) == "table", "define: schema must be a table");
 
-    local columns = {};
+    -- Split the schema into columns and relations.
+    local columns, relations = {}, {};
     for _, name in ipairs(utils.sorted_keys(schema)) do
         local def = schema[name];
-        utils.assert(type(def) == "table" and def.kind,
-            ("define: column '%s' is not a valid Norm.types descriptor"):format(name));
-        local col = utils.copy(def);
-        col.name = name;
-        columns[#columns + 1] = col;
+        if (type(def) == "table" and def.__relation) then
+            local rel = utils.copy(def);
+            rel.name = name;
+            relations[name] = rel;
+        else
+            utils.assert(type(def) == "table" and def.kind,
+                ("define: column '%s' is not a valid Norm.types descriptor"):format(name));
+            local col = utils.copy(def);
+            col.name = name;
+            columns[#columns + 1] = col;
+        end
     end
 
     -- Stable order: primary key(s) first, then alphabetical.
@@ -355,7 +420,21 @@ function module.define(orm, table_name, schema)
         NormRecord.__init(self, model, row, persisted);
     end
 
-    return NormModel(orm, table_name, columns, record_class);
+    local model = NormModel(orm, table_name, columns, record_class);
+
+    -- Resolve relation key defaults now that the model (and its primary key) exists.
+    local singular = (table_name:gsub("s$", ""));
+    for name, rel in pairs(relations) do
+        if (rel.kind == "belongs_to") then
+            rel.key = rel.key or (name .. "_id");
+        else
+            rel.key = rel.key or (singular .. "_id");
+            rel.localKey = rel.localKey or model.primary_key;
+        end
+    end
+    model.relations = relations;
+
+    return model;
 end
 
 return module;

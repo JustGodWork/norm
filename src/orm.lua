@@ -94,6 +94,114 @@ function NormOrm:_execute_map(query, params, transform)
     end);
 end
 
+--- Internal: batched eager-load of one relation onto a set of parent records.
+--- Runs a single `... IN (...)` query and attaches results. Calls `cb(err?)`.
+---@private
+---@param model NormModel
+---@param mains NormRecord[]
+---@param name string
+---@param cb fun(err: any)
+function NormOrm:_load_include_batch(model, mains, name, cb)
+    local rel = model.relations[name];
+    if (not rel) then
+        return cb(("model '%s' has no relation '%s'"):format(model.table, name));
+    end
+    local target = self:model(rel.target);
+    if (not target) then
+        return cb(("relation '%s': target model '%s' is not defined"):format(name, rel.target));
+    end
+    local d = self.adapter:get_dialect();
+
+    -- Collect the unique, non-nil join keys from the parent records.
+    local source_key = (rel.kind == "belongs_to") and rel.key or (rel.localKey or model.primary_key);
+    local keys, seen = {}, {};
+    for i = 1, #mains do
+        local v = mains[i][source_key];
+        if (v ~= nil and not seen[v]) then seen[v] = true; keys[#keys + 1] = v; end
+    end
+
+    local empty = (rel.kind == "has_many") and {} or nil;
+    if (#keys == 0) then
+        for i = 1, #mains do mains[i][name] = empty; end
+        return cb();
+    end
+
+    if (rel.kind == "belongs_to") then
+        local other_key = rel.otherKey or target.primary_key;
+        local state = { table = target.table, wheres = { { column = other_key, op = "IN", value = keys } } };
+        local statement, params = sqlmod.select(state, d);
+        self:_trace(statement, params);
+        self.adapter:raw_query(statement, params, function(err, rows)
+            if (err ~= nil) then return cb(err); end
+            local by_key = {};
+            for i = 1, #rows do by_key[rows[i][other_key]] = target:wrap(rows[i]); end
+            for i = 1, #mains do mains[i][name] = by_key[mains[i][rel.key]]; end
+            cb();
+        end);
+        return;
+    end
+
+    -- has_one / has_many: group target rows by their foreign key.
+    local state = { table = target.table, wheres = { { column = rel.key, op = "IN", value = keys } } };
+    local statement, params = sqlmod.select(state, d);
+    self:_trace(statement, params);
+    self.adapter:raw_query(statement, params, function(err, rows)
+        if (err ~= nil) then return cb(err); end
+        local groups = {};
+        for i = 1, #rows do
+            local k = rows[i][rel.key];
+            local g = groups[k];
+            if (not g) then g = {}; groups[k] = g; end
+            g[#g + 1] = target:wrap(rows[i]);
+        end
+        for i = 1, #mains do
+            local g = groups[mains[i][source_key]] or {};
+            mains[i][name] = (rel.kind == "has_one") and (g[1] or nil) or g;
+        end
+        cb();
+    end);
+end
+
+--- Internal: run a SELECT then eager-load `includes` (sequentially) before
+--- resolving. Returns a single record when `single` is true, else an array.
+---@private
+---@param model NormModel
+---@param state NormQueryState
+---@param includes string[]
+---@param single boolean
+---@return NormPromise
+function NormOrm:_query_with_includes(model, state, includes, single)
+    local d = self.adapter:get_dialect();
+    local statement, params = sqlmod.select(state, d);
+    self:_trace(statement, params);
+    return self.provider.new(function(resolve, reject)
+        self.adapter:raw_query(statement, params or {}, function(err, rows)
+            if (err ~= nil) then return reject(err); end
+            local records = {};
+            for i = 1, #rows do records[i] = model:wrap(rows[i]); end
+            if (#records == 0) then
+                return resolve(single and nil or records);
+            end
+            local index = 0;
+            local function step()
+                index = index + 1;
+                local name = includes[index];
+                if (not name) then
+                    return resolve(single and records[1] or records);
+                end
+                local ok, err2 = pcall(function()
+                    self:_load_include_batch(model, records, name, function(e)
+                        if (e ~= nil) then return reject(e); end
+                        step();
+                    end);
+                end);
+                if (not ok) then reject(err2); end
+            end
+            step();
+        end);
+    end);
+end
+
 --- Run a raw parameterised SELECT (bypassing the query builder). Resolves with
 --- the raw rows. Bind values with `?` placeholders, never interpolate.
 --- ```lua

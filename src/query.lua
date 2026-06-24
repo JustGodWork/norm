@@ -24,7 +24,25 @@ function NormQueryBuilder:__init(model)
         orders = {},
         limit = nil,
         offset = nil,
+        includes = nil,
     };
+end
+
+--- Eager-load the given relations with the result (one batched query per
+--- relation — no N+1), attaching them to each returned record.
+--- ```lua
+---     local users = User:query():include("posts", "profile"):all():await()
+---     print(#users[1].posts)
+--- ```
+---@param ... string relation names declared in the model's schema
+---@return NormQueryBuilder self
+function NormQueryBuilder:include(...)
+    self._state.includes = self._state.includes or {};
+    local names = { ... };
+    for i = 1, #names do
+        self._state.includes[#self._state.includes + 1] = names[i];
+    end
+    return self;
 end
 
 --- Restrict selected columns. select("id","name") or select({"id","name"}).
@@ -143,6 +161,10 @@ function NormQueryBuilder:offset(n) self._state.offset = n; return self; end
 ---@return NormRecordListPromise promise resolving to NormRecord[]
 function NormQueryBuilder:all()
     local model = self.model;
+    local includes = self._state.includes;
+    if (includes and #includes > 0) then
+        return model.orm:_query_with_includes(model, self._state, includes, false);
+    end
     local d = model.orm.adapter:get_dialect();
     local statement, params = sqlmod.select(self._state, d);
     return model.orm:_query_map(statement, params, function(rows)
@@ -160,6 +182,10 @@ end
 function NormQueryBuilder:first()
     self._state.limit = 1;
     local model = self.model;
+    local includes = self._state.includes;
+    if (includes and #includes > 0) then
+        return model.orm:_query_with_includes(model, self._state, includes, true);
+    end
     local d = model.orm.adapter:get_dialect();
     local statement, params = sqlmod.select(self._state, d);
     return model.orm:_query_map(statement, params, function(rows)
