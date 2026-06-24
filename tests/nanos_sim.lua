@@ -116,5 +116,12 @@ check("insert bound admin=1, name=John",
     insert_call and insert_call.params[1] == 1 and insert_call.params[2] == "John",
     insert_call and (tostring(insert_call.params[1]) .. "," .. tostring(insert_call.params[2])));
 
+-- nanos uses :0/:1 numbered placeholders, NOT `?` (the "invalid vector subscript" fix)
+check("insert uses :0/:1 placeholders, not ?",
+    insert_call and insert_call.q:find(":0", 1, true) ~= nil
+        and insert_call.q:find(":1", 1, true) ~= nil
+        and insert_call.q:find("?", 1, true) == nil,
+    insert_call and insert_call.q);
+
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
 if (failed > 0) then error("nanos sim failed"); end
