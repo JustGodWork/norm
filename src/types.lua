@@ -68,33 +68,91 @@ function types.id(options)
     return make("id", options);
 end
 
+--- Integer column (`INT` / SQLite `INTEGER`). Often a foreign-key column.
+--- ```lua
+---     coins   = Norm.types.integer({ default = 0 }),
+---     user_id = Norm.types.integer({ nullable = false }), -- FK column
+--- ```
 ---@param options? NormColumnOptions
 ---@return NormColumn
 function types.integer(options) return make("integer", options); end
+
+--- 64-bit integer (`BIGINT` / SQLite `INTEGER`). For values beyond 32 bits, e.g.
+--- Discord/Steam IDs or epoch milliseconds.
+--- ```lua
+---     steam_id = Norm.types.bigint({ unique = true }),
+--- ```
 ---@param options? NormColumnOptions
 ---@return NormColumn
 function types.bigint(options) return make("bigint", options); end
+
+--- Variable-length string (`VARCHAR(length)` / SQLite `TEXT`). Pass `length` for
+--- the VARCHAR size on MySQL (ignored by SQLite, which is typeless).
+--- ```lua
+---     name  = Norm.types.string({ length = 64, nullable = false }),
+---     email = Norm.types.string({ length = 128, unique = true }),
+--- ```
 ---@param options? NormColumnOptions
 ---@return NormColumn
 function types.string(options) return make("string", options); end
+
+--- Unbounded text (`TEXT`). Use for large free-form content where `string`'s
+--- length cap is impractical.
+--- ```lua
+---     bio = Norm.types.text(),
+--- ```
 ---@param options? NormColumnOptions
 ---@return NormColumn
 function types.text(options) return make("text", options); end
+
+--- Single-precision floating point (`FLOAT` / SQLite `REAL`).
+--- ```lua
+---     ratio = Norm.types.float({ default = 1.0 }),
+--- ```
 ---@param options? NormColumnOptions
 ---@return NormColumn
 function types.float(options) return make("float", options); end
+
+--- Double-precision floating point (`DOUBLE` / SQLite `REAL`). Prefer over
+--- `float` when you need more precision (coordinates, money-as-float, etc.).
+--- ```lua
+---     pos_x = Norm.types.double({ default = 0 }),
+--- ```
 ---@param options? NormColumnOptions
 ---@return NormColumn
 function types.double(options) return make("double", options); end
+
+--- Boolean, stored as `TINYINT(1)` on MySQL / `INTEGER` on SQLite. Norm converts
+--- to/from a real Lua boolean automatically (true/false in, true/false out).
+--- ```lua
+---     admin = Norm.types.boolean({ default = false }),
+--- ```
 ---@param options? NormColumnOptions
 ---@return NormColumn
 function types.boolean(options) return make("boolean", options); end
+
+--- Date + time (`DATETIME` / SQLite `TEXT`). Pair with `Norm.types.raw` to get a
+--- DB-side default timestamp.
+--- ```lua
+---     created_at = Norm.types.datetime({ default = Norm.types.raw("CURRENT_TIMESTAMP") }),
+--- ```
 ---@param options? NormColumnOptions
 ---@return NormColumn
 function types.datetime(options) return make("datetime", options); end
+
+--- Date only (`DATE` / SQLite `TEXT`).
+--- ```lua
+---     birthday = Norm.types.date(),
+--- ```
 ---@param options? NormColumnOptions
 ---@return NormColumn
 function types.date(options) return make("date", options); end
+
+--- JSON column (`JSON` on MySQL / `TEXT` on SQLite). Norm stores/returns the raw
+--- string; encode and decode it yourself. A raw default must be a valid literal.
+--- ```lua
+---     coordinates = Norm.types.json({ default = '{"x":0,"y":0,"z":0}' }),
+--- ```
 ---@param options? NormColumnOptions
 ---@return NormColumn
 function types.json(options) return make("json", options); end

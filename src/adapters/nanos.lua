@@ -46,7 +46,7 @@ function NormNanosAdapter:__init(options)
         assert(options.engine ~= nil, "[norm] nanos adapter requires `engine` or a `database` instance");
         options.engine = options.engine or _ENV.DatabaseEngine.SQLite;
         options.connection = options.connection or "./database.db";
-        options.pool_size = options.pool_size or 4;
+        options.pool_size = options.pool_size or 10;
         -- nanos Database(database_engine, connection_string, pool_size)
         local ok, db = pcall(Database, options.engine, options.connection, options.pool_size);
         if (not ok) then
