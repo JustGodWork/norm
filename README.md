@@ -88,7 +88,8 @@ provider. Passing a raw promise *class* (e.g. `promise = Promise`) auto-wraps it
 
 ### Column types — `Norm.types`
 `id, integer, bigint, string, text, float, double, boolean, datetime, date, json`,
-plus `raw(sql)` for raw SQL defaults (e.g. `default = Norm.types.raw("CURRENT_TIMESTAMP")`).
+plus `raw(sql)` for raw SQL defaults (e.g. `default = Norm.types.raw("CURRENT_TIMESTAMP")`)
+and the relations `belongsTo, hasOne, hasMany` (see [Relations](#relations)).
 Options: `{ length, nullable, unique, primary, autoincrement, default }`.
 
 ### Model (class-level) — from `db:define(name, schema)`
@@ -97,18 +98,58 @@ Options: `{ length, nullable, unique, primary, autoincrement, default }`.
 
 ### Query builder (chainable)
 `select`, `where`, `or_where`, `where_in`, `where_null`, `where_not_null`,
-`order`, `limit`, `offset` → terminals `all`, `first`, `count`, `update(data)`,
-`delete` (each returns a promise).
+`order`, `limit`, `offset`, `include(...)` → terminals `all`, `first`, `count`,
+`update(data)`, `delete` (each returns a promise).
 
 ### Record (row-level)
-`:save()` (INSERT or UPDATE), `:delete()`, `:reload()`, `:to_table()`. Columns are
-plain fields: `record.id`, `record.name`, …
+`:save()` (INSERT or UPDATE), `:delete()`, `:reload()`, `:load(relation)`,
+`:to_table()`. Columns are plain fields: `record.id`, `record.name`, …
 
 ### Raw
 `db:query(sql, params?)` → rows, `db:execute(sql, params?)` → `{ affectedRows, insertId }`.
 
 > All data values are bound as `?` parameters — Norm never interpolates your data
 > into SQL, so there is no injection from values you pass.
+
+## Relations
+
+Declare relations in the schema with `Norm.types.belongsTo / hasOne / hasMany`.
+They create no SQL column — they describe how to load related rows.
+
+```lua
+local User = db:define("users", {
+    id    = Norm.types.id(),
+    name  = Norm.types.string({ length = 64 }),
+    posts = Norm.types.hasMany("posts", { key = "user_id" }), -- posts.user_id -> users.id
+})
+
+local Post = db:define("posts", {
+    id      = Norm.types.id(),
+    title   = Norm.types.string({ length = 120 }),
+    user_id = Norm.types.integer(),
+    author  = Norm.types.belongsTo("users", { key = "user_id" }),
+})
+```
+
+- **Lazy** — `record:load(name)` runs one query, caches the result on `record[name]`,
+  and resolves with it:
+  ```lua
+  local author = post:load("author"):await()  -- also sets post.author
+  local posts  = user:load("posts"):await()   -- also sets user.posts (array)
+  ```
+- **Eager** — `:include(...)` on a query loads relations with **one batched query
+  per relation** (no N+1) and attaches them:
+  ```lua
+  local users = User:query():include("posts"):all():await()
+  print(#users[1].posts)
+
+  local posts = Post:query():where("user_id", 1):include("author"):all():await()
+  print(posts[1].author.name)
+  ```
+
+Key defaults: `belongsTo` → `key = <relationName>_id`, `otherKey = target PK`;
+`hasOne`/`hasMany` → `key = <thisTableSingular>_id`, `otherKey = this PK`. Override
+via the options table. (Many-to-many / join tables are not built in yet.)
 
 ## Promises & `await`
 
@@ -186,7 +227,8 @@ python tests/run_nanos.py     # the nanos adapter end-to-end with async/await
 
 ## Roadmap
 
-- Relations (`belongs_to` / `has_many`, joins, eager-loading) — not implemented yet.
+- Many-to-many relations (through a join table).
+- More dialects.
 
 ## License
 
