@@ -529,6 +529,65 @@ function NormQueryBuilder:count()
     end);
 end
 
+--- Paginate the current query. Runs a `COUNT(*)` over the filter plus a
+--- `LIMIT/OFFSET` page query, resolving with
+--- `{ data, total, page, per_page, last_page, from, to }`. Honours `where`,
+--- `order`, soft-delete scope, and `with_count`.
+--- ```lua
+---     local p = User:where("admin", true):order("name"):paginate(2, 20):await()
+---     print(p.page, p.last_page, #p.data, p.total)
+--- ```
+---@param page? number 1-based page (default 1).
+---@param per_page? number rows per page (default 15).
+---@return NormPromise promise resolving to a pagination table
+function NormQueryBuilder:paginate(page, per_page)
+    page = math.max(1, math.floor(page or 1));
+    per_page = math.max(1, math.floor(per_page or 15));
+    local model = self.model;
+    local orm = model.orm;
+    local d = orm.adapter:get_dialect();
+
+    local effective = self:_effective_state();
+    local count_sql, count_params = sqlmod.count({ table = effective.table, wheres = effective.wheres }, d);
+
+    local data_state, counts = self:_prepare_counts(effective);
+    local ds = {};
+    for k, v in pairs(data_state) do ds[k] = v; end
+    ds.limit = per_page;
+    ds.offset = (page - 1) * per_page;
+    local data_sql, data_params = sqlmod.select(ds, d);
+
+    return orm.provider.new(function(resolve, reject)
+        orm:_trace(count_sql, count_params);
+        orm:_raw_query(count_sql, count_params, function(cerr, crows)
+            if (cerr ~= nil) then return reject(cerr); end
+            local total = tonumber(((crows or {})[1] or {}).count) or 0;
+            orm:_trace(data_sql, data_params);
+            orm:_raw_query(data_sql, data_params, function(derr, drows)
+                if (derr ~= nil) then return reject(derr); end
+                drows = drows or {};
+                local data = {};
+                for i = 1, #drows do
+                    local rec = model:wrap(drows[i]);
+                    if (counts) then
+                        for j = 1, #counts do rec[counts[j] .. "_count"] = tonumber(drows[i][counts[j] .. "_count"]) or 0; end
+                    end
+                    data[i] = rec;
+                end
+                resolve({
+                    data = data,
+                    total = total,
+                    page = page,
+                    per_page = per_page,
+                    last_page = math.max(1, math.ceil(total / per_page)),
+                    from = (#data > 0) and (ds.offset + 1) or 0,
+                    to = ds.offset + #data,
+                });
+            end);
+        end);
+    end);
+end
+
 --- Execute the query and resolve with the RAW rows (no record wrapping). Use this
 --- for grouped aggregates built with `:select_raw` / `:group_by` / `:having`.
 --- ```lua
