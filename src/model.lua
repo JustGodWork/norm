@@ -187,6 +187,24 @@ function NormRecord:load(name)
     utils.assert(target, ("relation '%s': target model '%s' is not defined"):format(name, rel.target));
     local d = orm.adapter:get_dialect();
 
+    if (rel.kind == "belongs_to_many") then
+        -- Two-step batched fetch (pivot -> targets); cache the array on self[name].
+        local local_key = rel.localKey or model.primary_key;
+        local local_value = self[local_key];
+        if (local_value == nil) then
+            self[name] = {};
+            return orm.provider.resolve({});
+        end
+        return orm.provider.new(function(resolve, reject)
+            orm:_m2m_fetch(model, rel, { local_value }, function(err, by_main)
+                if (err ~= nil) then return reject(err); end
+                local list = (by_main and by_main[local_value]) or {};
+                self[name] = list;
+                resolve(list);
+            end);
+        end);
+    end
+
     if (rel.kind == "belongs_to") then
         local other_key = rel.otherKey or target.primary_key;
         local fk = self[rel.key];
@@ -489,6 +507,11 @@ function module.define(orm, table_name, schema)
     for name, rel in pairs(relations) do
         if (rel.kind == "belongs_to") then
             rel.key = rel.key or (name .. "_id");
+        elseif (rel.kind == "belongs_to_many") then
+            -- key = pivot FK to THIS model; otherKey/through/otherLocalKey depend
+            -- on the target and are resolved lazily (the target may not exist yet).
+            rel.key = rel.key or (singular .. "_id");
+            rel.localKey = rel.localKey or model.primary_key;
         else
             rel.key = rel.key or (singular .. "_id");
             rel.localKey = rel.localKey or model.primary_key;
