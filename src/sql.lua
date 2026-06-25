@@ -17,10 +17,18 @@ local utils = require("utils");
 ---@field op string Operator.
 ---@field value any Bound parameter.
 
+---@class NormJoin
+---@field type "INNER"|"LEFT" Join type.
+---@field table string Joined table.
+---@field first string Left column ref of the ON condition (e.g. "users.id").
+---@field op string ON operator.
+---@field second string Right column ref of the ON condition (e.g. "posts.user_id").
+
 ---@class NormQueryState
 ---@field table string
 ---@field columns? string[] Selected columns (nil = "*").
 ---@field raw_columns? string[] Raw (unquoted) select expressions, e.g. "COUNT(*) AS n".
+---@field joins? NormJoin[] JOIN clauses.
 ---@field wheres NormWhere[]
 ---@field groups? string[] GROUP BY columns.
 ---@field havings? NormHaving[] HAVING conditions (ANDed).
@@ -39,6 +47,22 @@ local function normalize(value)
     return value;
 end
 sql.normalize = normalize;
+
+--- Quote a column reference, qualifying each dotted segment: "users.id" ->
+--- `` `users`.`id` ``. A bare name quotes whole. Used wherever a join may make
+--- columns ambiguous (where / order / join ON).
+---@param d NormDialect
+---@param ref string
+---@return string
+local function quote_ref(d, ref)
+    if (ref:find(".", 1, true)) then
+        local parts = {};
+        for seg in ref:gmatch("[^.]+") do parts[#parts + 1] = d.quote(seg); end
+        return table.concat(parts, ".");
+    end
+    return d.quote(ref);
+end
+sql.quote_ref = quote_ref;
 
 --- Build the column definition fragment for CREATE TABLE.
 ---@param column NormColumn
@@ -214,7 +238,7 @@ local function compile_where(wheres, d, params)
     local fragments = {};
     for i = 1, #wheres do
         local cond = wheres[i];
-        local col = d.quote(cond.column);
+        local col = quote_ref(d, cond.column);
         local op = (cond.op or "="):upper();
         local frag;
 
@@ -265,6 +289,15 @@ function sql.select(state, d)
     local columns = (#cols > 0) and table.concat(cols, ", ") or "*";
 
     local statement = ("SELECT %s FROM %s"):format(columns, d.quote(state.table));
+
+    if (state.joins and #state.joins > 0) then
+        for i = 1, #state.joins do
+            local j = state.joins[i];
+            statement = statement .. (" %s JOIN %s ON %s %s %s"):format(
+                j.type, d.quote(j.table), quote_ref(d, j.first), (j.op or "="), quote_ref(d, j.second));
+        end
+    end
+
     statement = statement .. compile_where(state.wheres, d, params);
 
     if (state.groups and #state.groups > 0) then
@@ -288,7 +321,7 @@ function sql.select(state, d)
         local parts = {};
         for i = 1, #state.orders do
             local o = state.orders[i];
-            parts[#parts + 1] = d.quote(o.column) .. " " .. (o.dir or "ASC");
+            parts[#parts + 1] = quote_ref(d, o.column) .. " " .. (o.dir or "ASC");
         end
         statement = statement .. " ORDER BY " .. table.concat(parts, ", ");
     end
