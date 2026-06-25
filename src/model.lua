@@ -945,6 +945,32 @@ function NormModel:limit(...) return self:query():limit(...); end
 ---@return NormQueryBuilder
 function NormModel:select(...) return self:query():select(...); end
 
+---@param column string
+---@param value any
+---@return NormQueryBuilder
+function NormModel:where_not(column, value) return self:query():where_not(column, value); end
+
+---@param column string
+---@param list any[]
+---@return NormQueryBuilder
+function NormModel:where_in(column, list) return self:query():where_in(column, list); end
+
+---@param column string
+---@param list any[]
+---@return NormQueryBuilder
+function NormModel:where_not_in(column, list) return self:query():where_not_in(column, list); end
+
+---@param column string
+---@param pattern string
+---@return NormQueryBuilder
+function NormModel:where_like(column, pattern) return self:query():where_like(column, pattern); end
+
+---@param column string
+---@param min any
+---@param max any
+---@return NormQueryBuilder
+function NormModel:where_between(column, min, max) return self:query():where_between(column, min, max); end
+
 ---@param expr string
 ---@return NormQueryBuilder
 function NormModel:select_raw(expr) return self:query():select_raw(expr); end
