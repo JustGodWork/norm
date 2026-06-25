@@ -733,6 +733,7 @@ function NormModel:__init(orm, table_name, columns, record_class)
     self.record_class = record_class;
     self.hooks = nil;        -- event -> { fn, ... }, created on first registration
     self._has_hooks = false; -- fast-path flag so hook-less models pay nothing
+    self.scopes = nil;       -- name -> fn(query, ...), reusable query fragments
     for i = 1, #columns do
         local c = columns[i];
         self.columns_by_name[c.name] = c;
@@ -829,6 +830,29 @@ end
 function NormModel:_fire(event, record)
     local hs = self.hooks and self.hooks[event];
     if (hs) then for i = 1, #hs do hs[i](record); end end
+end
+
+--- Register a reusable, named query fragment. `fn(query, ...)` applies conditions
+--- to a query builder. The scope becomes callable as a starter (`Model:active()`)
+--- and chainable (`query:scope("active")`). The name must not collide with a
+--- built-in method.
+--- ```lua
+---     User:scope("active", function(q) q:where("active", true) end)
+---     User:scope("older_than", function(q, age) q:where("age", ">", age) end)
+---     User:active():scope("older_than", 18):all():await()
+--- ```
+---@param name string
+---@param fn fun(query: NormQueryBuilder, ...: any)
+---@return NormModel self
+function NormModel:scope(name, fn)
+    utils.assert(type(name) == "string", "scope: name must be a string");
+    utils.assert(type(fn) == "function", "scope: handler must be a function");
+    utils.assert(rawget(NormModel, name) == nil, ("scope '%s' collides with a built-in method"):format(name));
+    self.scopes = self.scopes or {};
+    self.scopes[name] = fn;
+    -- starter convenience on the model instance: Model:<name>(...) -> query():scope(...)
+    self[name] = function(s, ...) return s:query():scope(name, ...); end
+    return self;
 end
 
 --- Build an *unsaved* record from a data table (nothing hits the database until
@@ -1315,6 +1339,7 @@ end
 ---@field timestamps? boolean|{created?: string, updated?: string} Auto-manage created_at/updated_at (Norm-side, UTC; portable across SQLite/MySQL). `true` uses the default names; pass a table to rename.
 ---@field soft_deletes? boolean|{column?: string} Mark rows deleted (set a `deleted_at`) instead of removing them; queries then exclude them by default. `true` uses `deleted_at`; pass a table to rename.
 ---@field hooks? table<string, fun(record: NormRecord)|fun(record: NormRecord)[]> Lifecycle hooks per event (see `NormModel:hook`), as a single handler or a list.
+---@field scopes? table<string, fun(query: NormQueryBuilder, ...: any)> Named reusable query fragments (see `NormModel:scope`).
 
 --- Build a Model (+ dedicated Record subclass) from a schema definition.
 ---@param orm NormOrm
@@ -1395,6 +1420,11 @@ function module.define(orm, table_name, schema, options)
                 for i = 1, #handler do model:hook(event, handler[i]); end
             end
         end
+    end
+
+    -- Register named scopes passed at define time.
+    if (type(options.scopes) == "table") then
+        for name, fn in pairs(options.scopes) do model:scope(name, fn); end
     end
 
     -- Resolve relation key defaults now that the model (and its primary key) exists.
