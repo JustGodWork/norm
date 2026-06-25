@@ -1260,6 +1260,39 @@ check("define-time hook fires", dhits == 1, dhits);
 -- hook-less models stay flagged off
 local Plain = orm.new({ adapter = Mock({ dialect = "sqlite" }), promise = orm.promise.builtin() }):define("plain", { id = orm.types.id() });
 check("hook-less model has _has_hooks false", Plain._has_hooks == false);
+end do
+print("== Test group 27: increment / decrement ==");
+local cm = Mock({ dialect = "sqlite" });
+local cdb = orm.new({ adapter = cm, promise = orm.promise.builtin() });
+local Acc = cdb:define("accounts", { id = orm.types.id(), coins = orm.types.integer({ default = 0 }) });
+
+-- builder increment: SET col = col + ? over the WHERE
+cm.query_result = {};
+Acc:where("id", 1):increment("coins", 50);
+local isql = last_sql(cm);
+print("  INC: " .. isql);
+check("increment builds SET col = col + ?", isql:find("UPDATE `accounts` SET `coins` = `coins` + ?", 1, true) ~= nil, isql);
+check("increment keeps the WHERE", isql:find("WHERE `id` = ?", 1, true) ~= nil, isql);
+check("increment binds amount then where", (function()
+    local p = cm.calls[#cm.calls].params;
+    return p[1] == 50 and p[2] == 1;
+end)());
+
+-- builder decrement: negative amount
+Acc:where("id", 1):decrement("coins", 10);
+check("decrement binds a negative amount", cm.calls[#cm.calls].params[1] == -10, cm.calls[#cm.calls].params[1]);
+
+-- default amount = 1
+Acc:where("id", 1):increment("coins");
+check("increment defaults to 1", cm.calls[#cm.calls].params[1] == 1);
+
+-- record increment: targets the PK AND updates the in-memory value
+local rec = Acc:wrap({ id = 7, coins = 100 });
+rec:increment("coins", 25);
+check("record increment targets the pk", last_sql(cm):find("WHERE `id` = ?", 1, true) ~= nil, last_sql(cm));
+check("record increment updates memory", rec.coins == 125, rec.coins);
+rec:decrement("coins", 5);
+check("record decrement updates memory", rec.coins == 120, rec.coins);
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
