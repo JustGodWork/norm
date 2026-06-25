@@ -29,6 +29,7 @@ local NormOrm = class.new("NormOrm");
 ---@field logger? fun(level: string, message: string)
 ---@field foreignKeys? boolean|"auto" Emit SQL FOREIGN KEY constraints from `belongsTo` relations. `"auto"` (default) emits on MySQL, skips on SQLite (with a one-time warning); `true` always emits; `false` never emits (no warning).
 ---@field json? NormJsonProvider|"auto"|false JSON provider for `json` columns. `"auto"` (default) uses the adapter's, else auto-detects (Nanos `JSON` / Lua `json`), else raw passthrough; `false` disables (de)serialisation.
+---@field queue_until_ready? boolean Hold data operations in a queue until the first successful `sync()`/`migrate()`, then flush them (default false: run immediately).
 
 ---@param options NormOptions
 function NormOrm:__init(options)
@@ -55,6 +56,11 @@ function NormOrm:__init(options)
     self._logger = options.logger or utils.logger;
     self.foreign_keys = (options.foreignKeys == nil) and "auto" or options.foreignKeys;
     self._warned_sqlite_fk = false;
+
+    -- Readiness gate. When queueing is requested, data ops are held until the
+    -- first sync()/migrate() flips this ready and flushes them.
+    self._ready = (options.queue_until_ready ~= true);
+    self._queue = {};
 
     -- JSON provider for `json` columns: explicit > adapter default > auto-detect.
     -- `false` disables it (raw string passthrough).
@@ -86,6 +92,53 @@ function NormOrm:_trace(query, params)
     self._logger("SQL", query .. suffix);
 end
 
+--- The single gate every data operation goes through. Runs against the adapter
+--- when ready; otherwise holds the call until `sync()`/`migrate()` flushes it.
+--- (sync/migrate themselves bypass this — they're what makes the ORM ready.)
+---@private
+function NormOrm:_raw_query(query, params, callback)
+    if (self._ready) then return self.adapter:raw_query(query, params, callback); end
+    if (#self._queue == 0) then
+        self._logger("DB", "queue_until_ready: holding operations until sync()/migrate()");
+    end
+    self._queue[#self._queue + 1] = { kind = "query", query = query, params = params, callback = callback };
+end
+
+---@private
+function NormOrm:_raw_execute(query, params, callback)
+    if (self._ready) then return self.adapter:raw_execute(query, params, callback); end
+    if (#self._queue == 0) then
+        self._logger("DB", "queue_until_ready: holding operations until sync()/migrate()");
+    end
+    self._queue[#self._queue + 1] = { kind = "execute", query = query, params = params, callback = callback };
+end
+
+--- Mark the ORM ready and replay any queued operations in FIFO order. No-op if
+--- already ready. Called by `sync()`/`migrate()` on success.
+---@private
+function NormOrm:_flush_ready()
+    if (self._ready) then return; end
+    self._ready = true;
+    local queue = self._queue;
+    self._queue = {};
+    if (#queue > 0) then
+        self._logger("DB", ("ready: flushing %d queued operation(s)"):format(#queue));
+    end
+    for i = 1, #queue do
+        local op = queue[i];
+        if (op.kind == "query") then
+            self.adapter:raw_query(op.query, op.params, op.callback);
+        else
+            self.adapter:raw_execute(op.query, op.params, op.callback);
+        end
+    end
+end
+
+--- Whether operations run immediately. With `queue_until_ready`, false until the
+--- first successful `sync()`/`migrate()`; otherwise always true.
+---@return boolean
+function NormOrm:is_ready() return self._ready == true; end
+
 --- Run a SELECT and transform the rows inside the promise.
 ---@param query string
 ---@param params? any[]
@@ -94,7 +147,7 @@ end
 function NormOrm:_query_map(query, params, transform)
     self:_trace(query, params);
     return self.provider.new(function(resolve, reject)
-        self.adapter:raw_query(query, params or {}, function(err, rows)
+        self:_raw_query(query, params or {}, function(err, rows)
             if (err ~= nil) then return reject(err); end
             local ok, mapped = pcall(transform, rows or {});
             if (not ok) then return reject(mapped); end
@@ -111,7 +164,7 @@ end
 function NormOrm:_execute_map(query, params, transform)
     self:_trace(query, params);
     return self.provider.new(function(resolve, reject)
-        self.adapter:raw_execute(query, params or {}, function(err, result)
+        self:_raw_execute(query, params or {}, function(err, result)
             if (err ~= nil) then return reject(err); end
             local ok, mapped = pcall(transform, result or {});
             if (not ok) then return reject(mapped); end
@@ -147,7 +200,7 @@ function NormOrm:_m2m_fetch(model, rel, keys, cb)
         wheres = { { column = pivot_main, op = "IN", value = keys } } };
     local pstmt, pparams = sqlmod.select(pstate, d);
     self:_trace(pstmt, pparams);
-    self.adapter:raw_query(pstmt, pparams, function(perr, prows)
+    self:_raw_query(pstmt, pparams, function(perr, prows)
         if (perr ~= nil) then return cb(perr); end
         prows = prows or {};
         local main_to_related, related_ids, seen = {}, {}, {};
@@ -167,7 +220,7 @@ function NormOrm:_m2m_fetch(model, rel, keys, cb)
             wheres = { { column = other_local, op = "IN", value = related_ids } } };
         local tstmt, tparams = sqlmod.select(tstate, d);
         self:_trace(tstmt, tparams);
-        self.adapter:raw_query(tstmt, tparams, function(terr, trows)
+        self:_raw_query(tstmt, tparams, function(terr, trows)
             if (terr ~= nil) then return cb(terr); end
             trows = trows or {};
             local by_id = {};
@@ -232,7 +285,7 @@ function NormOrm:_load_include_batch(model, mains, name, cb)
         local state = { table = target.table, wheres = { { column = other_key, op = "IN", value = keys } } };
         local statement, params = sqlmod.select(state, d);
         self:_trace(statement, params);
-        self.adapter:raw_query(statement, params, function(err, rows)
+        self:_raw_query(statement, params, function(err, rows)
             if (err ~= nil) then return cb(err); end
             rows = rows or {};
             local by_key = {};
@@ -247,7 +300,7 @@ function NormOrm:_load_include_batch(model, mains, name, cb)
     local state = { table = target.table, wheres = { { column = rel.key, op = "IN", value = keys } } };
     local statement, params = sqlmod.select(state, d);
     self:_trace(statement, params);
-    self.adapter:raw_query(statement, params, function(err, rows)
+    self:_raw_query(statement, params, function(err, rows)
         if (err ~= nil) then return cb(err); end
         rows = rows or {};
         local groups = {};
@@ -278,7 +331,7 @@ function NormOrm:_query_with_includes(model, state, includes, single)
     local statement, params = sqlmod.select(state, d);
     self:_trace(statement, params);
     return self.provider.new(function(resolve, reject)
-        self.adapter:raw_query(statement, params or {}, function(err, rows)
+        self:_raw_query(statement, params or {}, function(err, rows)
             if (err ~= nil) then return reject(err); end
             rows = rows or {};
             local records = {};
@@ -500,7 +553,10 @@ function NormOrm:sync()
         local index = 0;
         local function step()
             index = index + 1;
-            if (index > #statements) then return resolve(true); end
+            if (index > #statements) then
+                self:_flush_ready(); -- schema prepared: release any queued data ops
+                return resolve(true);
+            end
             self:_trace(statements[index], {});
             self.adapter:raw_execute(statements[index], {}, function(err)
                 if (err ~= nil) then return reject(err); end
@@ -588,6 +644,10 @@ function NormOrm:migrate(migrations)
                 local function next_migration()
                     index = index + 1;
                     local mig = migrations[index];
+                    -- NOTE: migrate() does NOT mark the ORM ready. It evolves an
+                    -- existing schema (ALTERs) and does not create the model tables
+                    -- — only sync() does, so only sync() flips readiness. Run sync()
+                    -- before migrate().
                     if (not mig) then return resolve(applied); end
                     if (done[mig.id]) then return next_migration(); end
 
