@@ -7,6 +7,7 @@
 --- provider's promise; await it with `:await()` or chain per your provider.
 local class = class;
 local sqlmod = require("sql");
+local utils = require("utils");
 
 ---@class NormQueryBuilder: LightClass
 ---@field model NormModel
@@ -29,8 +30,37 @@ function NormQueryBuilder:__init(model)
         limit = nil,
         offset = nil,
         includes = nil,
+        trashed = nil, -- nil = exclude soft-deleted; "with" = include; "only" = only trashed
     };
 end
+
+--- Build the query state actually sent to SQL, applying the soft-delete scope for
+--- soft-delete models (excluded by default; honours `with_trashed`/`only_trashed`).
+---@private
+---@return NormQueryState
+function NormQueryBuilder:_effective_state()
+    local model = self.model;
+    local trashed = self._state.trashed;
+    if (not model.soft_deletes or trashed == "with") then
+        return self._state;
+    end
+    local s = {};
+    for k, v in pairs(self._state) do s[k] = v; end
+    local wheres = {};
+    for i = 1, #self._state.wheres do wheres[i] = self._state.wheres[i]; end
+    -- nil value -> compiled as IS NULL ("=") / IS NOT NULL ("!=").
+    wheres[#wheres + 1] = { column = model.soft_deletes, op = (trashed == "only") and "!=" or "=", bool = "AND" };
+    s.wheres = wheres;
+    return s;
+end
+
+--- Include soft-deleted rows in the result (disables the default exclusion).
+---@return NormQueryBuilder self
+function NormQueryBuilder:with_trashed() self._state.trashed = "with"; return self; end
+
+--- Return ONLY soft-deleted rows.
+---@return NormQueryBuilder self
+function NormQueryBuilder:only_trashed() self._state.trashed = "only"; return self; end
 
 ---@param self NormQueryBuilder
 ---@param jtype "INNER"|"LEFT"
@@ -313,11 +343,12 @@ end
 function NormQueryBuilder:all()
     local model = self.model;
     local includes = self._state.includes;
+    local state = self:_effective_state();
     if (includes and next(includes) ~= nil) then
-        return model.orm:_query_with_includes(model, self._state, includes, false);
+        return model.orm:_query_with_includes(model, state, includes, false);
     end
     local d = model.orm.adapter:get_dialect();
-    local statement, params = sqlmod.select(self._state, d);
+    local statement, params = sqlmod.select(state, d);
     return model.orm:_query_map(statement, params, function(rows)
         local out = {};
         for i = 1, #rows do out[i] = model:wrap(rows[i]); end
@@ -334,11 +365,12 @@ function NormQueryBuilder:first()
     self._state.limit = 1;
     local model = self.model;
     local includes = self._state.includes;
+    local state = self:_effective_state();
     if (includes and next(includes) ~= nil) then
-        return model.orm:_query_with_includes(model, self._state, includes, true);
+        return model.orm:_query_with_includes(model, state, includes, true);
     end
     local d = model.orm.adapter:get_dialect();
-    local statement, params = sqlmod.select(self._state, d);
+    local statement, params = sqlmod.select(state, d);
     return model.orm:_query_map(statement, params, function(rows)
         local row = rows[1];
         return row and model:wrap(row) or nil;
@@ -353,7 +385,7 @@ end
 function NormQueryBuilder:count()
     local model = self.model;
     local d = model.orm.adapter:get_dialect();
-    local statement, params = sqlmod.count(self._state, d);
+    local statement, params = sqlmod.count(self:_effective_state(), d);
     return model.orm:_query_map(statement, params, function(rows)
         local row = rows[1] or {};
         return tonumber(row.count or row.COUNT or row["COUNT(*)"]) or 0;
@@ -370,7 +402,7 @@ end
 function NormQueryBuilder:rows()
     local model = self.model;
     local d = model.orm.adapter:get_dialect();
-    local statement, params = sqlmod.select(self._state, d);
+    local statement, params = sqlmod.select(self:_effective_state(), d);
     return model.orm:_query_map(statement, params, function(rows) return rows; end);
 end
 
@@ -383,7 +415,7 @@ end
 local function aggregate(self, func, column, numeric)
     local model = self.model;
     local d = model.orm.adapter:get_dialect();
-    local statement, params = sqlmod.aggregate(self._state, func, column, d);
+    local statement, params = sqlmod.aggregate(self:_effective_state(), func, column, d);
     return model.orm:_query_map(statement, params, function(rows)
         local value = (rows[1] or {}).aggregate;
         if (numeric) then return tonumber(value) or 0; end
@@ -427,19 +459,40 @@ function NormQueryBuilder:max(column) return aggregate(self, "MAX", column, fals
 function NormQueryBuilder:update(data)
     local model = self.model;
     local d = model.orm.adapter:get_dialect();
-    local statement, params = sqlmod.update(self._state, model:_encode_write(data), d);
+    -- Don't update rows already soft-deleted (unless with_trashed/only_trashed).
+    local statement, params = sqlmod.update(self:_effective_state(), model:_encode_write(data), d);
     return model.orm:_execute_map(statement, params, function(res)
         return res and res.affectedRows or 0;
     end);
 end
 
---- Bulk-delete every matching row in one statement. Resolves with the affected
---- row count.
+--- Bulk-delete every matching row. On a soft-delete model this marks the rows
+--- (sets `deleted_at`) rather than removing them; use `force_delete` to remove.
+--- Resolves with the affected row count.
 --- ```lua
 ---     local n = User:query():where("coins", 0):delete():await()
 --- ```
 ---@return NormNumberPromise promise resolving to number
 function NormQueryBuilder:delete()
+    local model = self.model;
+    local d = model.orm.adapter:get_dialect();
+    if (model.soft_deletes) then
+        -- soft: UPDATE deleted_at = now over the (non-trashed) matched rows.
+        local statement, params = sqlmod.update(self:_effective_state(), { [model.soft_deletes] = utils.now_utc() }, d);
+        return model.orm:_execute_map(statement, params, function(res)
+            return res and res.affectedRows or 0;
+        end);
+    end
+    local statement, params = sqlmod.delete(self._state, d);
+    return model.orm:_execute_map(statement, params, function(res)
+        return res and res.affectedRows or 0;
+    end);
+end
+
+--- Bulk physical-DELETE every matching row, even on a soft-delete model.
+--- Resolves with the affected row count.
+---@return NormNumberPromise promise resolving to number
+function NormQueryBuilder:force_delete()
     local model = self.model;
     local d = model.orm.adapter:get_dialect();
     local statement, params = sqlmod.delete(self._state, d);
