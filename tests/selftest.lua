@@ -925,5 +925,49 @@ check("left join clause emitted",
     lsql:find("LEFT JOIN `users` ON `users`.`id` = `posts`.`user_id`", 1, true) ~= nil, lsql);
 check("order by a qualified column", lsql:find("ORDER BY `users`.`name` DESC", 1, true) ~= nil, lsql);
 
+-- ===============================================================
+print("== Test group 20: queue_until_ready ==");
+-- default (off): ready immediately, queries run at once
+local nm = Mock({ dialect = "sqlite" });
+local ndb = orm.new({ adapter = nm, promise = orm.promise.builtin() });
+check("ready immediately when queueing is off", ndb:is_ready() == true);
+local NUser = ndb:define("u", { id = orm.types.id() });
+nm.query_result = { { id = 5 } };
+nm.calls = {};
+local got;
+NUser:find(5):next(function(r) got = r; end);
+check("query runs immediately when queueing is off", #nm.calls == 1 and got and got.id == 5, got and got.id);
+
+-- on: hold until sync
+local qm = Mock({ dialect = "sqlite" });
+local qdb = orm.new({ adapter = qm, promise = orm.promise.builtin(), queue_until_ready = true });
+local QUser = qdb:define("users", { id = orm.types.id(), name = orm.types.string({ length = 32 }) });
+check("not ready before sync (queueing on)", qdb:is_ready() == false);
+
+qm.query_result = { { id = 1, name = "Zoe" } };
+qm.calls = {};
+local found, resolved = nil, false;
+QUser:find(1):next(function(u) found = u; resolved = true; end);
+check("query is held (no adapter call before ready)", #qm.calls == 0, #qm.calls);
+check("queued query has not resolved yet", resolved == false);
+
+qdb:sync();
+check("ready after sync", qdb:is_ready() == true);
+check("queued query ran + resolved after sync", resolved == true and found and found.name == "Zoe", found and found.name);
+
+-- migrate() does NOT mark ready (only sync creates all model tables); it still
+-- runs (bypassing the queue), but readiness stays until a sync().
+local gm = Mock({ dialect = "sqlite" });
+local gdb = orm.new({ adapter = gm, promise = orm.promise.builtin(), queue_until_ready = true });
+gm.query_result = {};
+local migrated;
+check("not ready before migrate", gdb:is_ready() == false);
+gdb:migrate({ { id = "init", up = function(m) m:add_column("t", "c", orm.types.integer()); end } })
+    :next(function(list) migrated = list; end);
+check("migrate ran despite not-ready (bypasses the queue)", migrated and migrated[1] == "init", migrated and migrated[1]);
+check("migrate does NOT mark ready", gdb:is_ready() == false);
+gdb:sync();
+check("sync marks ready after migrate", gdb:is_ready() == true);
+
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
 if (failed > 0) then error("self-test failed"); end
