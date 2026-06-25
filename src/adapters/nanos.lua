@@ -116,13 +116,35 @@ end
 
 --- Nanos binds parameters with NUMBERED placeholders (`:0`, `:1`, ... 0-indexed),
 --- not `?`. Norm's SQL builder emits `?`, so the adapter rewrites them in order.
---- Safe because the builder only ever emits `?` as a placeholder (never inside a
---- string literal; identifiers are backtick-quoted).
+--- Only `?` outside string literals (`'...'`) and quoted identifiers (`` `...` ``)
+--- are treated as placeholders, so a literal `?` in a value/DEFAULT is preserved
+--- (`''` and ``` `` ``` are handled as in-literal escaped quotes).
 ---@param query string
 ---@return string
 local function to_nanos_placeholders(query)
-    local i = -1;
-    return (query:gsub("%?", function() i = i + 1; return ":" .. i; end));
+    local out, i, n, idx = {}, 1, #query, -1;
+    local in_str, in_id = false, false;
+    while (i <= n) do
+        local c = query:sub(i, i);
+        if (in_str) then
+            out[#out + 1] = c;
+            if (c == "'") then
+                if (query:sub(i + 1, i + 1) == "'") then out[#out + 1] = "'"; i = i + 1; -- escaped ''
+                else in_str = false; end
+            end
+        elseif (in_id) then
+            out[#out + 1] = c;
+            if (c == "`") then
+                if (query:sub(i + 1, i + 1) == "`") then out[#out + 1] = "`"; i = i + 1; -- escaped ``
+                else in_id = false; end
+            end
+        elseif (c == "'") then out[#out + 1] = c; in_str = true;
+        elseif (c == "`") then out[#out + 1] = c; in_id = true;
+        elseif (c == "?") then idx = idx + 1; out[#out + 1] = ":" .. idx;
+        else out[#out + 1] = c; end
+        i = i + 1;
+    end
+    return table.concat(out);
 end
 
 --- Internal: run a SELECT (async if available, else synchronous).
