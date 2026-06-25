@@ -1336,6 +1336,39 @@ check("with_count selects COUNT(*) AS posts_count",
     csql:find("(SELECT COUNT(*) FROM `posts`", 1, true) ~= nil and csql:find("AS `posts_count`", 1, true) ~= nil, csql);
 check("with_count keeps the main columns (*)", csql:find("SELECT *,", 1, true) ~= nil, csql);
 check("with_count attaches the count to the record", wusers and wusers[1].posts_count == 3, wusers and wusers[1] and wusers[1].posts_count);
+end do
+print("== Test group 29: paginate ==");
+-- a mock that answers COUNT(*) with a total and data queries with page rows.
+local PMock = class.extend("PaginateMock", orm.Adapter);
+function PMock:__init(o) orm.Adapter.__init(self, o); self.queries = {}; end
+function PMock:raw_query(q, p, cb)
+    self.queries[#self.queries + 1] = q;
+    if (q:find("COUNT(*)", 1, true)) then cb(nil, { { count = 42 } });
+    else cb(nil, { { id = 11 }, { id = 12 } }); end
+end
+function PMock:raw_execute(q, p, cb) cb(nil, { affectedRows = 1 }); end
+
+local pmk = PMock({ dialect = "mysql" });
+local pgdb = orm.new({ adapter = pmk, promise = orm.promise.builtin() });
+local Item = pgdb:define("items", { id = orm.types.id() });
+
+local result;
+Item:where("active", true):order("id"):paginate(2, 10):next(function(r) result = r; end);
+check("paginate total from COUNT", result and result.total == 42, result and result.total);
+check("paginate page/per_page echoed", result and result.page == 2 and result.per_page == 10);
+check("paginate last_page = ceil(total/per_page)", result and result.last_page == 5, result and result.last_page);
+check("paginate data is wrapped records", result and #result.data == 2 and result.data[1].id == 11);
+check("paginate from/to", result and result.from == 11 and result.to == 12, result and (result.from .. "/" .. result.to));
+check("paginate data query has LIMIT/OFFSET", (function()
+    for _, q in ipairs(pmk.queries) do if (q:find("LIMIT 10 OFFSET 10", 1, true)) then return true; end end
+    return false;
+end)());
+check("paginate count query honours the WHERE", (function()
+    for _, q in ipairs(pmk.queries) do
+        if (q:find("COUNT(*)", 1, true) and q:find("WHERE `active` = ?", 1, true)) then return true; end
+    end
+    return false;
+end)());
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
