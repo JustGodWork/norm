@@ -5,6 +5,15 @@ local utils = require("utils");
 local sqlmod = require("sql");
 local NormQueryBuilder = require("query");
 
+--- Current UTC timestamp as `YYYY-MM-DD HH:MM:SS` (portable across MySQL DATETIME
+--- and SQLite TEXT). Returns nil if `os.date` is unavailable (timestamps skipped).
+---@return string|nil
+local function now_utc()
+    if (type(os) ~= "table" or type(os.date) ~= "function") then return nil; end
+    local ok, s = pcall(os.date, "!%Y-%m-%d %H:%M:%S");
+    return ok and s or nil;
+end
+
 ---@class NormModelModule
 ---@field Record NormRecord
 ---@field Model NormModel
@@ -40,6 +49,45 @@ function NormRecord:__init(model, row, persisted)
             end
         end
     end
+    -- Snapshot persisted records so :save() can diff (dirty tracking).
+    if (self.__persisted) then self:_snapshot(); end
+end
+
+--- Capture the current column values as the "clean" baseline for dirty tracking.
+---@private
+function NormRecord:_snapshot()
+    local snap = {};
+    local cols = self.__model.columns;
+    for i = 1, #cols do
+        local name = cols[i].name;
+        snap[name] = self[name];
+    end
+    self.__original = snap;
+end
+
+--- Columns whose value differs from the snapshot (the write-set for an UPDATE).
+--- Only non-nil values are returned (clearing to NULL via save() is unsupported,
+--- as before). `json` columns holding a table are always considered changed —
+--- their contents may have been mutated in place, which a reference check misses.
+---@private
+---@return table<string, any>
+function NormRecord:_changed_columns()
+    local model = self.__model;
+    local original = self.__original or {};
+    local out = {};
+    for i = 1, #model.columns do
+        local col = model.columns[i];
+        local name = col.name;
+        local cur = self[name];
+        if (cur ~= nil) then
+            if (col.kind == "json" and type(cur) == "table") then
+                out[name] = cur;
+            elseif (cur ~= original[name]) then
+                out[name] = cur;
+            end
+        end
+    end
+    return out;
 end
 
 --- Plain `{ column = value }` table for this record (e.g. to serialise it).
@@ -81,17 +129,42 @@ function NormRecord:save()
     local model = self.__model;
     local orm = model.orm;
     local d = orm.adapter:get_dialect();
-    local data = self:_persistable();
+    local ts = model.timestamps;
 
     if (self.__persisted) then
         utils.assert(model.primary_key, ("model '%s' has no primary key; cannot update"):format(model.table));
         local pk = model.primary_key;
-        data[pk] = nil;
+
+        -- Dirty tracking: only write columns that actually changed since load.
+        local changed = self:_changed_columns();
+        changed[pk] = nil; -- never update the primary key
+        if (next(changed) == nil) then
+            -- Nothing changed: skip the query entirely (and don't bump updated_at).
+            return orm.provider.resolve(self);
+        end
+        if (ts and ts.updated) then
+            local nowv = now_utc();
+            if (nowv ~= nil) then self[ts.updated] = nowv; changed[ts.updated] = nowv; end
+        end
+
         local state = { table = model.table, wheres = { { column = pk, op = "=", value = self[pk] } } };
-        local statement, params = sqlmod.update(state, model:_encode_write(data), d);
-        return orm:_execute_map(statement, params, function() return self; end);
+        local statement, params = sqlmod.update(state, model:_encode_write(changed), d);
+        return orm:_execute_map(statement, params, function()
+            self:_snapshot();
+            return self;
+        end);
     end
 
+    -- INSERT: stamp created_at / updated_at (unless the caller set them explicitly).
+    if (ts) then
+        local nowv = now_utc();
+        if (nowv ~= nil) then
+            if (ts.created and self[ts.created] == nil) then self[ts.created] = nowv; end
+            if (ts.updated and self[ts.updated] == nil) then self[ts.updated] = nowv; end
+        end
+    end
+
+    local data = self:_persistable();
     if (model.autoincrement_pk) then data[model.primary_key] = nil; end
 
     -- If the engine supports `INSERT ... RETURNING` (SQLite >= 3.35 / PostgreSQL),
@@ -109,6 +182,7 @@ function NormRecord:save()
             if (row and row[model.primary_key] ~= nil) then
                 self[model.primary_key] = row[model.primary_key];
             end
+            self:_snapshot();
             return self;
         end);
     end
@@ -119,6 +193,7 @@ function NormRecord:save()
         if (model.autoincrement_pk and res and res.insertId ~= nil) then
             self[model.primary_key] = res.insertId;
         end
+        self:_snapshot();
         return self;
     end);
 end
@@ -166,6 +241,7 @@ function NormRecord:reload()
                 end
             end
         end
+        self:_snapshot(); -- reloaded values are the new clean baseline
         return self;
     end);
 end
@@ -259,6 +335,7 @@ module.Record = NormRecord;
 ---@field primary_key? string
 ---@field autoincrement_pk boolean
 ---@field record_class NormRecord
+---@field timestamps? {created: string, updated: string} Auto-managed timestamp columns (nil if disabled).
 ---@overload fun(orm: NormOrm, table_name: string, columns: NormColumn[], record_class: NormRecord): NormModel
 local NormModel = class.new("NormModel");
 
@@ -459,12 +536,18 @@ local function unique_record_name(table_name)
     return ("NormRecord_%s_%d"):format(table_name, record_counter);
 end
 
+--- Options controlling how a model behaves (3rd arg of `define`).
+---@class NormDefineOptions
+---@field timestamps? boolean|{created?: string, updated?: string} Auto-manage created_at/updated_at (Norm-side, UTC; portable across SQLite/MySQL). `true` uses the default names; pass a table to rename.
+
 --- Build a Model (+ dedicated Record subclass) from a schema definition.
 ---@param orm NormOrm
 ---@param table_name string
 ---@param schema table<string, NormColumn>
+---@param options? NormDefineOptions
 ---@return NormModel
-function module.define(orm, table_name, schema)
+function module.define(orm, table_name, schema, options)
+    options = options or {};
     utils.assert(type(table_name) == "string", "define: table name must be a string");
     utils.assert(type(schema) == "table", "define: schema must be a table");
 
@@ -485,6 +568,19 @@ function module.define(orm, table_name, schema)
         end
     end
 
+    -- Timestamps: add managed `datetime` columns (unless already declared).
+    local timestamps = nil;
+    if (options.timestamps) then
+        local conf = (type(options.timestamps) == "table") and options.timestamps or {};
+        timestamps = { created = conf.created or "created_at", updated = conf.updated or "updated_at" };
+        local function ensure_ts_column(name)
+            for i = 1, #columns do if (columns[i].name == name) then return; end end
+            columns[#columns + 1] = { kind = "datetime", nullable = true, name = name };
+        end
+        ensure_ts_column(timestamps.created);
+        ensure_ts_column(timestamps.updated);
+    end
+
     -- Stable order: primary key(s) first, then alphabetical.
     table.sort(columns, function(a, b)
         if (a.primary and not b.primary) then return true; end
@@ -501,6 +597,7 @@ function module.define(orm, table_name, schema)
     end
 
     local model = NormModel(orm, table_name, columns, record_class);
+    model.timestamps = timestamps;
 
     -- Resolve relation key defaults now that the model (and its primary key) exists.
     local singular = (table_name:gsub("s$", ""));
