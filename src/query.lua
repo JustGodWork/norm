@@ -77,6 +77,63 @@ local function add_join(self, jtype, table_name, first, op, second)
     return self;
 end
 
+--- Build a correlated subquery `(SELECT <inner> FROM <related…> WHERE related.fk =
+--- parent.key [AND <configure conditions>])` for a relation — the engine behind
+--- `where_has` (inner = "1") and `with_count` (inner = "COUNT(*)"). Soft-deleted
+--- related rows are excluded. Returns (sql, params).
+---@param self NormQueryBuilder
+---@param rel NormRelation
+---@param inner_select string
+---@param configure? fun(q: NormQueryBuilder)
+---@return string sql, any[] params
+local function relation_subquery(self, rel, inner_select, configure)
+    local model = self.model;
+    local orm = model.orm;
+    local target = orm:model(rel.target);
+    assert(target, ("[norm] relation '%s': target '%s' is not defined"):format(rel.name or "?", rel.target));
+    local d = orm.adapter:get_dialect();
+    local params, wheres = {}, {};
+
+    if (configure) then
+        local sub = NormQueryBuilder(target);
+        configure(sub);
+        for i = 1, #sub._state.wheres do wheres[#wheres + 1] = sub._state.wheres[i]; end
+    end
+    if (target.soft_deletes) then
+        wheres[#wheres + 1] = { raw = sqlmod.quote_ref(d, target.table .. "." .. target.soft_deletes) .. " IS NULL" };
+    end
+
+    if (rel.kind == "belongs_to_many") then
+        local through = rel.through or utils.default_pivot(model.table, target.table);
+        local pivot_main = rel.key;
+        local pivot_other = rel.otherKey or (utils.singularize(target.table) .. "_id");
+        local other_local = rel.otherLocalKey or target.primary_key;
+        local local_key = rel.localKey or model.primary_key;
+        table.insert(wheres, 1, { raw = sqlmod.quote_ref(d, through .. "." .. pivot_main)
+            .. " = " .. sqlmod.quote_ref(d, model.table .. "." .. local_key) });
+        local clause = sqlmod.compile_where(wheres, d, params);
+        local from = ("%s INNER JOIN %s ON %s = %s"):format(
+            d.quote(through), d.quote(target.table),
+            sqlmod.quote_ref(d, target.table .. "." .. other_local),
+            sqlmod.quote_ref(d, through .. "." .. pivot_other));
+        return ("(SELECT %s FROM %s%s)"):format(inner_select, from, clause), params;
+    end
+
+    local corr;
+    if (rel.kind == "belongs_to") then
+        local other_key = rel.otherKey or target.primary_key;
+        corr = sqlmod.quote_ref(d, target.table .. "." .. other_key)
+            .. " = " .. sqlmod.quote_ref(d, model.table .. "." .. rel.key);
+    else -- has_one / has_many
+        local local_key = rel.localKey or model.primary_key;
+        corr = sqlmod.quote_ref(d, target.table .. "." .. rel.key)
+            .. " = " .. sqlmod.quote_ref(d, model.table .. "." .. local_key);
+    end
+    table.insert(wheres, 1, { raw = corr });
+    local clause = sqlmod.compile_where(wheres, d, params);
+    return ("(SELECT %s FROM %s%s)"):format(inner_select, d.quote(target.table), clause), params;
+end
+
 --- Eager-load relations with the result (one batched query per relation level —
 --- no N+1), attaching them to each returned record. Three forms:
 ---   * `include("posts", "profile")` — simple relation names.
@@ -276,6 +333,75 @@ function NormQueryBuilder:where_not_null(column)
     return self;
 end
 
+--- Keep only rows that HAVE at least one related row for `name` (optionally
+--- matching the `configure` conditions). Compiles to `EXISTS (correlated subquery)`.
+--- ```lua
+---     User:where_has("posts"):all():await()                       -- users with any post
+---     User:where_has("posts", function(q) q:where("published", true) end):all():await()
+--- ```
+---@param name string Relation name.
+---@param configure? fun(q: NormQueryBuilder) Conditions on the related rows.
+---@return NormQueryBuilder self
+function NormQueryBuilder:where_has(name, configure)
+    local rel = self.model.relations[name];
+    assert(rel, ("[norm] where_has: model '%s' has no relation '%s'"):format(self.model.table, name));
+    local sql, params = relation_subquery(self, rel, "1", configure);
+    self._state.wheres[#self._state.wheres + 1] = { exists = true, negate = false, sql = sql, params = params, bool = "AND" };
+    return self;
+end
+
+--- Inverse of `where_has`: keep only rows with NO matching related row
+--- (`NOT EXISTS (...)`).
+---@param name string Relation name.
+---@param configure? fun(q: NormQueryBuilder)
+---@return NormQueryBuilder self
+function NormQueryBuilder:where_doesnt_have(name, configure)
+    local rel = self.model.relations[name];
+    assert(rel, ("[norm] where_doesnt_have: model '%s' has no relation '%s'"):format(self.model.table, name));
+    local sql, params = relation_subquery(self, rel, "1", configure);
+    self._state.wheres[#self._state.wheres + 1] = { exists = true, negate = true, sql = sql, params = params, bool = "AND" };
+    return self;
+end
+
+--- Add a `<name>_count` field to each returned record: the number of related rows,
+--- without loading them (a correlated `COUNT(*)` subquery). Soft-deleted related
+--- rows aren't counted.
+--- ```lua
+---     local users = User:with_count("posts"):all():await()
+---     print(users[1].posts_count)
+--- ```
+---@param ... string relation names
+---@return NormQueryBuilder self
+function NormQueryBuilder:with_count(...)
+    self._state.with_counts = self._state.with_counts or {};
+    local names = { ... };
+    for i = 1, #names do self._state.with_counts[#self._state.with_counts + 1] = names[i]; end
+    return self;
+end
+
+--- Internal: fold `with_count` relations into a select state (adds `*` + the count
+--- subqueries to `raw_columns`). Returns (state, counts) — counts is nil if none.
+---@private
+---@param state NormQueryState
+---@return NormQueryState state, string[]|nil counts
+function NormQueryBuilder:_prepare_counts(state)
+    local counts = self._state.with_counts;
+    if (not counts or #counts == 0) then return state, nil; end
+    local d = self.model.orm.adapter:get_dialect();
+    local s = {};
+    for k, v in pairs(state) do s[k] = v; end
+    s.raw_columns = {};
+    if (state.raw_columns) then for i = 1, #state.raw_columns do s.raw_columns[i] = state.raw_columns[i]; end end
+    if (not s.columns or #s.columns == 0) then s.raw_columns[#s.raw_columns + 1] = "*"; end
+    for i = 1, #counts do
+        local rel = self.model.relations[counts[i]];
+        assert(rel, ("[norm] with_count: model '%s' has no relation '%s'"):format(self.model.table, counts[i]));
+        local sub = relation_subquery(self, rel, "COUNT(*)", nil); -- param-free (no configure)
+        s.raw_columns[#s.raw_columns + 1] = sub .. " AS " .. d.quote(counts[i] .. "_count");
+    end
+    return s, counts;
+end
+
 --- Add an ORDER BY clause (call again for secondary orderings).
 --- ```lua
 ---     User:query():order("coins", "DESC"):order("name"):all():await()
@@ -343,7 +469,7 @@ end
 function NormQueryBuilder:all()
     local model = self.model;
     local includes = self._state.includes;
-    local state = self:_effective_state();
+    local state, counts = self:_prepare_counts(self:_effective_state());
     if (includes and next(includes) ~= nil) then
         return model.orm:_query_with_includes(model, state, includes, false);
     end
@@ -351,7 +477,13 @@ function NormQueryBuilder:all()
     local statement, params = sqlmod.select(state, d);
     return model.orm:_query_map(statement, params, function(rows)
         local out = {};
-        for i = 1, #rows do out[i] = model:wrap(rows[i]); end
+        for i = 1, #rows do
+            local rec = model:wrap(rows[i]);
+            if (counts) then
+                for j = 1, #counts do rec[counts[j] .. "_count"] = tonumber(rows[i][counts[j] .. "_count"]) or 0; end
+            end
+            out[i] = rec;
+        end
         return out;
     end);
 end
@@ -365,7 +497,7 @@ function NormQueryBuilder:first()
     self._state.limit = 1;
     local model = self.model;
     local includes = self._state.includes;
-    local state = self:_effective_state();
+    local state, counts = self:_prepare_counts(self:_effective_state());
     if (includes and next(includes) ~= nil) then
         return model.orm:_query_with_includes(model, state, includes, true);
     end
@@ -373,7 +505,12 @@ function NormQueryBuilder:first()
     local statement, params = sqlmod.select(state, d);
     return model.orm:_query_map(statement, params, function(rows)
         local row = rows[1];
-        return row and model:wrap(row) or nil;
+        if (not row) then return nil; end
+        local rec = model:wrap(row);
+        if (counts) then
+            for j = 1, #counts do rec[counts[j] .. "_count"] = tonumber(row[counts[j] .. "_count"]) or 0; end
+        end
+        return rec;
     end);
 end
 
