@@ -631,5 +631,56 @@ check("dirty: no-op save issues no query", #tmk.calls == before, #tmk.calls - be
 check("dirty: no-op save still resolves the record", same == rec2);
 check("dirty: no-op leaves updated_at intact", rec2.updated_at == "t0", rec2.updated_at);
 
+-- ===============================================================
+print("== Test group 14: find_or_create / find_or_new / update_or_create ==");
+local fc = Routed({ dialect = "mysql" });
+fc.rows.players = { { id = 1, account_id = "AAA", name = "Alice" } };
+local fdb = orm.new({ adapter = fc, promise = orm.promise.builtin() });
+local Player = fdb:define("players", {
+    id         = orm.types.id(),
+    account_id = orm.types.string({ length = 32 }),
+    name       = orm.types.string({ length = 32 }),
+});
+local function emitted(mock, kind)
+    for _, q in ipairs(mock.queries) do if (q:find(kind, 1, true)) then return true; end end
+    return false;
+end
+
+-- existing -> returns it, no INSERT
+fc.queries = {};
+local p1;
+Player:find_or_create({ account_id = "AAA" }, { name = "ignored" }):next(function(r) p1 = r; end);
+check("find_or_create returns existing", p1 and p1.name == "Alice", p1 and p1.name);
+check("find_or_create existing issues no INSERT", not emitted(fc, "INSERT"));
+
+-- missing -> INSERT merged attributes + values
+fc.queries = {};
+local p2;
+Player:find_or_create({ account_id = "BBB" }, { name = "Bob" }):next(function(r) p2 = r; end);
+check("find_or_create creates when missing", p2 and p2.account_id == "BBB" and p2.name == "Bob", p2 and p2.name);
+check("find_or_create persisted the new record", p2 and p2.__persisted == true);
+check("find_or_create emitted an INSERT", emitted(fc, "INSERT"));
+
+-- find_or_new: missing -> unsaved build, no INSERT
+fc.queries = {};
+local p3;
+Player:find_or_new({ account_id = "CCC" }, { name = "Cara" }):next(function(r) p3 = r; end);
+check("find_or_new builds unsaved when missing", p3 and p3.__persisted == false and p3.name == "Cara");
+check("find_or_new issues no INSERT", not emitted(fc, "INSERT"));
+
+-- update_or_create: existing -> UPDATE
+fc.queries = {};
+local p4;
+Player:update_or_create({ account_id = "AAA" }, { name = "Alice2" }):next(function(r) p4 = r; end);
+check("update_or_create updates existing", p4 and p4.name == "Alice2", p4 and p4.name);
+check("update_or_create emitted an UPDATE", emitted(fc, "UPDATE"));
+
+-- update_or_create: missing -> INSERT
+fc.queries = {};
+local p5;
+Player:update_or_create({ account_id = "DDD" }, { name = "Dave" }):next(function(r) p5 = r; end);
+check("update_or_create inserts when missing", p5 and p5.__persisted == true and p5.name == "Dave");
+check("update_or_create missing emitted an INSERT", emitted(fc, "INSERT"));
+
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
 if (failed > 0) then error("self-test failed"); end
