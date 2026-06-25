@@ -35,16 +35,16 @@ function json.define(spec)
 end
 
 --- Wrap a Lua/FiveM-style library exposing `encode` / `decode` (e.g. FiveM's
---- global `json`, or a dkjson-like table). Defaults to the global `json`.
+--- global `json` / rapidjson, or a dkjson-like table). Defaults to the global `json`.
 --- ```lua
----     local db = Norm.new({ adapter = a, json = Norm.json.lua() }) -- uses _ENV.json
+---     local db = Norm.new({ adapter = a, json = Norm.json.rapidjson() }) -- uses _ENV.json
 --- ```
 ---@param lib? table The JSON library (defaults to `_ENV.json`).
 ---@return NormJsonProvider
 function json.rapidjson(lib)
     lib = lib or _ENV.json;
     assert(type(lib) == "table" and type(lib.encode) == "function" and type(lib.decode) == "function",
-        "[norm] json.lua requires a library with encode/decode (e.g. FiveM's `json`)");
+        "[norm] json.rapidjson requires a library with encode/decode (e.g. FiveM's `json`)");
     return {
         name = "rapidjson",
         encode = function(value) return lib.encode(value); end,
