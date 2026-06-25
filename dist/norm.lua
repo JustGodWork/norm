@@ -1337,6 +1337,7 @@ local promise = {};
 ---@overload fun(executor?: fun(resolve: fun(value: any), reject: fun(reason: any))): NormPromise
 local NormPromise = class.new("NormPromise");
 
+---@private
 ---@param executor? fun(resolve: fun(value: any), reject: fun(reason: any))
 function NormPromise:__init(executor)
     self._state = "pending";
@@ -1351,6 +1352,7 @@ function NormPromise:__init(executor)
     end
 end
 
+---@private
 function NormPromise:_settle(state, value)
     if (self._state ~= "pending") then return; end
     self._state = state;
@@ -1412,6 +1414,11 @@ end
 
 --- Block the current coroutine until the promise settles, then return its value
 --- (or raise its rejection reason). Must be called from inside a coroutine.
+--- ```lua
+---     coroutine.wrap(function()
+---         local user = User:find(1):await()
+---     end)()
+--- ```
 ---@return any value
 function NormPromise:await()
     if (self._state == "pending") then
@@ -1734,6 +1741,7 @@ local dialect = require("dialect");
 ---@overload fun(options?: NormAdapterOptions): NormAdapter
 local NormAdapter = class.new("NormAdapter");
 
+---@private
 ---@param options? NormAdapterOptions
 function NormAdapter:__init(options)
     self.options = options or {};
@@ -1825,6 +1833,7 @@ local utils = require("utils");
 ---@overload fun(model: NormModel): NormQueryBuilder
 local NormQueryBuilder = class.new("NormQueryBuilder");
 
+---@private
 ---@param model NormModel
 function NormQueryBuilder:__init(model)
     self.model = model;
@@ -2012,7 +2021,10 @@ function NormQueryBuilder:scope(name, ...)
     return self;
 end
 
---- Restrict selected columns. select("id","name") or select({"id","name"}).
+--- Restrict selected columns (the inverse is `:omit`).
+--- ```lua
+---     User:query():select("id", "name"):all():await()
+--- ```
 ---@param ... string|string[]
 ---@return NormQueryBuilder self
 function NormQueryBuilder:select(...)
@@ -2121,6 +2133,9 @@ function NormQueryBuilder:where(column, op, value)
 end
 
 --- OR variant of `where`.
+--- ```lua
+---     User:query():where("admin", true):or_where("coins", ">", 1000):all():await()
+--- ```
 ---@param column string|table<string, any>
 ---@param op? string
 ---@param value? any
@@ -2697,6 +2712,7 @@ local module = {};
 ---@field [string] any Column values.
 local NormRecord = class.new("NormRecord");
 
+---@private
 ---@param model NormModel
 ---@param row? table<string, any>
 ---@param persisted? boolean
@@ -3342,6 +3358,7 @@ module.Record = NormRecord;
 ---@overload fun(orm: NormOrm, table_name: string, columns: NormColumn[], record_class: NormRecord): NormModel
 local NormModel = class.new("NormModel");
 
+---@private
 ---@param orm NormOrm
 ---@param table_name string
 ---@param columns NormColumn[]
@@ -3449,6 +3466,7 @@ function NormModel:hook(event, fn)
 end
 
 --- Run every handler registered for `event`, in registration order.
+---@private
 ---@param event string
 ---@param record NormRecord
 function NormModel:_fire(event, record)
@@ -4038,6 +4056,7 @@ function module.define(orm, table_name, schema, options)
     -- walk), so a Record subclass must define its own __init forwarding to the base.
     -- This also lets users attach custom methods to a model's records.
     local record_class = class.extend(unique_record_name(table_name), NormRecord);
+    ---@private
     function record_class:__init(model, row, persisted)
         NormRecord.__init(self, model, row, persisted);
     end
@@ -4171,6 +4190,7 @@ local NormOrm = class.new("NormOrm");
 ---@field json? NormJsonProvider|"auto"|false JSON provider for `json` columns. `"auto"` (default) uses the adapter's, else auto-detects (Nanos `JSON` / Lua `json`), else raw passthrough; `false` disables (de)serialisation.
 ---@field queue_until_ready? boolean Hold data operations in a queue until the first successful `sync()`/`migrate()`, then flush them (default false: run immediately).
 
+---@private
 ---@param options NormOptions
 function NormOrm:__init(options)
     utils.assert(type(options) == "table", "Norm: options table is required");
@@ -4337,6 +4357,7 @@ function NormOrm:transaction(fn)
 end
 
 --- Run a SELECT and transform the rows inside the promise.
+---@private
 ---@param query string
 ---@param params? any[]
 ---@param transform fun(rows: table[]): any
@@ -4354,6 +4375,7 @@ function NormOrm:_query_map(query, params, transform)
 end
 
 --- Run a write statement and transform the result inside the promise.
+---@private
 ---@param query string
 ---@param params? any[]
 ---@param transform fun(result: NormExecResult): any
@@ -4658,6 +4680,9 @@ function NormOrm:define(table_name, schema, options)
 end
 
 --- Get a previously defined model.
+--- ```lua
+---     local User = db:model("users")
+--- ```
 ---@param table_name string
 ---@return NormModel|nil
 function NormOrm:model(table_name)
@@ -5010,6 +5035,7 @@ local function detect_mariadb_returning(db)
     return (major > 10) or (major == 10 and minor >= 5);
 end
 
+---@private
 ---@param options? NormNanosAdapterOptions
 function NormNanosAdapter:__init(options)
     options = options or {};
@@ -5245,6 +5271,7 @@ local jsonlib = require("json");
 ---@overload fun(options?: NormOxMySQLAdapterOptions): NormOxMySQLAdapter
 local NormOxMySQLAdapter = class.extend("NormOxMySQLAdapter", NormAdapter);
 
+---@private
 ---@param options? NormOxMySQLAdapterOptions
 function NormOxMySQLAdapter:__init(options)
     options = options or {};
