@@ -522,5 +522,51 @@ check("returning: insert omits autoincrement id", rlast.sql:find("(`id`", 1, tru
 check("returning: id read from RETURNING row", rcreated and rcreated.id == 99, rcreated and rcreated.id);
 check("returning: record persisted", rcreated and rcreated.__persisted == true);
 
+-- ===============================================================
+print("== Test group 12: many-to-many (belongs_to_many via pivot) ==");
+-- Reuse the routed mock: it filters SELECTs by table + single-column WHERE, so
+-- the pivot query and the target query are exercised faithfully.
+local m2m = Routed({ dialect = "mysql" });
+m2m.rows.users = { { id = 1, name = "Alice" }, { id = 2, name = "Bob" } };
+m2m.rows.roles = { { id = 100, name = "admin" }, { id = 200, name = "mod" }, { id = 300, name = "vip" } };
+m2m.rows.role_user = {
+    { user_id = 1, role_id = 100 },
+    { user_id = 1, role_id = 200 },
+    { user_id = 2, role_id = 300 },
+};
+local mdb = orm.new({ adapter = m2m, promise = orm.promise.builtin() });
+-- no options: exercises the default through ("role_user"), key ("user_id") and otherKey ("role_id").
+local MUsers = mdb:define("users", {
+    id    = orm.types.id(),
+    name  = orm.types.string({ length = 32 }),
+    roles = orm.types.belongsToMany("roles"),
+});
+mdb:define("roles", { id = orm.types.id(), name = orm.types.string({ length = 32 }) });
+
+check("m2m relation is not a column", MUsers.columns_by_name.roles == nil and MUsers.relations.roles ~= nil);
+
+-- eager: users -> roles. Batched: main + pivot + targets = 3 queries (no N+1).
+m2m.queries = {};
+local musers;
+MUsers:query():include("roles"):all():next(function(r) musers = r; end);
+check("m2m eager attaches roles", musers and #musers[1].roles == 2 and #musers[2].roles == 1,
+    musers and (#musers[1].roles .. "/" .. #musers[2].roles));
+check("m2m eager resolved target rows", musers and musers[1].roles[1].name == "admin"
+    and musers[2].roles[1].name == "vip", musers and musers[1].roles[1].name);
+check("m2m eager no N+1 (3 queries: main + pivot + targets)", #m2m.queries == 3, #m2m.queries);
+
+-- lazy: one parent -> roles array, cached on self[name].
+local mu = MUsers:wrap({ id = 1, name = "Alice" });
+local mlist;
+mu:load("roles"):next(function(l) mlist = l; end);
+check("m2m lazy loads + caches", mlist and #mlist == 2 and mu.roles == mlist, mlist and #mlist);
+
+-- parent with no pivot rows -> empty array (not nil).
+local mu3 = MUsers:wrap({ id = 99, name = "Nobody" });
+local mempty = nil;
+local got_empty = false;
+mu3:load("roles"):next(function(l) mempty = l; got_empty = true; end);
+check("m2m lazy empty array when no links", got_empty and type(mempty) == "table" and #mempty == 0);
+
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
 if (failed > 0) then error("self-test failed"); end
