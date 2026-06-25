@@ -969,5 +969,55 @@ check("migrate does NOT mark ready", gdb:is_ready() == false);
 gdb:sync();
 check("sync marks ready after migrate", gdb:is_ready() == true);
 
+-- ===============================================================
+print("== Test group 21: nested includes (include \"posts.comments\") ==");
+local nm = Routed({ dialect = "mysql" });
+nm.rows.users = { { id = 1, name = "A" }, { id = 2, name = "B" } };
+nm.rows.posts = { { id = 10, user_id = 1 }, { id = 11, user_id = 1 }, { id = 12, user_id = 2 } };
+nm.rows.comments = { { id = 100, post_id = 10 }, { id = 101, post_id = 10 }, { id = 102, post_id = 12 } };
+local ndb = orm.new({ adapter = nm, promise = orm.promise.builtin() });
+local NUser = ndb:define("users", {
+    id = orm.types.id(), name = orm.types.string({ length = 32 }),
+    posts = orm.types.hasMany("posts", { key = "user_id" }),
+});
+ndb:define("posts", {
+    id = orm.types.id(), user_id = orm.types.integer(),
+    comments = orm.types.hasMany("comments", { key = "post_id" }),
+});
+ndb:define("comments", { id = orm.types.id(), post_id = orm.types.integer() });
+
+nm.queries = {};
+local nusers;
+NUser:query():include("posts.comments"):all():next(function(r) nusers = r; end);
+check("nested: users carry their posts", nusers and #nusers[1].posts == 2 and #nusers[2].posts == 1,
+    nusers and (#nusers[1].posts .. "/" .. #nusers[2].posts));
+check("nested: posts carry their comments", nusers and nusers[1].posts[1] and #nusers[1].posts[1].comments == 2,
+    nusers and nusers[1].posts[1] and #nusers[1].posts[1].comments);
+check("nested: second branch loaded too", nusers and nusers[2].posts[1] and #nusers[2].posts[1].comments == 1,
+    nusers and nusers[2].posts[1] and #nusers[2].posts[1].comments);
+check("nested: no N+1 (3 queries: users + posts + comments)", #nm.queries == 3, #nm.queries);
+
+-- ===============================================================
+print("== Test group 22: omit (select all columns but some) ==");
+local om = Mock({ dialect = "mysql" });
+om.query_result = { { id = 1, name = "Al", email = "a@b.c" } };
+local Odb = orm.new({ adapter = om, promise = orm.promise.builtin() });
+local OUser = Odb:define("users", {
+    id       = orm.types.id(),
+    name     = orm.types.string({ length = 32 }),
+    email    = orm.types.string({ length = 64 }),
+    password = orm.types.string({ length = 64 }),
+});
+local omitted;
+OUser:omit("password"):first():next(function(u) omitted = u; end);
+local osql = last_sql(om);
+print("  OMIT: " .. osql);
+check("omit keeps the other columns",
+    osql:find("`id`", 1, true) and osql:find("`name`", 1, true) and osql:find("`email`", 1, true) ~= nil, osql);
+check("omit excludes the listed column", osql:find("`password`", 1, true) == nil, osql);
+check("omit is not SELECT *", osql:find("SELECT *", 1, true) == nil, osql);
+check("omitted column is absent on the record", omitted and omitted.password == nil and omitted.name == "Al",
+    omitted and omitted.name);
+
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
 if (failed > 0) then error("self-test failed"); end
