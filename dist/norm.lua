@@ -489,33 +489,91 @@ function types.id(options)
     return make("id", options);
 end
 
+--- Integer column (`INT` / SQLite `INTEGER`). Often a foreign-key column.
+--- ```lua
+---     coins   = Norm.types.integer({ default = 0 }),
+---     user_id = Norm.types.integer({ nullable = false }), -- FK column
+--- ```
 ---@param options? NormColumnOptions
 ---@return NormColumn
 function types.integer(options) return make("integer", options); end
+
+--- 64-bit integer (`BIGINT` / SQLite `INTEGER`). For values beyond 32 bits, e.g.
+--- Discord/Steam IDs or epoch milliseconds.
+--- ```lua
+---     steam_id = Norm.types.bigint({ unique = true }),
+--- ```
 ---@param options? NormColumnOptions
 ---@return NormColumn
 function types.bigint(options) return make("bigint", options); end
+
+--- Variable-length string (`VARCHAR(length)` / SQLite `TEXT`). Pass `length` for
+--- the VARCHAR size on MySQL (ignored by SQLite, which is typeless).
+--- ```lua
+---     name  = Norm.types.string({ length = 64, nullable = false }),
+---     email = Norm.types.string({ length = 128, unique = true }),
+--- ```
 ---@param options? NormColumnOptions
 ---@return NormColumn
 function types.string(options) return make("string", options); end
+
+--- Unbounded text (`TEXT`). Use for large free-form content where `string`'s
+--- length cap is impractical.
+--- ```lua
+---     bio = Norm.types.text(),
+--- ```
 ---@param options? NormColumnOptions
 ---@return NormColumn
 function types.text(options) return make("text", options); end
+
+--- Single-precision floating point (`FLOAT` / SQLite `REAL`).
+--- ```lua
+---     ratio = Norm.types.float({ default = 1.0 }),
+--- ```
 ---@param options? NormColumnOptions
 ---@return NormColumn
 function types.float(options) return make("float", options); end
+
+--- Double-precision floating point (`DOUBLE` / SQLite `REAL`). Prefer over
+--- `float` when you need more precision (coordinates, money-as-float, etc.).
+--- ```lua
+---     pos_x = Norm.types.double({ default = 0 }),
+--- ```
 ---@param options? NormColumnOptions
 ---@return NormColumn
 function types.double(options) return make("double", options); end
+
+--- Boolean, stored as `TINYINT(1)` on MySQL / `INTEGER` on SQLite. Norm converts
+--- to/from a real Lua boolean automatically (true/false in, true/false out).
+--- ```lua
+---     admin = Norm.types.boolean({ default = false }),
+--- ```
 ---@param options? NormColumnOptions
 ---@return NormColumn
 function types.boolean(options) return make("boolean", options); end
+
+--- Date + time (`DATETIME` / SQLite `TEXT`). Pair with `Norm.types.raw` to get a
+--- DB-side default timestamp.
+--- ```lua
+---     created_at = Norm.types.datetime({ default = Norm.types.raw("CURRENT_TIMESTAMP") }),
+--- ```
 ---@param options? NormColumnOptions
 ---@return NormColumn
 function types.datetime(options) return make("datetime", options); end
+
+--- Date only (`DATE` / SQLite `TEXT`).
+--- ```lua
+---     birthday = Norm.types.date(),
+--- ```
 ---@param options? NormColumnOptions
 ---@return NormColumn
 function types.date(options) return make("date", options); end
+
+--- JSON column (`JSON` on MySQL / `TEXT` on SQLite). Norm stores/returns the raw
+--- string; encode and decode it yourself. A raw default must be a valid literal.
+--- ```lua
+---     coordinates = Norm.types.json({ default = '{"x":0,"y":0,"z":0}' }),
+--- ```
 ---@param options? NormColumnOptions
 ---@return NormColumn
 function types.json(options) return make("json", options); end
@@ -531,11 +589,20 @@ function types.json(options) return make("json", options); end
 ---@field target string The related table name.
 ---@field key? string FK column (on this model for belongs_to, on the target otherwise).
 ---@field otherKey? string Referenced column (defaults to the relevant primary key).
+---@field onDelete? string Referential action emitted on the FK (belongs_to only).
+---@field onUpdate? string Referential action emitted on the FK (belongs_to only).
 ---@field name? string Set by define() from the schema key.
 
+--- A referential action for a foreign key: "CASCADE", "SET NULL", "RESTRICT",
+--- "NO ACTION" or "SET DEFAULT" (case-insensitive).
+---@alias NormReferentialAction
+---| "CASCADE" | "SET NULL" | "RESTRICT" | "NO ACTION" | "SET DEFAULT"
+
 ---@class NormRelationOptions
----@field key? string
----@field otherKey? string
+---@field key? string FK column name. See each relation for its default.
+---@field otherKey? string Referenced column (defaults to the relevant primary key).
+---@field onDelete? NormReferentialAction Emitted as `ON DELETE …` on the FK (belongs_to only).
+---@field onUpdate? NormReferentialAction Emitted as `ON UPDATE …` on the FK (belongs_to only).
 
 ---@param kind string
 ---@param target string
@@ -549,16 +616,23 @@ local function relation(kind, target, options)
         target = target,
         key = options.key,
         otherKey = options.otherKey,
+        onDelete = options.onDelete,
+        onUpdate = options.onUpdate,
     };
 end
 
---- This record holds a foreign key pointing to one `target` row.
---- `key` defaults to `<relationName>_id`, `otherKey` to the target's primary key.
+--- This record holds a foreign key pointing to one `target` row (the "many" side
+--- of a one-to-many, or either side of a one-to-one). `key` defaults to
+--- `<relationName>_id`, `otherKey` to the target's primary key.
+---
+--- This is the ONLY relation that can emit a real SQL `FOREIGN KEY` constraint
+--- (its `key` lives on this table). Add `onDelete`/`onUpdate` to control the
+--- referential action — emitted by `sync()` when foreign keys are enabled.
 --- ```lua
 ---     db:define("posts", {
 ---         id      = Norm.types.id(),
----         user_id = Norm.types.integer(),
----         author  = Norm.types.belongsTo("users", { key = "user_id" }),
+---         user_id = Norm.types.integer({ nullable = false }), -- the FK column
+---         author  = Norm.types.belongsTo("users", { key = "user_id", onDelete = "CASCADE" }),
 ---     })
 ---     -- post:load("author"):await()  /  Post:query():include("author"):all():await()
 --- ```
@@ -567,15 +641,26 @@ end
 ---@return NormRelation
 function types.belongsTo(target, options) return relation("belongs_to", target, options); end
 
---- The `target` holds a foreign key pointing back to one of this model's rows.
---- `key` defaults to `<thisTableSingular>_id`, `otherKey` to this primary key.
+--- One-to-one inverse: the `target` table holds a foreign key pointing back to a
+--- single row of this model. `key` defaults to `<thisTableSingular>_id`,
+--- `otherKey` to this primary key. Declare the matching `belongsTo` on the target
+--- if you want the FK constraint (the FK column lives there, not here).
+--- ```lua
+---     db:define("users", {
+---         id      = Norm.types.id(),
+---         profile = Norm.types.hasOne("profiles", { key = "user_id" }),
+---     })
+---     -- user:load("profile"):await()  /  User:query():include("profile"):all():await()
+--- ```
 ---@param target string
 ---@param options? NormRelationOptions
 ---@return NormRelation
 function types.hasOne(target, options) return relation("has_one", target, options); end
 
---- The `target` holds a foreign key pointing back to this model's rows (one-to-many).
---- `key` defaults to `<thisTableSingular>_id`, `otherKey` to this primary key.
+--- One-to-many inverse: the `target` table holds a foreign key pointing back to
+--- this model's rows. `key` defaults to `<thisTableSingular>_id`, `otherKey` to
+--- this primary key. As with `hasOne`, the FK column lives on the target, so put
+--- the `belongsTo` (and any `onDelete`) there.
 --- ```lua
 ---     db:define("users", {
 ---         id    = Norm.types.id(),
@@ -669,14 +754,41 @@ local function column_def(column, d)
     return def;
 end
 
---- CREATE TABLE IF NOT EXISTS.
+--- A foreign-key constraint to emit inside CREATE TABLE.
+---@class NormForeignKey
+---@field column string FK column on this table.
+---@field ref_table string Referenced table.
+---@field ref_column string Referenced column.
+---@field on_delete? string Referential action (e.g. "CASCADE").
+---@field on_update? string Referential action (e.g. "CASCADE").
+
+--- Build a `FOREIGN KEY (...) REFERENCES ...` table constraint fragment. Works
+--- for both MySQL (inline) and SQLite (inline, forward references allowed).
+---@param fk NormForeignKey
+---@param d NormDialect
+---@return string
+local function foreign_key_def(fk, d)
+    local frag = ("FOREIGN KEY (%s) REFERENCES %s (%s)"):format(
+        d.quote(fk.column), d.quote(fk.ref_table), d.quote(fk.ref_column));
+    if (fk.on_delete) then frag = frag .. " ON DELETE " .. tostring(fk.on_delete):upper(); end
+    if (fk.on_update) then frag = frag .. " ON UPDATE " .. tostring(fk.on_update):upper(); end
+    return frag;
+end
+sql.foreign_key_def = foreign_key_def;
+
+--- CREATE TABLE IF NOT EXISTS. Pass `foreign_keys` to append `FOREIGN KEY`
+--- constraints (the caller decides whether to emit them per dialect/options).
 ---@param table_name string
 ---@param columns NormColumn[] Ordered list (each has a `.name`).
 ---@param d NormDialect
+---@param foreign_keys? NormForeignKey[] Optional FK constraints to append.
 ---@return string statement
-function sql.create_table(table_name, columns, d)
+function sql.create_table(table_name, columns, d, foreign_keys)
     local parts = {};
     for i = 1, #columns do parts[#parts + 1] = column_def(columns[i], d); end
+    if (foreign_keys) then
+        for i = 1, #foreign_keys do parts[#parts + 1] = foreign_key_def(foreign_keys[i], d); end
+    end
     return ("CREATE TABLE IF NOT EXISTS %s (%s)%s"):format(
         d.quote(table_name), table.concat(parts, ", "), d.table_suffix);
 end
@@ -1795,15 +1907,19 @@ function NormModel:find_by(filter)
 end
 
 --- Create this model's table (CREATE TABLE IF NOT EXISTS). Prefer `orm:sync()`
---- to create every model at once. Resolves with true.
+--- to create every model at once (it also orders tables by their foreign-key
+--- dependencies). Emits this model's `belongsTo` foreign keys when enabled.
+--- Resolves with true.
 --- ```lua
 ---     User:sync():await()
 --- ```
 ---@return NormBooleanPromise promise resolving to true
 function NormModel:sync()
-    local d = self.orm.adapter:get_dialect();
-    local statement = sqlmod.create_table(self.table, self.columns, d);
-    return self.orm:_execute_map(statement, {}, function() return true; end);
+    local orm = self.orm;
+    local d = orm.adapter:get_dialect();
+    local fks = orm:_should_emit_fk(d) and orm:_collect_foreign_keys(self) or nil;
+    local statement = sqlmod.create_table(self.table, self.columns, d, fks);
+    return orm:_execute_map(statement, {}, function() return true; end);
 end
 
 module.Model = NormModel;
@@ -1896,7 +2012,9 @@ local model_module = require("model");
 ---@field provider NormPromiseProvider
 ---@field models table<string, NormModel>
 ---@field log boolean
+---@field foreign_keys boolean|"auto" Whether `sync()` emits SQL FOREIGN KEY constraints.
 ---@field private _logger fun(level: string, message: string)
+---@field private _warned_sqlite_fk boolean
 ---@overload fun(options: NormOptions): NormOrm
 local NormOrm = class.new("NormOrm");
 
@@ -1905,6 +2023,7 @@ local NormOrm = class.new("NormOrm");
 ---@field promise? NormPromiseProvider Promise provider. Defaults to the adapter's, else built-in.
 ---@field log? boolean Log every executed statement.
 ---@field logger? fun(level: string, message: string)
+---@field foreignKeys? boolean|"auto" Emit SQL FOREIGN KEY constraints from `belongsTo` relations. `"auto"` (default) emits on MySQL, skips on SQLite (with a one-time warning); `true` always emits; `false` never emits (no warning).
 
 ---@param options NormOptions
 function NormOrm:__init(options)
@@ -1929,6 +2048,8 @@ function NormOrm:__init(options)
     self.models = {};
     self.log = options.log == true;
     self._logger = options.logger or utils.logger;
+    self.foreign_keys = (options.foreignKeys == nil) and "auto" or options.foreignKeys;
+    self._warned_sqlite_fk = false;
 end
 
 ---@private
@@ -2140,17 +2261,140 @@ function NormOrm:model(table_name)
     return self.models[table_name];
 end
 
+--- Internal: the FOREIGN KEY constraints to emit for a model, derived from its
+--- `belongs_to` relations (the side that physically holds the FK column). The
+--- referenced column defaults to the target's primary key, resolved here because
+--- the target may have been defined after this model.
+---@private
+---@param model NormModel
+---@return NormForeignKey[]
+function NormOrm:_collect_foreign_keys(model)
+    local fks = {};
+    for _, rel in pairs(model.relations) do
+        if (rel.kind == "belongs_to" and rel.key) then
+            local target = self.models[rel.target];
+            -- Skip relations whose target table isn't registered: we can't emit a
+            -- REFERENCES clause to a table Norm doesn't know how to create.
+            if (target) then
+                fks[#fks + 1] = {
+                    column = rel.key,
+                    ref_table = rel.target,
+                    ref_column = rel.otherKey or target.primary_key or "id",
+                    on_delete = rel.onDelete,
+                    on_update = rel.onUpdate,
+                };
+            end
+        end
+    end
+    table.sort(fks, function(a, b) return a.column < b.column; end); -- stable output
+    return fks;
+end
+
+---@private
+---@return boolean
+function NormOrm:_has_any_foreign_key()
+    for _, m in pairs(self.models) do
+        if (#self:_collect_foreign_keys(m) > 0) then return true; end
+    end
+    return false;
+end
+
+--- Internal: decide whether `sync()` should emit FOREIGN KEY constraints for the
+--- given dialect, honouring the `foreignKeys` option and warning once on SQLite.
+---@private
+---@param d NormDialect
+---@return boolean
+function NormOrm:_should_emit_fk(d)
+    local mode = self.foreign_keys;
+    if (mode == false) then return false; end
+
+    if (mode == true) then
+        if (d.name == "sqlite" and not self._warned_sqlite_fk) then
+            self._warned_sqlite_fk = true;
+            self._logger("WARN", "[norm] foreignKeys=true on sqlite: constraints are emitted, but enforcement "
+                .. "needs `PRAGMA foreign_keys = ON` per connection, which Norm cannot guarantee.");
+        end
+        return true;
+    end
+
+    -- "auto": emit on engines that enforce FKs out of the box (MySQL), skip on
+    -- SQLite (per-connection PRAGMA can't be guaranteed). Warn only if relations
+    -- actually declare FKs, so FK-less SQLite schemas stay silent.
+    if (d.name == "sqlite") then
+        if (not self._warned_sqlite_fk and self:_has_any_foreign_key()) then
+            self._warned_sqlite_fk = true;
+            self._logger("WARN", "[norm] foreign keys are not emitted on sqlite (set foreignKeys=true to force "
+                .. "them, or foreignKeys=false to silence this warning).");
+        end
+        return false;
+    end
+    return true;
+end
+
+--- Internal: order models so a table is created after the tables it references
+--- via `belongs_to` (required for inline FKs on MySQL/InnoDB). Returns the table
+--- names in creation order plus whether a dependency cycle was detected.
+---@private
+---@return string[] order, boolean has_cycle
+function NormOrm:_sync_order()
+    local names = {};
+    for name in pairs(self.models) do names[#names + 1] = name; end
+    table.sort(names); -- deterministic starting point
+
+    -- deps[name] = sorted list of referenced tables that are also registered models.
+    local deps = {};
+    for _, name in ipairs(names) do
+        local set = {};
+        for _, rel in pairs(self.models[name].relations) do
+            if (rel.kind == "belongs_to" and rel.target ~= name and self.models[rel.target]) then
+                set[rel.target] = true;
+            end
+        end
+        local list = {};
+        for t in pairs(set) do list[#list + 1] = t; end
+        table.sort(list);
+        deps[name] = list;
+    end
+
+    local order, visited, on_stack, has_cycle = {}, {}, {}, false;
+    local function visit(name)
+        if (visited[name]) then return; end
+        if (on_stack[name]) then has_cycle = true; return; end
+        on_stack[name] = true;
+        for _, dep in ipairs(deps[name]) do visit(dep); end
+        on_stack[name] = nil;
+        visited[name] = true;
+        order[#order + 1] = name;
+    end
+    for _, name in ipairs(names) do visit(name); end
+    return order, has_cycle;
+end
+
 --- Create the table of every registered model (CREATE TABLE IF NOT EXISTS),
---- sequentially so foreign-key dependencies resolve in order. Resolves true.
+--- in dependency order so foreign keys resolve. When foreign keys are enabled
+--- (see the `foreignKeys` option), `belongsTo` relations emit `FOREIGN KEY`
+--- constraints. Resolves true.
 --- ```lua
 ---     db:sync():await() -- run once at startup, after defining your models
 --- ```
 ---@return NormBooleanPromise promise resolving to true
 function NormOrm:sync()
     local d = self.adapter:get_dialect();
+    local emit_fk = self:_should_emit_fk(d);
+    local order, has_cycle = self:_sync_order();
+
+    -- Inline FKs need referenced tables first; a cycle can't satisfy that on
+    -- engines that check at CREATE time (MySQL). SQLite allows forward refs.
+    if (emit_fk and has_cycle and d.name ~= "sqlite") then
+        self._logger("WARN", "[norm] cyclic foreign-key dependency detected; CREATE TABLE order cannot satisfy "
+            .. "every reference on '" .. d.name .. "'. Consider foreignKeys=false or breaking the cycle.");
+    end
+
     local statements = {};
-    for _, m in pairs(self.models) do
-        statements[#statements + 1] = sqlmod.create_table(m.table, m.columns, d);
+    for _, name in ipairs(order) do
+        local m = self.models[name];
+        local fks = emit_fk and self:_collect_foreign_keys(m) or nil;
+        statements[#statements + 1] = sqlmod.create_table(m.table, m.columns, d, fks);
     end
 
     return self.provider.new(function(resolve, reject)
@@ -2221,7 +2465,7 @@ function NormNanosAdapter:__init(options)
         assert(options.engine ~= nil, "[norm] nanos adapter requires `engine` or a `database` instance");
         options.engine = options.engine or _ENV.DatabaseEngine.SQLite;
         options.connection = options.connection or "./database.db";
-        options.pool_size = options.pool_size or 4;
+        options.pool_size = options.pool_size or 10;
         -- nanos Database(database_engine, connection_string, pool_size)
         local ok, db = pcall(Database, options.engine, options.connection, options.pool_size);
         if (not ok) then
