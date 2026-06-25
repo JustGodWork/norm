@@ -650,6 +650,84 @@ function NormModel:update_or_create(attributes, values)
     end);
 end
 
+--- **Atomic** upsert: a single `INSERT ... ON CONFLICT/ON DUPLICATE KEY UPDATE`
+--- statement (race-safe, unlike `find_or_create`). `data` is inserted; if a row
+--- with the same `opts.conflict` columns exists it is updated instead. The write
+--- is one statement; the canonical row is then read back and resolved as a record.
+---
+--- The conflict columns MUST carry a UNIQUE (or PRIMARY KEY) constraint — that is
+--- what the database matches on. `opts.conflict` defaults to the primary key;
+--- `opts.update` defaults to every written column except the conflict columns (and
+--- `created_at`, preserved on an existing row).
+--- ```lua
+---     -- create the player, or update name/last_seen if account_id already exists
+---     local p = Player:upsert(
+---         { account_id = id, name = nick, last_seen = ts },
+---         { conflict = { "account_id" } }
+---     ):await()
+--- ```
+---@param data table<string, any> Columns to insert (and update on conflict).
+---@param opts? {conflict?: string[], update?: string[]}
+---@return NormRecordOrNilPromise promise resolving to NormRecord
+function NormModel:upsert(data, opts)
+    opts = opts or {};
+    local model = self;
+    local orm = self.orm;
+    local d = orm.adapter:get_dialect();
+    local ts = model.timestamps;
+
+    local conflict = opts.conflict;
+    if (conflict == nil and model.primary_key) then conflict = { model.primary_key }; end
+    utils.assert(type(conflict) == "table" and #conflict > 0,
+        ("upsert on '%s' needs conflict columns (opts.conflict) or a primary key"):format(model.table));
+
+    -- write payload (+ timestamps for the INSERT branch).
+    local write = {};
+    for k, v in pairs(data) do write[k] = v; end
+    if (ts) then
+        local nowv = now_utc();
+        if (nowv ~= nil) then
+            if (ts.created and write[ts.created] == nil) then write[ts.created] = nowv; end
+            if (ts.updated and write[ts.updated] == nil) then write[ts.updated] = nowv; end
+        end
+    end
+
+    -- update-set: all written columns except the conflict target and created_at
+    -- (so an existing row keeps its original created_at).
+    local conflict_set = {};
+    for _, c in ipairs(conflict) do conflict_set[c] = true; end
+    local update_cols = opts.update;
+    if (update_cols == nil) then
+        update_cols = {};
+        for _, name in ipairs(utils.sorted_keys(write)) do
+            if (not conflict_set[name] and not (ts and name == ts.created)) then
+                update_cols[#update_cols + 1] = name;
+            end
+        end
+    end
+
+    local statement, params = sqlmod.upsert(model.table, model:_encode_write(write), conflict, update_cols, d);
+
+    return orm.provider.new(function(resolve, reject)
+        orm:_trace(statement, params);
+        orm.adapter:raw_execute(statement, params, function(err)
+            if (err ~= nil) then return reject(err); end
+            -- the write is atomic; read the canonical row back by the conflict key.
+            local state = { table = model.table, limit = 1, wheres = {} };
+            for _, c in ipairs(conflict) do
+                state.wheres[#state.wheres + 1] = { column = c, op = "=", value = write[c] };
+            end
+            local sel, sparams = sqlmod.select(state, d);
+            orm:_trace(sel, sparams);
+            orm.adapter:raw_query(sel, sparams, function(serr, rows)
+                if (serr ~= nil) then return reject(serr); end
+                rows = rows or {};
+                resolve(rows[1] and model:wrap(rows[1]) or nil);
+            end);
+        end);
+    end);
+end
+
 --- Create this model's table (CREATE TABLE IF NOT EXISTS). Prefer `orm:sync()`
 --- to create every model at once (it also orders tables by their foreign-key
 --- dependencies). Emits this model's `belongsTo` foreign keys when enabled.
