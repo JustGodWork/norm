@@ -512,7 +512,7 @@ local fakejson = { encode = function(_) return "E"; end, decode = function(_) re
 local lp = orm.json.rapidjson(fakejson);
 check("json.rapidjson wraps encode/decode", lp.encode({}) == "E" and lp.decode("x") == "D");
 
--- ===============================================================
+do -- scope each group below (Lua caps locals per function at 200)
 print("== Test group 11: INSERT ... RETURNING (returning-capable adapter) ==");
 -- An adapter that advertises RETURNING support must have its inserts routed
 -- through raw_query (the statement returns a row), with the id read from that
@@ -545,7 +545,7 @@ check("returning: insert omits autoincrement id", rlast.sql:find("(`id`", 1, tru
 check("returning: id read from RETURNING row", rcreated and rcreated.id == 99, rcreated and rcreated.id);
 check("returning: record persisted", rcreated and rcreated.__persisted == true);
 
--- ===============================================================
+end do
 print("== Test group 12: many-to-many (belongs_to_many via pivot) ==");
 -- Reuse the routed mock: it filters SELECTs by table + single-column WHERE, so
 -- the pivot query and the target query are exercised faithfully.
@@ -591,7 +591,7 @@ local got_empty = false;
 mu3:load("roles"):next(function(l) mempty = l; got_empty = true; end);
 check("m2m lazy empty array when no links", got_empty and type(mempty) == "table" and #mempty == 0);
 
--- ===============================================================
+end do
 print("== Test group 13: timestamps + dirty tracking ==");
 local tmk = Mock({ dialect = "sqlite" });
 local tdb = orm.new({ adapter = tmk, promise = orm.promise.builtin() });
@@ -631,7 +631,7 @@ check("dirty: no-op save issues no query", #tmk.calls == before, #tmk.calls - be
 check("dirty: no-op save still resolves the record", same == rec2);
 check("dirty: no-op leaves updated_at intact", rec2.updated_at == "t0", rec2.updated_at);
 
--- ===============================================================
+end do
 print("== Test group 14: find_or_create / find_or_new / update_or_create ==");
 local fc = Routed({ dialect = "mysql" });
 fc.rows.players = { { id = 1, account_id = "AAA", name = "Alice" } };
@@ -682,7 +682,7 @@ Player:update_or_create({ account_id = "DDD" }, { name = "Dave" }):next(function
 check("update_or_create inserts when missing", p5 and p5.__persisted == true and p5.name == "Dave");
 check("update_or_create missing emitted an INSERT", emitted(fc, "INSERT"));
 
--- ===============================================================
+end do
 print("== Test group 15: atomic upsert (ON CONFLICT / ON DUPLICATE KEY) ==");
 local function upsert_sql_of(mock)
     for _, c in ipairs(mock.calls) do
@@ -738,7 +738,7 @@ check("upsert update bumps updated_at, preserves created_at",
     tsql and tsql:find("`updated_at` = excluded.`updated_at`", 1, true) ~= nil
         and tsql:find("`created_at` = excluded.`created_at`", 1, true) == nil, tsql);
 
--- ===============================================================
+end do
 print("== Test group 16: aggregations (scalar + grouped) ==");
 local am = Mock({ dialect = "mysql" });
 local Agg = orm.new({ adapter = am, promise = orm.promise.builtin() }):define("players", {
@@ -780,7 +780,7 @@ check("group_by emits GROUP BY", gsql:find("GROUP BY `faction`", 1, true) ~= nil
 check("having emits HAVING with a bound param", gsql:find("HAVING COUNT(*) > ?", 1, true) ~= nil, gsql);
 check("rows() returns raw rows (no wrapping)", stats and #stats == 2 and stats[1].faction == "red", stats and #stats);
 
--- ===============================================================
+end do
 print("== Test group 17: migrations ==");
 local function find_sql(mock, needle)
     for _, c in ipairs(mock.calls) do if (c.sql:find(needle, 1, true)) then return c.sql; end end
@@ -834,7 +834,7 @@ mdbs:migrate({ { id = "di", up = function(m) m:drop_index("idx_acc", "players");
 check("sqlite drop_index omits ON table",
     find_sql(mms, "DROP INDEX `idx_acc`") ~= nil and find_sql(mms, "DROP INDEX `idx_acc` ON") == nil);
 
--- ===============================================================
+end do
 print("== Test group 18: m2m attach / detach / sync_pivot ==");
 local pm = Routed({ dialect = "mysql" });
 pm.rows.role_user = { { user_id = 1, role_id = 100 }, { user_id = 1, role_id = 200 } };
@@ -893,7 +893,7 @@ check("sync_pivot computes attach/detach counts", synced and synced.attached == 
 check("sync_pivot deletes the removed id", count_matching(pm, "DELETE FROM `role_user`") == 1);
 check("sync_pivot inserts the new id", count_matching(pm, "INSERT INTO `role_user`") == 1);
 
--- ===============================================================
+end do
 print("== Test group 19: joins (filter/sort by a related column) ==");
 local jm = Mock({ dialect = "mysql" });
 jm.query_result = { { id = 10, user_id = 1, title = "A" } };
@@ -925,7 +925,7 @@ check("left join clause emitted",
     lsql:find("LEFT JOIN `users` ON `users`.`id` = `posts`.`user_id`", 1, true) ~= nil, lsql);
 check("order by a qualified column", lsql:find("ORDER BY `users`.`name` DESC", 1, true) ~= nil, lsql);
 
--- ===============================================================
+end do
 print("== Test group 20: queue_until_ready ==");
 -- default (off): ready immediately, queries run at once
 local nm = Mock({ dialect = "sqlite" });
@@ -969,7 +969,7 @@ check("migrate does NOT mark ready", gdb:is_ready() == false);
 gdb:sync();
 check("sync marks ready after migrate", gdb:is_ready() == true);
 
--- ===============================================================
+end do
 print("== Test group 21: nested includes (include \"posts.comments\") ==");
 local nm = Routed({ dialect = "mysql" });
 nm.rows.users = { { id = 1, name = "A" }, { id = 2, name = "B" } };
@@ -997,7 +997,7 @@ check("nested: second branch loaded too", nusers and nusers[2].posts[1] and #nus
     nusers and nusers[2].posts[1] and #nusers[2].posts[1].comments);
 check("nested: no N+1 (3 queries: users + posts + comments)", #nm.queries == 3, #nm.queries);
 
--- ===============================================================
+end do
 print("== Test group 22: omit (select all columns but some) ==");
 local om = Mock({ dialect = "mysql" });
 om.query_result = { { id = 1, name = "Al", email = "a@b.c" } };
@@ -1019,7 +1019,7 @@ check("omit is not SELECT *", osql:find("SELECT *", 1, true) == nil, osql);
 check("omitted column is absent on the record", omitted and omitted.password == nil and omitted.name == "Al",
     omitted and omitted.name);
 
--- ===============================================================
+end do
 print("== Test group 23: include with options (where / order / limit per parent) ==");
 local im = Routed({ dialect = "mysql" });
 im.rows.users = { { id = 1, name = "A" }, { id = 2, name = "B" } };
@@ -1068,7 +1068,7 @@ check("nested configurator loads the deeper relation",
     iu2 and iu2[1].posts[1] and iu2[1].posts[1].comments ~= nil);
 check("nested configurator still batched (3 queries)", #im.queries == 3, #im.queries);
 
--- ===============================================================
+end do
 print("== Test group 24: soft deletes ==");
 local sm = Mock({ dialect = "sqlite" });
 local sdb = orm.new({ adapter = sm, promise = orm.promise.builtin() });
@@ -1115,6 +1115,75 @@ sdb:sync();
 local screate;
 for _, c in ipairs(sm.calls) do if (c.sql:find("CREATE TABLE", 1, true)) then screate = c.sql; end end
 check("sync creates the deleted_at column", screate and screate:find("`deleted_at`", 1, true) ~= nil, screate);
+
+end do
+print("== Test group 25: transactions ==");
+-- a transaction-capable adapter (records what it's asked to do)
+local TxMock = class.extend("TxMock", orm.Adapter);
+function TxMock:__init(opts) orm.Adapter.__init(self, opts); self.log = {}; self.qr = {}; end
+function TxMock:supports_transactions() return true; end
+function TxMock:raw_query(q, p, cb) self.log[#self.log + 1] = "POOL_Q"; cb(nil, self.qr); end
+function TxMock:raw_execute(q, p, cb) self.log[#self.log + 1] = "POOL_E"; cb(nil, { affectedRows = 1, insertId = 1 }); end
+-- scoped contract: open, run body with sync tx fns, commit/rollback on its return.
+function TxMock:transaction(body, finish)
+    self.log[#self.log + 1] = "BEGIN";
+    local tx_query = function(q, p, cb) self.log[#self.log + 1] = "TX_Q"; cb(nil, self.qr); end;
+    local tx_execute = function(q, p, cb) self.log[#self.log + 1] = "TX_E"; cb(nil, { affectedRows = 1, insertId = 1 }); end;
+    local commit = body(tx_query, tx_execute);
+    if (commit) then self.log[#self.log + 1] = "COMMIT"; finish(nil);
+    else self.log[#self.log + 1] = "ROLLBACK"; finish("rolled back"); end
+end
+local function log_has(mock, needle)
+    for _, e in ipairs(mock.log) do if (e == needle) then return true; end end
+    return false;
+end
+
+local tmk = TxMock({ dialect = "sqlite" });
+local txdb = orm.new({ adapter = tmk, promise = orm.promise.builtin() });
+local TU = txdb:define("users", { id = orm.types.id(), name = orm.types.string({ length = 32 }) });
+
+-- commit path: ops route through the transaction
+tmk.log = {};
+local result;
+coroutine.wrap(function()
+    result = txdb:transaction(function()
+        TU:create({ name = "A" }):await();
+        TU:create({ name = "B" }):await();
+        return "ok";
+    end):await();
+end)();
+check("transaction begins", log_has(tmk, "BEGIN"));
+check("ops route through the transaction (txn_execute)", (function()
+    local n = 0; for _, e in ipairs(tmk.log) do if (e == "TX_E") then n = n + 1; end end return n == 2;
+end)());
+check("ops did NOT use the pool", not log_has(tmk, "POOL_E"));
+check("transaction commits on success", tmk.log[#tmk.log] == "COMMIT", tmk.log[#tmk.log]);
+check("transaction resolves fn's return value", result == "ok", result);
+check("active transaction cleared afterwards", txdb._tx == nil);
+
+-- rollback path: fn raises
+tmk.log = {};
+local terr;
+coroutine.wrap(function()
+    local ok, e = pcall(function()
+        txdb:transaction(function()
+            TU:create({ name = "C" }):await();
+            error("boom");
+        end):await();
+    end);
+    terr = (not ok) and tostring(e) or nil;
+end)();
+check("transaction rolls back on error", log_has(tmk, "ROLLBACK") and not log_has(tmk, "COMMIT"));
+check("transaction propagates the error", terr and terr:find("boom", 1, true) ~= nil, terr);
+check("active transaction cleared after rollback", txdb._tx == nil);
+
+-- unsupported adapter -> transaction() THROWS
+local plain = Mock({ dialect = "sqlite" });
+local pdbx = orm.new({ adapter = plain, promise = orm.promise.builtin() });
+check("supports_transactions reflects the adapter", pdbx:supports_transactions() == false);
+check("transaction throws on an unsupported adapter",
+    select(1, pcall(function() pdbx:transaction(function() end) end)) == false);
+end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
 if (failed > 0) then error("self-test failed"); end
