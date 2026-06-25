@@ -852,6 +852,45 @@ function NormModel:build(data) return self.record_class(self, data, false); end
 ---@return NormRecordPromise promise resolving to NormRecord
 function NormModel:create(data) return self:build(data):save(); end
 
+--- Bulk-insert many rows in ONE statement. A fast path: it does NOT build records,
+--- fire hooks, or return insert ids (a multi-row insert can't give per-row ids).
+--- Timestamps are stamped; auto-increment ids are left to the DB; columns missing
+--- from a row are inserted as NULL. Resolves with the affected row count.
+--- ```lua
+---     Log:insert_many({ { level = "info", msg = "a" }, { level = "warn", msg = "b" } }):await()
+--- ```
+---@param rows table<string, any>[]
+---@return NormNumberPromise promise resolving to number
+function NormModel:insert_many(rows)
+    utils.assert(type(rows) == "table", "insert_many: expected a list of rows");
+    local orm = self.orm;
+    if (#rows == 0) then return orm.provider.resolve(0); end
+    local d = orm.adapter:get_dialect();
+    local ts = self.timestamps;
+    local nowv = ts and now_utc() or nil;
+
+    local encoded, colset = {}, {};
+    for i = 1, #rows do
+        local data = {};
+        for k, v in pairs(rows[i]) do data[k] = v; end
+        if (ts and nowv ~= nil) then
+            if (ts.created and data[ts.created] == nil) then data[ts.created] = nowv; end
+            if (ts.updated and data[ts.updated] == nil) then data[ts.updated] = nowv; end
+        end
+        if (self.autoincrement_pk) then data[self.primary_key] = nil; end
+        local enc = self:_encode_write(data);
+        encoded[i] = enc;
+        for k in pairs(enc) do colset[k] = true; end
+    end
+
+    local columns = {};
+    for k in pairs(colset) do columns[#columns + 1] = k; end
+    table.sort(columns); -- stable column order
+
+    local statement, params = sqlmod.insert_many(self.table, columns, encoded, d);
+    return orm:_execute_map(statement, params, function(res) return (res and res.affectedRows) or #rows; end);
+end
+
 --- Start a chainable query against this model's table.
 --- ```lua
 ---     local admins = User:query():where("admin", true):order("name"):all():await()
