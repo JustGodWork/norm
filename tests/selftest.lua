@@ -1424,6 +1424,44 @@ local NR = orm.new({ adapter = Mock({ dialect = "sqlite" }), promise = orm.promi
     :define("nr", { id = orm.types.id(), name = orm.types.string({ length = 8 }) });
 check("insert_many records throws without RETURNING support",
     select(1, pcall(function() NR:insert_many({ { name = "a" } }, { records = true }) end)) == false);
+end do
+print("== Test group 31: where_between / where_like / where_not / or_where_* ==");
+local qm = Mock({ dialect = "mysql" });
+local qdb = orm.new({ adapter = qm, promise = orm.promise.builtin() });
+local P = qdb:define("players", {
+    id = orm.types.id(), name = orm.types.string({ length = 32 }),
+    level = orm.types.integer(), banned = orm.types.boolean(),
+});
+
+-- between (model delegator) + bound params
+qm.query_result = {};
+P:where_between("level", 10, 20):all();
+check("where_between emits BETWEEN ? AND ?", last_sql(qm):find("`level` BETWEEN ? AND ?", 1, true) ~= nil, last_sql(qm));
+check("where_between binds min then max", qm.calls[#qm.calls].params[1] == 10 and qm.calls[#qm.calls].params[2] == 20);
+
+P:query():where_not_between("level", 1, 5):all();
+check("where_not_between emits NOT BETWEEN", last_sql(qm):find("`level` NOT BETWEEN ? AND ?", 1, true) ~= nil, last_sql(qm));
+
+-- like / not like
+P:where_like("name", "John%"):all();
+check("where_like emits LIKE ?", last_sql(qm):find("`name` LIKE ?", 1, true) ~= nil, last_sql(qm));
+check("where_like binds the pattern", qm.calls[#qm.calls].params[1] == "John%");
+P:query():where_not_like("name", "%bot%"):all();
+check("where_not_like emits NOT LIKE ?", last_sql(qm):find("`name` NOT LIKE ?", 1, true) ~= nil, last_sql(qm));
+
+-- not / not_in
+P:where_not("banned", true):all();
+check("where_not emits !=", last_sql(qm):find("`banned` != ?", 1, true) ~= nil, last_sql(qm));
+P:where_not_in("id", { 1, 2 }):all();
+check("where_not_in emits NOT IN", last_sql(qm):find("`id` NOT IN (?, ?)", 1, true) ~= nil, last_sql(qm));
+
+-- OR variants chain with the previous condition
+P:where("level", ">", 5):or_where_like("name", "admin%"):all();
+check("or_where_like uses OR", last_sql(qm):find("`level` > ? OR `name` LIKE ?", 1, true) ~= nil, last_sql(qm));
+P:where("id", 1):or_where_between("level", 1, 3):all();
+check("or_where_between uses OR", last_sql(qm):find("`id` = ? OR `level` BETWEEN ? AND ?", 1, true) ~= nil, last_sql(qm));
+P:where("id", 1):or_where_null("name"):all();
+check("or_where_null uses OR + IS NULL", last_sql(qm):find("`id` = ? OR `name` IS NULL", 1, true) ~= nil, last_sql(qm));
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
