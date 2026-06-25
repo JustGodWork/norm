@@ -93,6 +93,13 @@ local sel2 = last_sql(mock);
 print("  SELECT in: " .. sel2);
 check("where_in placeholders", sel2:find("`id` IN (?, ?, ?)", 1, true) ~= nil);
 
+mock.query_result = {};
+User:query():where_in("id", {}):all();
+local sel3 = last_sql(mock);
+print("  SELECT empty in: " .. sel3);
+check("empty where_in -> constant false predicate",
+    sel3:find("1 = 0", 1, true) ~= nil and sel3:find("IN ()", 1, true) == nil, sel3);
+
 found.age = 42;
 local saved;
 found:save():next(function(u) saved = u; end);

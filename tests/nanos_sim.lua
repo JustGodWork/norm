@@ -77,6 +77,7 @@ local User = db:define("users", {
     id    = Norm.types.id(),
     name  = Norm.types.string({ length = 64, nullable = false }),
     admin = Norm.types.boolean({ default = false }),
+    note  = Norm.types.string({ default = "huh?" }), -- literal '?' must survive placeholder rewriting
 });
 
 local results = {};
@@ -128,6 +129,16 @@ check("insert uses :0/:1 placeholders, not ?",
         and insert_call.q:find(":1", 1, true) ~= nil
         and insert_call.q:find("?", 1, true) == nil,
     insert_call and insert_call.q);
+
+-- a literal `?` inside a DEFAULT string literal must NOT be rewritten to `:n`.
+local create_call;
+for _, c in ipairs(adapter.database.calls) do
+    if (c.q:find("CREATE TABLE", 1, true)) then create_call = c; end
+end
+check("DEFAULT literal '?' preserved (not rewritten to ':n')",
+    create_call and create_call.q:find("'huh?'", 1, true) ~= nil
+        and create_call.q:find("'huh:", 1, true) == nil,
+    create_call and create_call.q);
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
 if (failed > 0) then error("nanos sim failed"); end
