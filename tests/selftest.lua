@@ -345,5 +345,83 @@ local ulist;
 user:load("posts"):next(function(l) ulist = l; end);
 check("lazy has_many loads + caches", ulist and #ulist == 2 and user.posts == ulist, ulist and #ulist);
 
+print("== Test group 9: foreign keys (DDL emission, ordering, options) ==");
+-- Collect the latest CREATE TABLE statement per table from a mock's call log.
+local function creates_by_table(mock)
+    local out = {};
+    for _, c in ipairs(mock.calls) do
+        local t = c.sql:match("CREATE TABLE IF NOT EXISTS `([%w_]+)`");
+        if (t) then out[t] = c.sql; end
+    end
+    return out;
+end
+local function define_players_characters(db, action)
+    db:define("players", { id = orm.types.id(), name = orm.types.string({ length = 32 }) });
+    db:define("characters", {
+        id        = orm.types.id(),
+        player_id = orm.types.integer({ nullable = false }),
+        player    = orm.types.belongsTo("players", { key = "player_id", onDelete = action }),
+    });
+end
+
+-- 9a) mysql + default ("auto"): belongs_to emits a FOREIGN KEY with ON DELETE.
+local mfk = Mock({ dialect = "mysql" });
+local fdb = orm.new({ adapter = mfk, promise = orm.promise.builtin() });
+define_players_characters(fdb, "CASCADE");
+fdb:sync();
+local mc = creates_by_table(mfk);
+check("mysql auto emits FK on belongs_to", mc.characters and mc.characters:find(
+    "FOREIGN KEY (`player_id`) REFERENCES `players` (`id`) ON DELETE CASCADE", 1, true) ~= nil, mc.characters);
+check("referenced table carries no FK", mc.players and mc.players:find("FOREIGN KEY", 1, true) == nil);
+
+-- 9b) referenced table is created before the referencing table (dependency order).
+check("FK dependency order: players before characters", (function()
+    local pi, ci;
+    for i, c in ipairs(mfk.calls) do
+        if (c.sql:find("CREATE TABLE IF NOT EXISTS `players`", 1, true)) then pi = i; end
+        if (c.sql:find("CREATE TABLE IF NOT EXISTS `characters`", 1, true)) then ci = i; end
+    end
+    return pi and ci and pi < ci;
+end)());
+
+-- 9c) sqlite + default ("auto"): FK skipped, one-time warning through the logger.
+local warns = {};
+local sfk = Mock({ dialect = "sqlite" });
+local sdb = orm.new({
+    adapter = sfk, promise = orm.promise.builtin(),
+    logger = function(level, msg) warns[#warns + 1] = tostring(level) .. " " .. tostring(msg); end,
+});
+define_players_characters(sdb, "CASCADE");
+sdb:sync();
+sdb:sync(); -- second sync must NOT warn again
+local sc = creates_by_table(sfk);
+check("sqlite auto skips FK", sc.characters and sc.characters:find("FOREIGN KEY", 1, true) == nil, sc.characters);
+check("sqlite auto warns exactly once", (function()
+    local n = 0;
+    for _, w in ipairs(warns) do if (w:find("foreign keys are not emitted", 1, true)) then n = n + 1; end end
+    return n == 1;
+end)(), #warns);
+
+-- 9d) foreignKeys=false: never emit, even on mysql.
+local nfk = Mock({ dialect = "mysql" });
+local ndb = orm.new({ adapter = nfk, promise = orm.promise.builtin(), foreignKeys = false });
+define_players_characters(ndb, "CASCADE");
+ndb:sync();
+local nc = creates_by_table(nfk);
+check("foreignKeys=false emits no FK", nc.characters and nc.characters:find("FOREIGN KEY", 1, true) == nil);
+
+-- 9e) foreignKeys=true on sqlite: force inline FK (action normalised to upper-case).
+local tfk = Mock({ dialect = "sqlite" });
+local tdb = orm.new({ adapter = tfk, promise = orm.promise.builtin(), foreignKeys = true });
+tdb:define("players", { id = orm.types.id() });
+tdb:define("characters", {
+    id = orm.types.id(), player_id = orm.types.integer(),
+    player = orm.types.belongsTo("players", { key = "player_id", onDelete = "set null" }),
+});
+tdb:sync();
+local tc = creates_by_table(tfk);
+check("foreignKeys=true forces FK on sqlite", tc.characters and tc.characters:find(
+    "FOREIGN KEY (`player_id`) REFERENCES `players` (`id`) ON DELETE SET NULL", 1, true) ~= nil, tc.characters);
+
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
 if (failed > 0) then error("self-test failed"); end
