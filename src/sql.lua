@@ -504,18 +504,22 @@ function sql.rename_column(table_name, from, to, d)
         d.quote(table_name), d.quote(from), d.quote(to));
 end
 
---- `CREATE [UNIQUE] INDEX name ON table (cols...)`.
+--- `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (cols...)`. `if_not_exists`
+--- (used by `sync()` for idempotency) is supported by SQLite/MariaDB/Postgres but
+--- NOT by stock MySQL 8 — manage those indexes via migrations instead.
 ---@param table_name string
 ---@param index_name string
 ---@param columns string[]
 ---@param unique boolean
 ---@param d NormDialect
+---@param if_not_exists? boolean
 ---@return string
-function sql.add_index(table_name, index_name, columns, unique, d)
+function sql.add_index(table_name, index_name, columns, unique, d, if_not_exists)
     local cols = {};
     for i = 1, #columns do cols[i] = d.quote(columns[i]); end
-    return ("CREATE %sINDEX %s ON %s (%s)"):format(
-        unique and "UNIQUE " or "", d.quote(index_name), d.quote(table_name), table.concat(cols, ", "));
+    return ("CREATE %sINDEX %s%s ON %s (%s)"):format(
+        unique and "UNIQUE " or "", if_not_exists and "IF NOT EXISTS " or "",
+        d.quote(index_name), d.quote(table_name), table.concat(cols, ", "));
 end
 
 --- `DROP INDEX`. MySQL needs the table (`DROP INDEX i ON t`); SQLite/Postgres don't.
