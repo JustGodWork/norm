@@ -591,5 +591,45 @@ local got_empty = false;
 mu3:load("roles"):next(function(l) mempty = l; got_empty = true; end);
 check("m2m lazy empty array when no links", got_empty and type(mempty) == "table" and #mempty == 0);
 
+-- ===============================================================
+print("== Test group 13: timestamps + dirty tracking ==");
+local tmk = Mock({ dialect = "sqlite" });
+local tdb = orm.new({ adapter = tmk, promise = orm.promise.builtin() });
+local Account = tdb:define("accounts", {
+    id    = orm.types.id(),
+    name  = orm.types.string({ length = 32 }),
+    coins = orm.types.integer({ default = 0 }),
+}, { timestamps = true });
+
+check("timestamps: created_at column added", Account.columns_by_name.created_at ~= nil);
+check("timestamps: updated_at column added", Account.columns_by_name.updated_at ~= nil);
+
+-- create -> INSERT stamps both timestamps
+local acc;
+Account:create({ name = "Tim" }):next(function(u) acc = u; end);
+print("  INSERT: " .. last_sql(tmk));
+check("timestamps: insert sets created_at + updated_at",
+    last_sql(tmk):find("`created_at`", 1, true) ~= nil and last_sql(tmk):find("`updated_at`", 1, true) ~= nil,
+    last_sql(tmk));
+check("timestamps: created_at populated on record", type(acc.created_at) == "string", acc and acc.created_at);
+
+-- dirty tracking: change ONE column -> UPDATE writes only it (+ updated_at)
+local rec = Account:wrap({ id = 5, name = "Old", coins = 10, created_at = "t0", updated_at = "t0" });
+rec.coins = 20;
+rec:save();
+print("  UPDATE: " .. last_sql(tmk));
+check("dirty: update writes changed column", last_sql(tmk):find("`coins`", 1, true) ~= nil);
+check("dirty: update bumps updated_at", last_sql(tmk):find("`updated_at`", 1, true) ~= nil);
+check("dirty: update omits unchanged column", last_sql(tmk):find("`name`", 1, true) == nil, last_sql(tmk));
+
+-- no-op save (nothing changed) -> no query at all, updated_at untouched
+local before = #tmk.calls;
+local rec2 = Account:wrap({ id = 6, name = "Same", coins = 1, created_at = "t0", updated_at = "t0" });
+local same;
+rec2:save():next(function(u) same = u; end);
+check("dirty: no-op save issues no query", #tmk.calls == before, #tmk.calls - before);
+check("dirty: no-op save still resolves the record", same == rec2);
+check("dirty: no-op leaves updated_at intact", rec2.updated_at == "t0", rec2.updated_at);
+
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
 if (failed > 0) then error("self-test failed"); end
