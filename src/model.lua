@@ -93,6 +93,26 @@ function NormRecord:save()
     end
 
     if (model.autoincrement_pk) then data[model.primary_key] = nil; end
+
+    -- If the engine supports `INSERT ... RETURNING` (SQLite >= 3.35 / PostgreSQL),
+    -- read the new id atomically from the INSERT itself (routed as a query, since
+    -- it returns a row). This is pool-safe, unlike a separate LAST_INSERT_ID query.
+    local can_return = model.autoincrement_pk
+        and type(orm.adapter.supports_returning) == "function"
+        and orm.adapter:supports_returning();
+
+    if (can_return) then
+        local statement, params = sqlmod.insert(model.table, model:_encode_write(data), d, model.primary_key);
+        return orm:_query_map(statement, params, function(rows)
+            self.__persisted = true;
+            local row = rows[1];
+            if (row and row[model.primary_key] ~= nil) then
+                self[model.primary_key] = row[model.primary_key];
+            end
+            return self;
+        end);
+    end
+
     local statement, params = sqlmod.insert(model.table, model:_encode_write(data), d);
     return orm:_execute_map(statement, params, function(res)
         self.__persisted = true;
