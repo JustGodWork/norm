@@ -11,6 +11,7 @@ local jsonlib = require("json");
 ---@field connection? string Connection string / file path.
 ---@field pool_size? integer Number of pooled connections (nanos default if omitted).
 ---@field database? table An already-built nanos `Database` instance to reuse.
+---@field returning? boolean Force `INSERT ... RETURNING` on/off. Default: auto — on for SQLite/PostgreSQL, auto-detected for MariaDB >= 10.5 (off for real MySQL).
 
 ---@class NormNanosAdapter: NormAdapter
 ---@field database table The underlying nanos `Database`.
@@ -40,6 +41,24 @@ local function engine_supports_returning(engine)
     local E = _ENV.DatabaseEngine;
     if (not E or engine == nil) then return nil; end
     return engine == E.SQLite or engine == E.PostgreSQL;
+end
+
+--- MariaDB >= 10.5 supports `INSERT ... RETURNING`; real MySQL does not. The
+--- nanos `MySQL` engine can point at either, so probe the server banner once
+--- (`SELECT VERSION()` -> e.g. "11.6.2-MariaDB"). Best-effort: any failure or an
+--- unrecognised banner yields false (falls back to the LAST_INSERT_ID path).
+---@param db table
+---@return boolean
+local function detect_mariadb_returning(db)
+    if (type(db) ~= "table" or type(db.Select) ~= "function") then return false; end
+    local ok, rows = pcall(function() return db:Select("SELECT VERSION() AS v"); end);
+    if (not ok or type(rows) ~= "table" or type(rows[1]) ~= "table") then return false; end
+    local v = tostring(rows[1].v or "");
+    if (not v:find("MariaDB", 1, true)) then return false; end
+    local major, minor = v:match("^(%d+)%.(%d+)");
+    major, minor = tonumber(major), tonumber(minor);
+    if (not major or not minor) then return false; end
+    return (major > 10) or (major == 10 and minor >= 5);
 end
 
 ---@param options? NormNanosAdapterOptions
@@ -76,6 +95,18 @@ function NormNanosAdapter:__init(options)
         self.database = db;
         utils.log("DB", "connected to nanos database '%s' (pool=%d)", tostring(options.connection), options.pool_size);
     end
+
+    -- RETURNING availability on the mysql dialect isn't known from the engine
+    -- alone: nanos `MySQL` may be real MySQL (no RETURNING) OR MariaDB (>= 10.5,
+    -- which supports it). Honour an explicit override, else probe the server once.
+    if (options.returning ~= nil) then
+        self._supports_returning = options.returning == true;
+    elseif (not self._supports_returning and self._resolved_dialect == "mysql") then
+        if (detect_mariadb_returning(self.database)) then
+            self._supports_returning = true;
+            utils.log("DB", "MariaDB >= 10.5 detected: using INSERT ... RETURNING for atomic insertId");
+        end
+    end
 end
 
 ---@return "mysql"|"sqlite"
@@ -83,9 +114,10 @@ function NormNanosAdapter:get_dialect_name()
     return self._resolved_dialect or "sqlite";
 end
 
---- SQLite/PostgreSQL support `INSERT ... RETURNING`, letting the ORM fetch a new
---- id atomically (pool-safe). MySQL does not, and falls back to a best-effort
---- `LAST_INSERT_ID()` query (see `raw_execute`).
+--- SQLite, PostgreSQL and MariaDB (>= 10.5, auto-detected at init) support
+--- `INSERT ... RETURNING`, letting the ORM fetch a new id atomically (pool-safe).
+--- Real MySQL does not, and falls back to a best-effort `LAST_INSERT_ID()` query
+--- (see `raw_execute`).
 ---@return boolean
 function NormNanosAdapter:supports_returning()
     return self._supports_returning == true;
