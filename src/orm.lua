@@ -356,11 +356,12 @@ end
 --- ```
 ---@param table_name string
 ---@param schema table<string, NormColumn>
+---@param options? NormDefineOptions
 ---@return NormModel
-function NormOrm:define(table_name, schema)
+function NormOrm:define(table_name, schema, options)
     utils.assert(not self.models[table_name],
         ("Norm: model '%s' is already defined"):format(table_name));
-    local model = model_module.define(self, table_name, schema);
+    local model = model_module.define(self, table_name, schema, options);
     self.models[table_name] = model;
     return model;
 end
