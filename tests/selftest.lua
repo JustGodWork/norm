@@ -738,5 +738,47 @@ check("upsert update bumps updated_at, preserves created_at",
     tsql and tsql:find("`updated_at` = excluded.`updated_at`", 1, true) ~= nil
         and tsql:find("`created_at` = excluded.`created_at`", 1, true) == nil, tsql);
 
+-- ===============================================================
+print("== Test group 16: aggregations (scalar + grouped) ==");
+local am = Mock({ dialect = "mysql" });
+local Agg = orm.new({ adapter = am, promise = orm.promise.builtin() }):define("players", {
+    id      = orm.types.id(),
+    faction = orm.types.string({ length = 16 }),
+    coins   = orm.types.integer({ default = 0 }),
+    score   = orm.types.integer({ default = 0 }),
+});
+
+-- scalar SUM over a WHERE filter
+am.query_result = { { aggregate = 1500 } };
+local total;
+Agg:where("faction", "red"):sum("coins"):next(function(v) total = v; end);
+check("sum builds SUM(col) AS aggregate", last_sql(am):find("SELECT SUM(`coins`) AS `aggregate`", 1, true) ~= nil, last_sql(am));
+check("sum applies WHERE", last_sql(am):find("WHERE `faction` = ?", 1, true) ~= nil, last_sql(am));
+check("sum resolves a number", total == 1500, total);
+
+-- MAX returns the raw value
+am.query_result = { { aggregate = 99 } };
+local top;
+Agg:max("score"):next(function(v) top = v; end);
+check("max builds MAX(col)", last_sql(am):find("SELECT MAX(`score`) AS `aggregate`", 1, true) ~= nil, last_sql(am));
+check("max resolves the value", top == 99, top);
+
+-- AVG via the model-level delegator
+am.query_result = { { aggregate = 42 } };
+local avg;
+Agg:avg("coins"):next(function(v) avg = v; end);
+check("avg via model delegator", last_sql(am):find("SELECT AVG(`coins`)", 1, true) ~= nil and avg == 42, avg);
+
+-- grouped aggregate: select_raw + group_by + having + rows()
+am.query_result = { { faction = "red", n = 12 }, { faction = "blue", n = 11 } };
+local stats;
+Agg:select_raw("`faction`, COUNT(*) AS n"):group_by("faction"):having("COUNT(*)", ">", 10):rows():next(function(r) stats = r; end);
+local gsql = last_sql(am);
+print("  GROUPED: " .. gsql);
+check("select_raw kept verbatim", gsql:find("SELECT `faction`, COUNT(*) AS n FROM", 1, true) ~= nil, gsql);
+check("group_by emits GROUP BY", gsql:find("GROUP BY `faction`", 1, true) ~= nil, gsql);
+check("having emits HAVING with a bound param", gsql:find("HAVING COUNT(*) > ?", 1, true) ~= nil, gsql);
+check("rows() returns raw rows (no wrapping)", stats and #stats == 2 and stats[1].faction == "red", stats and #stats);
+
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
 if (failed > 0) then error("self-test failed"); end
