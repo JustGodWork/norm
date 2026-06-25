@@ -172,6 +172,35 @@ function sql.insert(table_name, data, d, returning)
     return statement, params;
 end
 
+--- Multi-row INSERT: `INSERT INTO t (cols) VALUES (…), (…)`. `columns` is the
+--- ordered column union; each `data_rows[i]` is an (already-encoded) `{col=value}`
+--- map — a column absent from a row is written as `NULL`.
+---@param table_name string
+---@param columns string[]
+---@param data_rows table<string, any>[]
+---@param d NormDialect
+---@return string statement, any[] params
+function sql.insert_many(table_name, columns, data_rows, d)
+    local params, tuples = {}, {};
+    local quoted = {};
+    for i = 1, #columns do quoted[i] = d.quote(columns[i]); end
+    for r = 1, #data_rows do
+        local marks = {};
+        for c = 1, #columns do
+            local v = data_rows[r][columns[c]];
+            if (v == nil) then
+                marks[c] = "NULL";
+            else
+                params[#params + 1] = normalize(v);
+                marks[c] = d.placeholder(#params);
+            end
+        end
+        tuples[r] = "(" .. table.concat(marks, ", ") .. ")";
+    end
+    return ("INSERT INTO %s (%s) VALUES %s"):format(
+        d.quote(table_name), table.concat(quoted, ", "), table.concat(tuples, ", ")), params;
+end
+
 --- INSERT with an atomic "on conflict, update" clause (upsert). Dialect-aware:
 --- MySQL/MariaDB emit `ON DUPLICATE KEY UPDATE col = VALUES(col)`; SQLite/Postgres
 --- emit `ON CONFLICT (target) DO UPDATE SET col = excluded.col`. `conflict_cols`
