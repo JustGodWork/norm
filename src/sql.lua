@@ -113,12 +113,14 @@ function sql.create_table(table_name, columns, d, foreign_keys)
         d.quote(table_name), table.concat(parts, ", "), d.table_suffix);
 end
 
---- INSERT.
+--- INSERT. Pass `returning` (a column name) to append a `RETURNING <col>` clause
+--- (SQLite >= 3.35 / PostgreSQL) so the new row's value comes back atomically.
 ---@param table_name string
 ---@param data table<string, any>
 ---@param d NormDialect
+---@param returning? string Column to append in a `RETURNING` clause.
 ---@return string statement, any[] params
-function sql.insert(table_name, data, d)
+function sql.insert(table_name, data, d, returning)
     local cols, marks, params = {}, {}, {};
     for _, key in ipairs(utils.sorted_keys(data)) do
         local value = data[key];
@@ -130,8 +132,12 @@ function sql.insert(table_name, data, d)
             marks[#marks + 1] = d.placeholder(#params);
         end
     end
-    return ("INSERT INTO %s (%s) VALUES (%s)"):format(
-        d.quote(table_name), table.concat(cols, ", "), table.concat(marks, ", ")), params;
+    local statement = ("INSERT INTO %s (%s) VALUES (%s)"):format(
+        d.quote(table_name), table.concat(cols, ", "), table.concat(marks, ", "));
+    if (returning) then
+        statement = statement .. " RETURNING " .. d.quote(returning);
+    end
+    return statement, params;
 end
 
 --- Compile WHERE conditions into a fragment, appending bound params.
