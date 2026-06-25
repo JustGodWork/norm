@@ -489,6 +489,30 @@ function NormQueryBuilder:delete()
     end);
 end
 
+--- Atomically add `amount` (default 1) to a column on every matching row, in one
+--- `SET col = col + ?` statement (no read-modify-write, race-free). Resolves with
+--- the affected row count.
+--- ```lua
+---     Player:where("id", id):increment("coins", 50):await()
+--- ```
+---@param column string
+---@param amount? number Defaults to 1.
+---@return NormNumberPromise promise resolving to number
+function NormQueryBuilder:increment(column, amount)
+    local model = self.model;
+    local d = model.orm.adapter:get_dialect();
+    local statement, params = sqlmod.increment(self:_effective_state(), { { column = column, amount = amount or 1 } }, d);
+    return model.orm:_execute_map(statement, params, function(res) return res and res.affectedRows or 0; end);
+end
+
+--- Atomically subtract `amount` (default 1) from a column on every matching row.
+---@param column string
+---@param amount? number Defaults to 1.
+---@return NormNumberPromise promise resolving to number
+function NormQueryBuilder:decrement(column, amount)
+    return self:increment(column, -(amount or 1));
+end
+
 --- Bulk physical-DELETE every matching row, even on a soft-delete model.
 --- Resolves with the affected row count.
 ---@return NormNumberPromise promise resolving to number
