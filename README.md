@@ -4,6 +4,8 @@ A small, **dependency-free** Lua ORM with **pluggable database adapters** and
 **pluggable promise providers**. It runs anywhere — [nanos world](https://nanos.world),
 [FiveM](https://fivem.net), or plain Lua — by keeping framework specifics out of the core.
 
+> **Full documentation:** https://justgodwork.github.io/norm-docs/
+
 - **Zero dependencies, one file.** Ships as a single self-contained bundle;
   [light-class](https://github.com/JustGodWork/light-class) is embedded at build time.
 - **No runtime `require`, no cross-package import.** An internal module resolver makes
