@@ -953,6 +953,12 @@ function NormModel:all() return self:query():all(); end
 ---@return NormNumberPromise promise resolving to number
 function NormModel:count() return self:query():count(); end
 
+--- Paginate the whole table. See `NormQueryBuilder:paginate`.
+---@param page? number
+---@param per_page? number
+---@return NormPromise
+function NormModel:paginate(page, per_page) return self:query():paginate(page, per_page); end
+
 --- SUM of a column across the whole table.
 --- ```lua
 ---     local total = User:sum("coins"):await()
