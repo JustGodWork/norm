@@ -7,21 +7,8 @@ local promise = require("promise");
 local jsonmod = require("json");
 local model_module = require("model");
 
---- Naive singulariser (drops a trailing "s"), used for relation key/table defaults.
----@param name string
----@return string
-local function singularize(name) return (name:gsub("s$", "")); end
-
---- Default pivot table name for a many-to-many: the two table singulars joined by
---- "_" in alphabetical order (e.g. `users` + `roles` -> `role_user`).
----@param a string
----@param b string
----@return string
-local function default_pivot(a, b)
-    local sa, sb = singularize(a), singularize(b);
-    if (sa <= sb) then return sa .. "_" .. sb; end
-    return sb .. "_" .. sa;
-end
+local singularize = utils.singularize;
+local default_pivot = utils.default_pivot;
 
 ---@class NormOrm: LightClass
 ---@field adapter NormAdapter
