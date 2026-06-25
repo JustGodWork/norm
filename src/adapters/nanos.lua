@@ -15,6 +15,7 @@ local jsonlib = require("json");
 ---@class NormNanosAdapter: NormAdapter
 ---@field database table The underlying nanos `Database`.
 ---@field private _resolved_dialect "mysql"|"sqlite"
+---@field private _supports_returning boolean
 ---@overload fun(options?: NormNanosAdapterOptions): NormNanosAdapter
 local NormNanosAdapter = class.extend("NormNanosAdapter", NormAdapter);
 
@@ -30,12 +31,30 @@ local function engine_to_dialect(engine)
     return "mysql";
 end
 
+--- Whether a DatabaseEngine supports `INSERT ... RETURNING` (SQLite >= 3.35,
+--- PostgreSQL — both bundled by nanos satisfy this; MySQL does not). Returns nil
+--- when the engine is unknown (e.g. a pre-built `database` instance was passed).
+---@param engine integer|nil
+---@return boolean|nil
+local function engine_supports_returning(engine)
+    local E = _ENV.DatabaseEngine;
+    if (not E or engine == nil) then return nil; end
+    return engine == E.SQLite or engine == E.PostgreSQL;
+end
+
 ---@param options? NormNanosAdapterOptions
 function NormNanosAdapter:__init(options)
     options = options or {};
     self._resolved_dialect = options.dialect
         or (options.engine ~= nil and engine_to_dialect(options.engine))
         or "sqlite";
+
+    -- RETURNING support is engine-driven (PostgreSQL maps to the "mysql" dialect,
+    -- so the dialect name alone can't tell it apart). When the engine is unknown,
+    -- only assume support for SQLite.
+    local sr = engine_supports_returning(options.engine);
+    if (sr == nil) then sr = (self._resolved_dialect == "sqlite"); end
+    self._supports_returning = sr;
 
     NormAdapter.__init(self, options); -- light-class: explicit super constructor call
 
@@ -62,6 +81,14 @@ end
 ---@return "mysql"|"sqlite"
 function NormNanosAdapter:get_dialect_name()
     return self._resolved_dialect or "sqlite";
+end
+
+--- SQLite/PostgreSQL support `INSERT ... RETURNING`, letting the ORM fetch a new
+--- id atomically (pool-safe). MySQL does not, and falls back to a best-effort
+--- `LAST_INSERT_ID()` query (see `raw_execute`).
+---@return boolean
+function NormNanosAdapter:supports_returning()
+    return self._supports_returning == true;
 end
 
 --- If nanos-promise is loaded in this package (global `Promise`), use it.
@@ -139,6 +166,13 @@ function NormNanosAdapter:raw_query(query, params, callback)
     do_select(self.database, query, params, callback);
 end
 
+--- Run a write. For models on SQLite/PostgreSQL the id is fetched via `INSERT ...
+--- RETURNING` (see the model layer), so this path is only used for those engines
+--- by raw `execute()` calls. On MySQL (no RETURNING) inserts fall back to a
+--- separate `LAST_INSERT_ID()` query: this is best-effort, because that function
+--- is connection-scoped and the pool may run it on another connection. Prefer a
+--- client-generated id (or `pool_size = 1`) if a correct insertId is critical on
+--- MySQL + nanos.
 ---@param query string
 ---@param params any[]
 ---@param callback NormExecuteCallback

@@ -63,7 +63,7 @@ end
 ---@return NormJsonProvider|nil
 function NormOxMySQLAdapter:default_json_provider()
     if (type(_ENV.json) == "table") then
-        local ok, provider = pcall(jsonlib.lua, _ENV.json);
+        local ok, provider = pcall(jsonlib.rapidjson, _ENV.json);
         if (ok) then return provider; end
     end
     return nil; -- fall back to auto-detection / raw passthrough
