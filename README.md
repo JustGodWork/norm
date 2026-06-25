@@ -82,9 +82,11 @@ support, which is why even a minimal promise library works.
 
 ## API
 
-### `Norm.new({ adapter, promise?, log?, logger? })` → ORM
+### `Norm.new({ adapter, promise?, log?, logger?, foreignKeys? })` → ORM
 `promise` defaults to the adapter's `default_provider()`, then to the built-in
 provider. Passing a raw promise *class* (e.g. `promise = Promise`) auto-wraps it.
+`foreignKeys` (`"auto"` default / `true` / `false`) controls SQL `FOREIGN KEY`
+emission in `sync()` — see [Foreign keys](#foreign-keys).
 
 ### Column types — `Norm.types`
 `id, integer, bigint, string, text, float, double, boolean, datetime, date, json`,
@@ -150,6 +152,33 @@ local Post = db:define("posts", {
 Key defaults: `belongsTo` → `key = <relationName>_id`, `otherKey = target PK`;
 `hasOne`/`hasMany` → `key = <thisTableSingular>_id`, `otherKey = this PK`. Override
 via the options table. (Many-to-many / join tables are not built in yet.)
+
+### Foreign keys
+
+`sync()` can emit real SQL `FOREIGN KEY` constraints from `belongsTo` relations
+(the side holding the FK column). Add `onDelete` / `onUpdate` for the referential
+action, and tables are created in dependency order so references resolve:
+
+```lua
+local Character = db:define("characters", {
+    id        = Norm.types.id(),
+    player_id = Norm.types.integer({ nullable = false }),
+    player    = Norm.types.belongsTo("players", { key = "player_id", onDelete = "CASCADE" }),
+})
+```
+
+Emission is controlled by the `foreignKeys` option on `Norm.new` — `"auto"`
+(default) emits on MySQL and skips on SQLite (with a one-time warning), `true`
+always emits, `false` never does:
+
+```lua
+local db = Norm.new({ adapter = a, foreignKeys = "auto" })
+```
+
+SQLite only enforces FKs when `PRAGMA foreign_keys = ON`, which is per-connection
+and off by default — Norm can't guarantee it across a pool, hence the `"auto"`
+skip. Use `foreignKeys = false` to silence the warning, or handle cascades in
+application code (delete children before the parent).
 
 ## Promises & `await`
 
