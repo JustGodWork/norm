@@ -423,5 +423,64 @@ local tc = creates_by_table(tfk);
 check("foreignKeys=true forces FK on sqlite", tc.characters and tc.characters:find(
     "FOREIGN KEY (`player_id`) REFERENCES `players` (`id`) ON DELETE SET NULL", 1, true) ~= nil, tc.characters);
 
+print("== Test group 10: json provider ((de)serialisation of json columns) ==");
+local function params_have(mock, value)
+    local params = mock.calls[#mock.calls].params;
+    for _, p in ipairs(params) do if (p == value) then return true; end end
+    return false;
+end
+-- A deterministic test provider: encode tags the value, decode wraps the string.
+local jp = {
+    name = "test",
+    encode = function(v) return "ENC:" .. tostring(v.x); end,
+    decode = function(s) return { decoded = s }; end,
+};
+
+local jmock = Mock({ dialect = "mysql" });
+local jdb = orm.new({ adapter = jmock, promise = orm.promise.builtin(), json = jp });
+local Doc = jdb:define("docs", { id = orm.types.id(), meta = orm.types.json() });
+
+-- 10a) a Lua table in a json column is encoded on INSERT.
+Doc:create({ meta = { x = 7 } });
+check("json table encoded on insert", params_have(jmock, "ENC:7"));
+
+-- 10b) a raw string from the driver is decoded on read.
+jmock.query_result = { { id = 1, meta = "stored-json" } };
+local got;
+Doc:find(1):next(function(r) got = r; end);
+check("json decoded on read", got and type(got.meta) == "table" and got.meta.decoded == "stored-json",
+    got and type(got.meta));
+
+-- 10c) a value already a string is passed through (never double-encoded).
+Doc:create({ meta = "already-a-string" });
+check("string json value passes through encode", params_have(jmock, "already-a-string"));
+
+-- 10d) bulk update also encodes json columns.
+Doc:query():where("id", 1):update({ meta = { x = 9 } });
+check("json encoded on bulk update", params_have(jmock, "ENC:9"));
+
+-- 10e) json = false disables (de)serialisation (raw string passthrough).
+local rmock2 = Mock({ dialect = "mysql" });
+local rdb2 = orm.new({ adapter = rmock2, promise = orm.promise.builtin(), json = false });
+local Doc2 = rdb2:define("docs2", { id = orm.types.id(), meta = orm.types.json() });
+check("json=false resolves to raw provider", rdb2.json.name == "raw", rdb2.json.name);
+rmock2.query_result = { { id = 1, meta = '{"x":1}' } };
+local got2;
+Doc2:find(1):next(function(r) got2 = r; end);
+check("json=false leaves raw string on read", got2 and got2.meta == '{"x":1}', got2 and tostring(got2.meta));
+
+-- 10f) with no host JSON library, auto-detection falls back to the raw provider.
+local amock = Mock({ dialect = "mysql" });
+local adb = orm.new({ adapter = amock, promise = orm.promise.builtin() });
+check("json auto-detect falls back to raw", adb.json.name == "raw", adb.json.name);
+
+-- 10g) the built-in nanos / lua builders wrap their library uniformly.
+local fakeJSON = { stringify = function(v) return "S(" .. tostring(v.x) .. ")"; end, parse = function(s) return { p = s }; end };
+local np = orm.json.nanos(fakeJSON);
+check("json.nanos wraps stringify/parse", np.encode({ x = 3 }) == "S(3)" and np.decode("z").p == "z");
+local fakejson = { encode = function(_) return "E"; end, decode = function(_) return "D"; end };
+local lp = orm.json.lua(fakejson);
+check("json.lua wraps encode/decode", lp.encode({}) == "E" and lp.decode("x") == "D");
+
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
 if (failed > 0) then error("self-test failed"); end
