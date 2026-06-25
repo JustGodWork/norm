@@ -36,6 +36,27 @@ local function to_id_list(ids)
     return out;
 end
 
+-- Lifecycle hook events a model can register handlers for.
+local HOOK_EVENTS = {
+    "before_create", "after_create", "before_update", "after_update",
+    "before_save", "after_save", "before_delete", "after_delete", "after_find",
+};
+local VALID_HOOK = {};
+for i = 1, #HOOK_EVENTS do VALID_HOOK[HOOK_EVENTS[i]] = true; end
+
+--- Fire one or more hook events on a model for a record, captured in a pcall so a
+--- throwing hook becomes a cancelled operation. Returns (ok, err).
+---@param model NormModel
+---@param record NormRecord
+---@param ... string event names, in order
+---@return boolean ok, any err
+local function pfire(model, record, ...)
+    local events = { ... };
+    return pcall(function()
+        for i = 1, #events do model:_fire(events[i], record); end
+    end);
+end
+
 ---@class NormModelModule
 ---@field Record NormRecord
 ---@field Model NormModel
@@ -150,6 +171,11 @@ function NormRecord:_do_insert(cb)
     local d = orm.adapter:get_dialect();
     local ts = model.timestamps;
 
+    if (model._has_hooks) then
+        local ok, herr = pfire(model, self, "before_save", "before_create");
+        if (not ok) then return cb(herr); end
+    end
+
     -- stamp created_at / updated_at unless the caller set them explicitly.
     if (ts) then
         local nowv = now_utc();
@@ -161,6 +187,15 @@ function NormRecord:_do_insert(cb)
 
     local data = self:_persistable();
     if (model.autoincrement_pk) then data[model.primary_key] = nil; end
+
+    -- fire after-create/after-save once the insert succeeds.
+    local function fired(then_cb)
+        if (model._has_hooks) then
+            local ok, herr = pfire(model, self, "after_create", "after_save");
+            if (not ok) then return cb(herr); end
+        end
+        then_cb();
+    end
 
     -- INSERT ... RETURNING (SQLite >= 3.35 / PostgreSQL / MariaDB) reads the new id
     -- atomically (pool-safe) — routed as a query, since it returns a row.
@@ -180,7 +215,7 @@ function NormRecord:_do_insert(cb)
                 self[model.primary_key] = row[model.primary_key];
             end
             self:_snapshot();
-            cb(nil);
+            fired(function() cb(nil); end);
         end);
         return;
     end
@@ -194,7 +229,7 @@ function NormRecord:_do_insert(cb)
             self[model.primary_key] = res.insertId;
         end
         self:_snapshot();
-        cb(nil);
+        fired(function() cb(nil); end);
     end);
 end
 
@@ -211,6 +246,13 @@ function NormRecord:_do_update(cb)
     local pk = model.primary_key;
     utils.assert(pk, ("model '%s' has no primary key; cannot update"):format(model.table));
 
+    -- before hooks run BEFORE the dirty check, so a hook may mutate the record and
+    -- have those changes persisted.
+    if (model._has_hooks) then
+        local ok, herr = pfire(model, self, "before_save", "before_update");
+        if (not ok) then return cb(herr); end
+    end
+
     local changed = self:_changed_columns();
     changed[pk] = nil; -- never update the primary key
     if (next(changed) == nil) then return cb(nil); end -- nothing changed: no query
@@ -225,6 +267,10 @@ function NormRecord:_do_update(cb)
     orm:_raw_execute(statement, params, function(err)
         if (err ~= nil) then return cb(err); end
         self:_snapshot();
+        if (model._has_hooks) then
+            local ok, herr = pfire(model, self, "after_update", "after_save");
+            if (not ok) then return cb(herr); end
+        end
         cb(nil);
     end);
 end
@@ -271,32 +317,67 @@ function NormRecord:delete()
     local d = orm.adapter:get_dialect();
     local pk = model.primary_key;
 
-    if (model.soft_deletes) then
-        local col = model.soft_deletes;
-        local nowv = now_utc();
-        self[col] = nowv;
+    return orm.provider.new(function(resolve, reject)
+        if (model._has_hooks) then
+            local ok, herr = pfire(model, self, "before_delete");
+            if (not ok) then return reject(herr); end
+        end
+        local function done()
+            if (model._has_hooks) then
+                local ok, herr = pfire(model, self, "after_delete");
+                if (not ok) then return reject(herr); end
+            end
+            resolve(self);
+        end
         local state = { table = model.table, wheres = { { column = pk, op = "=", value = self[pk] } } };
-        local statement, params = sqlmod.update(state, { [col] = nowv }, d);
-        return orm:_execute_map(statement, params, function() self:_snapshot(); return self; end);
-    end
-
-    return self:force_delete();
+        if (model.soft_deletes) then
+            local col = model.soft_deletes;
+            local nowv = now_utc();
+            self[col] = nowv;
+            local statement, params = sqlmod.update(state, { [col] = nowv }, d);
+            orm:_trace(statement, params);
+            orm:_raw_execute(statement, params, function(err)
+                if (err ~= nil) then return reject(err); end
+                self:_snapshot(); done();
+            end);
+        else
+            local statement, params = sqlmod.delete(state, d);
+            orm:_trace(statement, params);
+            orm:_raw_execute(statement, params, function(err)
+                if (err ~= nil) then return reject(err); end
+                self.__persisted = false; done();
+            end);
+        end
+    end);
 end
 
 --- Physically DELETE this record by its primary key, even on a soft-delete model.
 --- The record is flagged not-persisted (a later `:save()` re-inserts it). Resolves
---- with the record.
+--- with the record. Fires `before_delete` / `after_delete`.
 ---@return NormRecordPromise promise resolving to NormRecord (self)
 function NormRecord:force_delete()
     local model = self.__model;
+    local orm = model.orm;
     utils.assert(model.primary_key, ("model '%s' has no primary key; cannot delete"):format(model.table));
-    local d = model.orm.adapter:get_dialect();
+    local d = orm.adapter:get_dialect();
     local pk = model.primary_key;
-    local state = { table = model.table, wheres = { { column = pk, op = "=", value = self[pk] } } };
-    local statement, params = sqlmod.delete(state, d);
-    return model.orm:_execute_map(statement, params, function()
-        self.__persisted = false;
-        return self;
+    return orm.provider.new(function(resolve, reject)
+        if (model._has_hooks) then
+            local ok, herr = pfire(model, self, "before_delete");
+            if (not ok) then return reject(herr); end
+        end
+        local state = { table = model.table, wheres = { { column = pk, op = "=", value = self[pk] } } };
+        local statement, params = sqlmod.delete(state, d);
+        orm:_trace(statement, params);
+        orm:_raw_execute(statement, params, function(err)
+            if (err ~= nil) then return reject(err); end
+            self.__persisted = false;
+            if (model._has_hooks) then
+                local ok, herr = pfire(model, self, "after_delete");
+                if (not ok) then return reject(herr); end
+            end
+            resolve(self);
+        end);
     end);
 end
 
@@ -617,6 +698,8 @@ function NormModel:__init(orm, table_name, columns, record_class)
     self.primary_key = nil;
     self.autoincrement_pk = false;
     self.record_class = record_class;
+    self.hooks = nil;        -- event -> { fn, ... }, created on first registration
+    self._has_hooks = false; -- fast-path flag so hook-less models pay nothing
     for i = 1, #columns do
         local c = columns[i];
         self.columns_by_name[c.name] = c;
@@ -676,10 +759,44 @@ function NormModel:_encode_write(data)
     return out;
 end
 
---- Wrap a DB row into a persisted record.
+--- Wrap a DB row into a persisted record (fires `after_find`).
 ---@param row table<string, any>
 ---@return NormRecord
-function NormModel:wrap(row) return self.record_class(self, row, true); end
+function NormModel:wrap(row)
+    local record = self.record_class(self, row, true);
+    if (self._has_hooks) then self:_fire("after_find", record); end
+    return record;
+end
+
+--- Register a lifecycle hook handler. Events: `before_create`, `after_create`,
+--- `before_update`, `after_update`, `before_save`, `after_save`, `before_delete`,
+--- `after_delete`, `after_find`. Handlers run **synchronously** with the record;
+--- a `before_*` handler that raises cancels the operation (the promise rejects).
+--- Convenience methods exist per event (e.g. `Model:before_save(fn)`).
+--- ```lua
+---     User:before_save(function(u) assert(u.name ~= nil, "name required") end)
+---     User:after_create(function(u) print("created #" .. u.id) end)
+--- ```
+---@param event string
+---@param fn fun(record: NormRecord)
+---@return NormModel self
+function NormModel:hook(event, fn)
+    utils.assert(VALID_HOOK[event], ("unknown hook event '%s'"):format(tostring(event)));
+    utils.assert(type(fn) == "function", "hook handler must be a function");
+    self.hooks = self.hooks or {};
+    self.hooks[event] = self.hooks[event] or {};
+    self.hooks[event][#self.hooks[event] + 1] = fn;
+    self._has_hooks = true;
+    return self;
+end
+
+--- Run every handler registered for `event`, in registration order.
+---@param event string
+---@param record NormRecord
+function NormModel:_fire(event, record)
+    local hs = self.hooks and self.hooks[event];
+    if (hs) then for i = 1, #hs do hs[i](record); end end
+end
 
 --- Build an *unsaved* record from a data table (nothing hits the database until
 --- you call `:save()`). Useful to prepare a record then persist it later.
@@ -1033,6 +1150,12 @@ function NormModel:sync()
     end);
 end
 
+-- Per-event convenience registrars: NormModel:before_save(fn), :after_create(fn), …
+for i = 1, #HOOK_EVENTS do
+    local event = HOOK_EVENTS[i];
+    NormModel[event] = function(self, fn) return self:hook(event, fn); end
+end
+
 module.Model = NormModel;
 
 -- ==========================================================================
@@ -1051,6 +1174,7 @@ end
 ---@class NormDefineOptions
 ---@field timestamps? boolean|{created?: string, updated?: string} Auto-manage created_at/updated_at (Norm-side, UTC; portable across SQLite/MySQL). `true` uses the default names; pass a table to rename.
 ---@field soft_deletes? boolean|{column?: string} Mark rows deleted (set a `deleted_at`) instead of removing them; queries then exclude them by default. `true` uses `deleted_at`; pass a table to rename.
+---@field hooks? table<string, fun(record: NormRecord)|fun(record: NormRecord)[]> Lifecycle hooks per event (see `NormModel:hook`), as a single handler or a list.
 
 --- Build a Model (+ dedicated Record subclass) from a schema definition.
 ---@param orm NormOrm
@@ -1121,6 +1245,17 @@ function module.define(orm, table_name, schema, options)
     local model = NormModel(orm, table_name, columns, record_class);
     model.timestamps = timestamps;
     model.soft_deletes = soft_deletes;
+
+    -- Register lifecycle hooks passed at define time.
+    if (type(options.hooks) == "table") then
+        for event, handler in pairs(options.hooks) do
+            if (type(handler) == "function") then
+                model:hook(event, handler);
+            elseif (type(handler) == "table") then
+                for i = 1, #handler do model:hook(event, handler[i]); end
+            end
+        end
+    end
 
     -- Resolve relation key defaults now that the model (and its primary key) exists.
     local singular = (table_name:gsub("s$", ""));
