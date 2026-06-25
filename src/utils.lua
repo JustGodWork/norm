@@ -32,6 +32,22 @@ function utils.copy(t)
     return out;
 end
 
+--- Naive singulariser (drops a trailing "s"), for relation key/table defaults.
+---@param name string
+---@return string
+function utils.singularize(name) return (name:gsub("s$", "")); end
+
+--- Default pivot table name for a many-to-many: the two table singulars joined by
+--- "_" in alphabetical order (e.g. `users` + `roles` -> `role_user`).
+---@param a string
+---@param b string
+---@return string
+function utils.default_pivot(a, b)
+    local sa, sb = utils.singularize(a), utils.singularize(b);
+    if (sa <= sb) then return sa .. "_" .. sb; end
+    return sb .. "_" .. sa;
+end
+
 --- Sorted array of a dictionary's keys (stable SQL output).
 ---@param dict table<string, any>
 ---@return string[]
