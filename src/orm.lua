@@ -10,21 +10,18 @@ local model_module = require("model");
 local singularize = utils.singularize;
 local default_pivot = utils.default_pivot;
 
---- Build a nested include tree from dotted paths. `{ "posts.comments", "posts.likes",
---- "profile" }` -> `{ posts = { comments = {}, likes = {} }, profile = {} }`. Shared
---- prefixes collapse, so each relation level is loaded once.
----@param paths string[]
----@return table
-local function build_include_tree(paths)
-    local tree = {};
-    for _, path in ipairs(paths) do
-        local node = tree;
-        for seg in path:gmatch("[^.]+") do
-            node[seg] = node[seg] or {};
-            node = node[seg];
-        end
-    end
-    return tree;
+--- Take `list[offset+1 .. offset+limit]` (used for per-parent limit on an included
+--- collection). Returns the list unchanged when `limit` is nil.
+---@param list any[]
+---@param offset? number
+---@param limit? number
+---@return any[]
+local function slice(list, offset, limit)
+    if (not limit) then return list; end
+    offset = offset or 0;
+    local out = {};
+    for i = offset + 1, math.min(#list, offset + limit) do out[#out + 1] = list[i]; end
+    return out;
 end
 
 --- Flatten the records loaded under `name` across a set of parents (handles a
@@ -218,8 +215,9 @@ end
 ---@param model NormModel
 ---@param rel NormRelation
 ---@param keys any[] Unique parent local-key values.
+---@param spec? table Include spec (`wheres`/`orders`/`limit`/`offset`) applied to the target.
 ---@param cb fun(err: any, by_main?: table<any, NormRecord[]>) `by_main[parentKey]` = linked target records.
-function NormOrm:_m2m_fetch(model, rel, keys, cb)
+function NormOrm:_m2m_fetch(model, rel, keys, spec, cb)
     local target = self:model(rel.target);
     if (not target) then
         return cb(("relation '%s': target model '%s' is not defined"):format(rel.name or "?", rel.target));
@@ -252,42 +250,59 @@ function NormOrm:_m2m_fetch(model, rel, keys, cb)
         end
         if (#related_ids == 0) then return cb(nil, {}); end
 
-        -- 2) target rows, fetched once by their local key.
+        -- 2) target rows, fetched once by their local key (+ any include filters/order).
         local tstate = { table = target.table,
             wheres = { { column = other_local, op = "IN", value = related_ids } } };
+        if (spec and spec.wheres) then for i = 1, #spec.wheres do tstate.wheres[#tstate.wheres + 1] = spec.wheres[i]; end end
+        if (spec and spec.orders and #spec.orders > 0) then tstate.orders = spec.orders; end
         local tstmt, tparams = sqlmod.select(tstate, d);
         self:_trace(tstmt, tparams);
+        -- invert pivot mapping: related key -> the parent keys linked to it.
+        local related_to_mains = {};
+        for mk, rks in pairs(main_to_related) do
+            for j = 1, #rks do
+                local rk = rks[j];
+                local l = related_to_mains[rk];
+                if (not l) then l = {}; related_to_mains[rk] = l; end
+                l[#l + 1] = mk;
+            end
+        end
         self:_raw_query(tstmt, tparams, function(terr, trows)
             if (terr ~= nil) then return cb(terr); end
             trows = trows or {};
-            local by_id = {};
-            for i = 1, #trows do by_id[trows[i][other_local]] = target:wrap(trows[i]); end
             local by_main = {};
-            for mk, rks in pairs(main_to_related) do
-                local list = {};
-                for i = 1, #rks do
-                    local rec = by_id[rks[i]];
-                    if (rec ~= nil) then list[#list + 1] = rec; end
+            for mk in pairs(main_to_related) do by_main[mk] = {}; end
+            -- iterate target rows in SQL order so any include `order` is honoured.
+            for i = 1, #trows do
+                local rec = target:wrap(trows[i]);
+                local owners = related_to_mains[trows[i][other_local]];
+                if (owners) then
+                    for j = 1, #owners do
+                        local g = by_main[owners[j]];
+                        g[#g + 1] = rec;
+                    end
                 end
-                by_main[mk] = list;
+            end
+            if (spec and spec.limit) then
+                for mk, list in pairs(by_main) do by_main[mk] = slice(list, spec.offset, spec.limit); end
             end
             cb(nil, by_main);
         end);
     end);
 end
 
---- Internal: eager-load a tree of (possibly nested) relations onto a set of
---- records. Each relation level is loaded once via `_load_include_batch` (batched,
---- no N+1); for a level with children, the loaded records are flattened and the
---- subtree is loaded onto them. Sibling relations are loaded sequentially.
+--- Internal: eager-load a map of include specs onto a set of records. Each
+--- relation is loaded once via `_load_include_batch` (batched, no N+1) with its
+--- spec (per-relation `wheres`/`orders`/`limit`); a spec with `children` then
+--- recurses onto the flattened loaded records. Siblings load sequentially.
 ---@private
 ---@param model NormModel
 ---@param records NormRecord[]
----@param tree table name -> subtree
+---@param includes table<string, table> name -> spec { wheres, orders, limit, offset, children }
 ---@param cb fun(err: any)
-function NormOrm:_load_include_tree(model, records, tree, cb)
+function NormOrm:_load_includes(model, records, includes, cb)
     local names = {};
-    for name in pairs(tree) do names[#names + 1] = name; end
+    for name in pairs(includes) do names[#names + 1] = name; end
     table.sort(names); -- deterministic order
 
     local i = 0;
@@ -295,15 +310,16 @@ function NormOrm:_load_include_tree(model, records, tree, cb)
         i = i + 1;
         local name = names[i];
         if (not name) then return cb(); end
-        self:_load_include_batch(model, records, name, function(err)
+        local spec = includes[name];
+        self:_load_include_batch(model, records, name, spec, function(err)
             if (err ~= nil) then return cb(err); end
-            local subtree = tree[name];
-            if (next(subtree) == nil) then return step(); end -- leaf: nothing nested
+            local children = spec.children;
+            if (not children or next(children) == nil) then return step(); end -- leaf
             local rel = model.relations[name];
             local target = self:model(rel.target);
-            local children = collect_loaded(records, name);
-            if (#children == 0) then return step(); end
-            self:_load_include_tree(target, children, subtree, function(e)
+            local kids = collect_loaded(records, name);
+            if (#kids == 0) then return step(); end
+            self:_load_includes(target, kids, children, function(e)
                 if (e ~= nil) then return cb(e); end
                 step();
             end);
@@ -318,8 +334,9 @@ end
 ---@param model NormModel
 ---@param mains NormRecord[]
 ---@param name string
+---@param spec? table Include spec (`wheres`/`orders`/`limit`/`offset`).
 ---@param cb fun(err: any)
-function NormOrm:_load_include_batch(model, mains, name, cb)
+function NormOrm:_load_include_batch(model, mains, name, spec, cb)
     local rel = model.relations[name];
     if (not rel) then
         return cb(("model '%s' has no relation '%s'"):format(model.table, name));
@@ -345,7 +362,7 @@ function NormOrm:_load_include_batch(model, mains, name, cb)
     end
 
     if (rel.kind == "belongs_to_many") then
-        self:_m2m_fetch(model, rel, keys, function(err, by_main)
+        self:_m2m_fetch(model, rel, keys, spec, function(err, by_main)
             if (err ~= nil) then return cb(err); end
             for i = 1, #mains do mains[i][name] = (by_main and by_main[mains[i][source_key]]) or {}; end
             cb();
@@ -356,6 +373,7 @@ function NormOrm:_load_include_batch(model, mains, name, cb)
     if (rel.kind == "belongs_to") then
         local other_key = rel.otherKey or target.primary_key;
         local state = { table = target.table, wheres = { { column = other_key, op = "IN", value = keys } } };
+        if (spec and spec.wheres) then for i = 1, #spec.wheres do state.wheres[#state.wheres + 1] = spec.wheres[i]; end end
         local statement, params = sqlmod.select(state, d);
         self:_trace(statement, params);
         self:_raw_query(statement, params, function(err, rows)
@@ -371,6 +389,8 @@ function NormOrm:_load_include_batch(model, mains, name, cb)
 
     -- has_one / has_many: group target rows by their foreign key.
     local state = { table = target.table, wheres = { { column = rel.key, op = "IN", value = keys } } };
+    if (spec and spec.wheres) then for i = 1, #spec.wheres do state.wheres[#state.wheres + 1] = spec.wheres[i]; end end
+    if (spec and spec.orders and #spec.orders > 0) then state.orders = spec.orders; end
     local statement, params = sqlmod.select(state, d);
     self:_trace(statement, params);
     self:_raw_query(statement, params, function(err, rows)
@@ -385,6 +405,7 @@ function NormOrm:_load_include_batch(model, mains, name, cb)
         end
         for i = 1, #mains do
             local g = groups[mains[i][source_key]] or {};
+            if (spec and spec.limit and rel.kind == "has_many") then g = slice(g, spec.offset, spec.limit); end
             mains[i][name] = (rel.kind == "has_one") and (g[1] or nil) or g;
         end
         cb();
@@ -396,14 +417,13 @@ end
 ---@private
 ---@param model NormModel
 ---@param state NormQueryState
----@param includes string[]
+---@param includes table<string, table> include spec map (name -> { wheres, orders, limit, offset, children })
 ---@param single boolean
 ---@return NormPromise
 function NormOrm:_query_with_includes(model, state, includes, single)
     local d = self.adapter:get_dialect();
     local statement, params = sqlmod.select(state, d);
     self:_trace(statement, params);
-    local tree = build_include_tree(includes);
     return self.provider.new(function(resolve, reject)
         self:_raw_query(statement, params or {}, function(err, rows)
             if (err ~= nil) then return reject(err); end
@@ -414,7 +434,7 @@ function NormOrm:_query_with_includes(model, state, includes, single)
                 return resolve(single and nil or records);
             end
             local ok, perr = pcall(function()
-                self:_load_include_tree(model, records, tree, function(e)
+                self:_load_includes(model, records, includes, function(e)
                     if (e ~= nil) then return reject(e); end
                     resolve(single and records[1] or records);
                 end);
