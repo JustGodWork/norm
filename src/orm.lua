@@ -7,6 +7,22 @@ local promise = require("promise");
 local jsonmod = require("json");
 local model_module = require("model");
 
+--- Naive singulariser (drops a trailing "s"), used for relation key/table defaults.
+---@param name string
+---@return string
+local function singularize(name) return (name:gsub("s$", "")); end
+
+--- Default pivot table name for a many-to-many: the two table singulars joined by
+--- "_" in alphabetical order (e.g. `users` + `roles` -> `role_user`).
+---@param a string
+---@param b string
+---@return string
+local function default_pivot(a, b)
+    local sa, sb = singularize(a), singularize(b);
+    if (sa <= sb) then return sa .. "_" .. sb; end
+    return sb .. "_" .. sa;
+end
+
 ---@class NormOrm: LightClass
 ---@field adapter NormAdapter
 ---@field provider NormPromiseProvider
@@ -117,6 +133,72 @@ function NormOrm:_execute_map(query, params, transform)
     end);
 end
 
+--- Internal: fetch many-to-many target records for a set of parent keys, in two
+--- batched queries (pivot then targets) — no N+1 regardless of cardinality. The
+--- target-dependent defaults (`through`, `otherKey`, `otherLocalKey`) are resolved
+--- here, since the target model may have been defined after this one.
+---@private
+---@param model NormModel
+---@param rel NormRelation
+---@param keys any[] Unique parent local-key values.
+---@param cb fun(err: any, by_main?: table<any, NormRecord[]>) `by_main[parentKey]` = linked target records.
+function NormOrm:_m2m_fetch(model, rel, keys, cb)
+    local target = self:model(rel.target);
+    if (not target) then
+        return cb(("relation '%s': target model '%s' is not defined"):format(rel.name or "?", rel.target));
+    end
+    if (#keys == 0) then return cb(nil, {}); end
+
+    local d = self.adapter:get_dialect();
+    local through = rel.through or default_pivot(model.table, target.table);
+    local pivot_main = rel.key;                                          -- pivot col -> this model
+    local pivot_other = rel.otherKey or (singularize(target.table) .. "_id"); -- pivot col -> target
+    local other_local = rel.otherLocalKey or target.primary_key;         -- target's local key
+
+    -- 1) pivot rows: parent key + related key.
+    local pstate = { table = through, columns = { pivot_main, pivot_other },
+        wheres = { { column = pivot_main, op = "IN", value = keys } } };
+    local pstmt, pparams = sqlmod.select(pstate, d);
+    self:_trace(pstmt, pparams);
+    self.adapter:raw_query(pstmt, pparams, function(perr, prows)
+        if (perr ~= nil) then return cb(perr); end
+        prows = prows or {};
+        local main_to_related, related_ids, seen = {}, {}, {};
+        for i = 1, #prows do
+            local mk, rk = prows[i][pivot_main], prows[i][pivot_other];
+            if (mk ~= nil and rk ~= nil) then
+                local lst = main_to_related[mk];
+                if (not lst) then lst = {}; main_to_related[mk] = lst; end
+                lst[#lst + 1] = rk;
+                if (not seen[rk]) then seen[rk] = true; related_ids[#related_ids + 1] = rk; end
+            end
+        end
+        if (#related_ids == 0) then return cb(nil, {}); end
+
+        -- 2) target rows, fetched once by their local key.
+        local tstate = { table = target.table,
+            wheres = { { column = other_local, op = "IN", value = related_ids } } };
+        local tstmt, tparams = sqlmod.select(tstate, d);
+        self:_trace(tstmt, tparams);
+        self.adapter:raw_query(tstmt, tparams, function(terr, trows)
+            if (terr ~= nil) then return cb(terr); end
+            trows = trows or {};
+            local by_id = {};
+            for i = 1, #trows do by_id[trows[i][other_local]] = target:wrap(trows[i]); end
+            local by_main = {};
+            for mk, rks in pairs(main_to_related) do
+                local list = {};
+                for i = 1, #rks do
+                    local rec = by_id[rks[i]];
+                    if (rec ~= nil) then list[#list + 1] = rec; end
+                end
+                by_main[mk] = list;
+            end
+            cb(nil, by_main);
+        end);
+    end);
+end
+
 --- Internal: batched eager-load of one relation onto a set of parent records.
 --- Runs a single `... IN (...)` query and attaches results. Calls `cb(err?)`.
 ---@private
@@ -143,10 +225,19 @@ function NormOrm:_load_include_batch(model, mains, name, cb)
         if (v ~= nil and not seen[v]) then seen[v] = true; keys[#keys + 1] = v; end
     end
 
-    local empty = (rel.kind == "has_many") and {} or nil;
+    local empty = (rel.kind == "has_many" or rel.kind == "belongs_to_many") and {} or nil;
     if (#keys == 0) then
         for i = 1, #mains do mains[i][name] = empty; end
         return cb();
+    end
+
+    if (rel.kind == "belongs_to_many") then
+        self:_m2m_fetch(model, rel, keys, function(err, by_main)
+            if (err ~= nil) then return cb(err); end
+            for i = 1, #mains do mains[i][name] = (by_main and by_main[mains[i][source_key]]) or {}; end
+            cb();
+        end);
+        return;
     end
 
     if (rel.kind == "belongs_to") then
