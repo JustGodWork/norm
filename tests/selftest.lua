@@ -229,6 +229,29 @@ coroutine.wrap(function()
     check("await an ORM query result", u and u.name == "John", u and u.name);
 end)();
 
+-- an error raised AFTER a pending await resumes must be SURFACED, not swallowed
+-- (the builtin's _settle resumes the coroutine and reports a failed resume).
+do
+    local captured, real_print = {}, print;
+    print = function(...) captured[#captured + 1] = table.concat({ ... }, " "); end
+    local resolve_fn;
+    local p = orm.promise.builtin().new(function(res) resolve_fn = res; end);
+    local co = coroutine.create(function()
+        p:await();
+        error("boom-after-await");
+    end);
+    coroutine.resume(co);  -- suspends at :await()
+    resolve_fn(true);      -- resumes -> raises -> must be logged
+    print = real_print;
+    local found = false;
+    for _, line in ipairs(captured) do
+        if (line:find("uncaught error after await", 1, true) and line:find("boom-after-await", 1, true)) then
+            found = true;
+        end
+    end
+    check("error after await is surfaced (not swallowed)", found, table.concat(captured, " | "));
+end
+
 print("== Test group 7: custom promise class (auto-wrapped via from_class) ==");
 -- A framework promise with a `Class(executor)` constructor and its OWN :await()
 -- (like no-more-rp's). Passing the CLASS directly should auto-wrap it.
