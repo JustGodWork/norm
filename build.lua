@@ -13,7 +13,7 @@ local base = script_path:match("^(.*)[/\\]") or ".";
 
 -- Module load list. Order is cosmetic (the resolver is lazy); `init` is the entry.
 local MODULES = {
-    "utils", "dialect", "types", "sql", "promise",
+    "utils", "dialect", "types", "sql", "promise", "json",
     "adapter", "query", "model", "orm",
     "adapters.nanos", "adapters.oxmysql", "init",
 };
