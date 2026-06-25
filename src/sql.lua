@@ -307,6 +307,12 @@ local function compile_where(wheres, d, params)
                 end
                 frag = ("%s %s (%s)"):format(col, op, table.concat(marks, ", "));
             end
+        elseif (op == "BETWEEN" or op == "NOT BETWEEN") then
+            params[#params + 1] = normalize(cond.value[1]);
+            local lo = d.placeholder(#params);
+            params[#params + 1] = normalize(cond.value[2]);
+            local hi = d.placeholder(#params);
+            frag = ("%s %s %s AND %s"):format(col, op, lo, hi);
         else
             params[#params + 1] = normalize(cond.value);
             frag = ("%s %s %s"):format(col, op, d.placeholder(#params));
