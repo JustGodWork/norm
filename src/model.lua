@@ -408,6 +408,39 @@ function NormRecord:trashed()
     return col ~= nil and self[col] ~= nil;
 end
 
+--- Atomically add `amount` (default 1) to a column of THIS record
+--- (`SET col = col + ?` by primary key — no read-modify-write). Also updates the
+--- in-memory value when it is a number, and resnapshots. Resolves with the record.
+--- ```lua
+---     player:increment("coins", 50):await()  -- player.coins is updated locally too
+--- ```
+---@param column string
+---@param amount? number Defaults to 1.
+---@return NormRecordPromise promise resolving to NormRecord (self)
+function NormRecord:increment(column, amount)
+    amount = amount or 1;
+    local model = self.__model;
+    local orm = model.orm;
+    utils.assert(model.primary_key, ("model '%s' has no primary key; cannot increment"):format(model.table));
+    local d = orm.adapter:get_dialect();
+    local pk = model.primary_key;
+    local state = { table = model.table, wheres = { { column = pk, op = "=", value = self[pk] } } };
+    local statement, params = sqlmod.increment(state, { { column = column, amount = amount } }, d);
+    return orm:_execute_map(statement, params, function()
+        if (type(self[column]) == "number") then self[column] = self[column] + amount; end
+        self:_snapshot(); -- the column now matches the DB
+        return self;
+    end);
+end
+
+--- Atomically subtract `amount` (default 1) from a column of this record.
+---@param column string
+---@param amount? number Defaults to 1.
+---@return NormRecordPromise promise resolving to NormRecord (self)
+function NormRecord:decrement(column, amount)
+    return self:increment(column, -(amount or 1));
+end
+
 --- Resolve a `belongs_to_many` relation into its pivot coordinates (asserts the
 --- relation exists and is many-to-many).
 ---@private
