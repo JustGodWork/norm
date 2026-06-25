@@ -692,6 +692,12 @@ function NormOrm:sync()
         local m = self.models[name];
         local fks = emit_fk and self:_collect_foreign_keys(m) or nil;
         statements[#statements + 1] = sqlmod.create_table(m.table, m.columns, d, fks);
+        -- each table's indexes, right after it's created (idempotent via IF NOT EXISTS).
+        if (m.indexes) then
+            for _, ix in ipairs(m.indexes) do
+                statements[#statements + 1] = sqlmod.add_index(m.table, ix.name, ix.columns, ix.unique, d, true);
+            end
+        end
     end
 
     return self.provider.new(function(resolve, reject)
