@@ -5,14 +5,7 @@ local utils = require("utils");
 local sqlmod = require("sql");
 local NormQueryBuilder = require("query");
 
---- Current UTC timestamp as `YYYY-MM-DD HH:MM:SS` (portable across MySQL DATETIME
---- and SQLite TEXT). Returns nil if `os.date` is unavailable (timestamps skipped).
----@return string|nil
-local function now_utc()
-    if (type(os) ~= "table" or type(os.date) ~= "function") then return nil; end
-    local ok, s = pcall(os.date, "!%Y-%m-%d %H:%M:%S");
-    return ok and s or nil;
-end
+local now_utc = utils.now_utc;
 
 --- Merge two attribute tables (`b` overrides `a`), both optional.
 ---@param a? table<string, any>
@@ -263,14 +256,38 @@ function NormRecord:save()
     end);
 end
 
---- DELETE this record from the database by its primary key. Resolves with the
---- record (now flagged as not persisted, so a later `:save()` re-inserts it).
+--- Delete this record. For a soft-delete model this sets the `deleted_at` column
+--- (the row stays, but queries exclude it by default); otherwise it physically
+--- removes the row. Resolves with the record.
 --- ```lua
 ---     local user = User:find(1):await()
 ---     user:delete():await()
 --- ```
 ---@return NormRecordPromise promise resolving to NormRecord (self)
 function NormRecord:delete()
+    local model = self.__model;
+    local orm = model.orm;
+    utils.assert(model.primary_key, ("model '%s' has no primary key; cannot delete"):format(model.table));
+    local d = orm.adapter:get_dialect();
+    local pk = model.primary_key;
+
+    if (model.soft_deletes) then
+        local col = model.soft_deletes;
+        local nowv = now_utc();
+        self[col] = nowv;
+        local state = { table = model.table, wheres = { { column = pk, op = "=", value = self[pk] } } };
+        local statement, params = sqlmod.update(state, { [col] = nowv }, d);
+        return orm:_execute_map(statement, params, function() self:_snapshot(); return self; end);
+    end
+
+    return self:force_delete();
+end
+
+--- Physically DELETE this record by its primary key, even on a soft-delete model.
+--- The record is flagged not-persisted (a later `:save()` re-inserts it). Resolves
+--- with the record.
+---@return NormRecordPromise promise resolving to NormRecord (self)
+function NormRecord:force_delete()
     local model = self.__model;
     utils.assert(model.primary_key, ("model '%s' has no primary key; cannot delete"):format(model.table));
     local d = model.orm.adapter:get_dialect();
@@ -281,6 +298,33 @@ function NormRecord:delete()
         self.__persisted = false;
         return self;
     end);
+end
+
+--- Un-delete a soft-deleted record (clears `deleted_at`). Resolves with the record.
+--- ```lua
+---     local post = Post:only_trashed():where("id", 5):first():await()
+---     post:restore():await()
+--- ```
+---@return NormRecordPromise promise resolving to NormRecord (self)
+function NormRecord:restore()
+    local model = self.__model;
+    local orm = model.orm;
+    local col = utils.assert(model.soft_deletes, ("model '%s' does not use soft deletes"):format(model.table));
+    utils.assert(model.primary_key, ("model '%s' has no primary key; cannot restore"):format(model.table));
+    local d = orm.adapter:get_dialect();
+    local params = {};
+    -- explicit `SET col = NULL` (a nil value can't be carried through a data table).
+    local where = sqlmod.compile_where({ { column = model.primary_key, op = "=", value = self[model.primary_key] } }, d, params);
+    local statement = ("UPDATE %s SET %s = NULL%s"):format(d.quote(model.table), d.quote(col), where);
+    self[col] = nil;
+    return orm:_execute_map(statement, params, function() self:_snapshot(); return self; end);
+end
+
+--- Whether this record is currently soft-deleted (its `deleted_at` is set).
+---@return boolean
+function NormRecord:trashed()
+    local col = self.__model.soft_deletes;
+    return col ~= nil and self[col] ~= nil;
 end
 
 --- Resolve a `belongs_to_many` relation into its pivot coordinates (asserts the
@@ -507,6 +551,7 @@ function NormRecord:load(name)
             return orm.provider.resolve(nil);
         end
         local state = { table = target.table, limit = 1, wheres = { { column = other_key, op = "=", value = fk } } };
+        utils.soft_scope(state, target);
         local statement, params = sqlmod.select(state, d);
         return orm:_query_map(statement, params, function(rows)
             local rec = rows[1] and target:wrap(rows[1]) or nil;
@@ -524,6 +569,7 @@ function NormRecord:load(name)
     end
     local state = { table = target.table, wheres = { { column = rel.key, op = "=", value = local_value } } };
     if (rel.kind == "has_one") then state.limit = 1; end
+    utils.soft_scope(state, target);
     local statement, params = sqlmod.select(state, d);
     return orm:_query_map(statement, params, function(rows)
         if (rel.kind == "has_one") then
@@ -554,6 +600,7 @@ module.Record = NormRecord;
 ---@field autoincrement_pk boolean
 ---@field record_class NormRecord
 ---@field timestamps? {created: string, updated: string} Auto-managed timestamp columns (nil if disabled).
+---@field soft_deletes? string The soft-delete column name (nil if disabled).
 ---@overload fun(orm: NormOrm, table_name: string, columns: NormColumn[], record_class: NormRecord): NormModel
 local NormModel = class.new("NormModel");
 
@@ -694,6 +741,14 @@ function NormModel:select_raw(expr) return self:query():select_raw(expr); end
 ---@param ... string|string[]
 ---@return NormQueryBuilder
 function NormModel:omit(...) return self:query():omit(...); end
+
+--- Start a query that INCLUDES soft-deleted rows (soft-delete models only).
+---@return NormQueryBuilder
+function NormModel:with_trashed() return self:query():with_trashed(); end
+
+--- Start a query over ONLY soft-deleted rows (soft-delete models only).
+---@return NormQueryBuilder
+function NormModel:only_trashed() return self:query():only_trashed(); end
 
 ---@param table_name string
 ---@param first string
@@ -995,6 +1050,7 @@ end
 --- Options controlling how a model behaves (3rd arg of `define`).
 ---@class NormDefineOptions
 ---@field timestamps? boolean|{created?: string, updated?: string} Auto-manage created_at/updated_at (Norm-side, UTC; portable across SQLite/MySQL). `true` uses the default names; pass a table to rename.
+---@field soft_deletes? boolean|{column?: string} Mark rows deleted (set a `deleted_at`) instead of removing them; queries then exclude them by default. `true` uses `deleted_at`; pass a table to rename.
 
 --- Build a Model (+ dedicated Record subclass) from a schema definition.
 ---@param orm NormOrm
@@ -1024,17 +1080,27 @@ function module.define(orm, table_name, schema, options)
         end
     end
 
-    -- Timestamps: add managed `datetime` columns (unless already declared).
+    -- Managed `datetime` columns (added unless already declared).
+    local function ensure_datetime_column(name)
+        for i = 1, #columns do if (columns[i].name == name) then return; end end
+        columns[#columns + 1] = { kind = "datetime", nullable = true, name = name };
+    end
+
+    -- Timestamps.
     local timestamps = nil;
     if (options.timestamps) then
         local conf = (type(options.timestamps) == "table") and options.timestamps or {};
         timestamps = { created = conf.created or "created_at", updated = conf.updated or "updated_at" };
-        local function ensure_ts_column(name)
-            for i = 1, #columns do if (columns[i].name == name) then return; end end
-            columns[#columns + 1] = { kind = "datetime", nullable = true, name = name };
-        end
-        ensure_ts_column(timestamps.created);
-        ensure_ts_column(timestamps.updated);
+        ensure_datetime_column(timestamps.created);
+        ensure_datetime_column(timestamps.updated);
+    end
+
+    -- Soft deletes (a nullable `deleted_at`; rows are marked, not removed).
+    local soft_deletes = nil;
+    local sd = options.soft_deletes or options.softDeletes;
+    if (sd) then
+        soft_deletes = (type(sd) == "table" and sd.column) or "deleted_at";
+        ensure_datetime_column(soft_deletes);
     end
 
     -- Stable order: primary key(s) first, then alphabetical.
@@ -1054,6 +1120,7 @@ function module.define(orm, table_name, schema, options)
 
     local model = NormModel(orm, table_name, columns, record_class);
     model.timestamps = timestamps;
+    model.soft_deletes = soft_deletes;
 
     -- Resolve relation key defaults now that the model (and its primary key) exists.
     local singular = (table_name:gsub("s$", ""));
