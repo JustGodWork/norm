@@ -852,19 +852,32 @@ function NormModel:build(data) return self.record_class(self, data, false); end
 ---@return NormRecordPromise promise resolving to NormRecord
 function NormModel:create(data) return self:build(data):save(); end
 
---- Bulk-insert many rows in ONE statement. A fast path: it does NOT build records,
---- fire hooks, or return insert ids (a multi-row insert can't give per-row ids).
---- Timestamps are stamped; auto-increment ids are left to the DB; columns missing
---- from a row are inserted as NULL. Resolves with the affected row count.
+--- Bulk-insert many rows in ONE statement. A fast path: it does NOT fire create
+--- hooks. Timestamps are stamped; auto-increment ids are left to the DB; columns
+--- missing from a row are inserted as NULL.
+---
+--- By default (no per-row ids available from a multi-row insert) it resolves with
+--- the affected row count. Pass `{ records = true }` to get the inserted rows back
+--- as records WITH their ids — this uses `INSERT ... RETURNING *` and therefore
+--- requires a RETURNING-capable adapter (SQLite >= 3.35 / PostgreSQL / MariaDB >=
+--- 10.5); it **throws** otherwise.
 --- ```lua
----     Log:insert_many({ { level = "info", msg = "a" }, { level = "warn", msg = "b" } }):await()
+---     local n    = Log:insert_many({ { level = "info" }, { level = "warn" } }):await()
+---     local recs = Log:insert_many(rows, { records = true }):await()  -- recs[1].id, …
 --- ```
 ---@param rows table<string, any>[]
----@return NormNumberPromise promise resolving to number
-function NormModel:insert_many(rows)
+---@param opts? { records?: boolean }
+---@return NormNumberPromise|NormRecordListPromise promise resolving to a count, or records
+function NormModel:insert_many(rows, opts)
+    opts = opts or {};
     utils.assert(type(rows) == "table", "insert_many: expected a list of rows");
     local orm = self.orm;
-    if (#rows == 0) then return orm.provider.resolve(0); end
+    local want_records = opts.records == true;
+    if (want_records) then
+        utils.assert(type(orm.adapter.supports_returning) == "function" and orm.adapter:supports_returning(),
+            ("insert_many{ records = true } needs an adapter with RETURNING support (model '%s')"):format(self.table));
+    end
+    if (#rows == 0) then return orm.provider.resolve(want_records and {} or 0); end
     local d = orm.adapter:get_dialect();
     local ts = self.timestamps;
     local nowv = ts and now_utc() or nil;
@@ -886,6 +899,15 @@ function NormModel:insert_many(rows)
     local columns = {};
     for k in pairs(colset) do columns[#columns + 1] = k; end
     table.sort(columns); -- stable column order
+
+    if (want_records) then
+        local statement, params = sqlmod.insert_many(self.table, columns, encoded, d, "*");
+        return orm:_query_map(statement, params, function(back)
+            local out = {};
+            for i = 1, #back do out[i] = self:wrap(back[i]); end
+            return out;
+        end);
+    end
 
     local statement, params = sqlmod.insert_many(self.table, columns, encoded, d);
     return orm:_execute_map(statement, params, function(res) return (res and res.affectedRows) or #rows; end);
