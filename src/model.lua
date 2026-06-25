@@ -490,7 +490,7 @@ function NormRecord:load(name)
             return orm.provider.resolve({});
         end
         return orm.provider.new(function(resolve, reject)
-            orm:_m2m_fetch(model, rel, { local_value }, function(err, by_main)
+            orm:_m2m_fetch(model, rel, { local_value }, nil, function(err, by_main)
                 if (err ~= nil) then return reject(err); end
                 local list = (by_main and by_main[local_value]) or {};
                 self[name] = list;
