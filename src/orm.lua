@@ -10,6 +10,43 @@ local model_module = require("model");
 local singularize = utils.singularize;
 local default_pivot = utils.default_pivot;
 
+--- Build a nested include tree from dotted paths. `{ "posts.comments", "posts.likes",
+--- "profile" }` -> `{ posts = { comments = {}, likes = {} }, profile = {} }`. Shared
+--- prefixes collapse, so each relation level is loaded once.
+---@param paths string[]
+---@return table
+local function build_include_tree(paths)
+    local tree = {};
+    for _, path in ipairs(paths) do
+        local node = tree;
+        for seg in path:gmatch("[^.]+") do
+            node[seg] = node[seg] or {};
+            node = node[seg];
+        end
+    end
+    return tree;
+end
+
+--- Flatten the records loaded under `name` across a set of parents (handles a
+--- single record, nil, or an array) into one list for the next nesting level.
+---@param records NormRecord[]
+---@param name string
+---@return NormRecord[]
+local function collect_loaded(records, name)
+    local out = {};
+    for i = 1, #records do
+        local v = records[i][name];
+        if (v ~= nil) then
+            if (v.__model) then
+                out[#out + 1] = v;                       -- single record (belongs_to / has_one)
+            else
+                for j = 1, #v do out[#out + 1] = v[j]; end -- array (has_many / belongs_to_many)
+            end
+        end
+    end
+    return out;
+end
+
 ---@class NormOrm: LightClass
 ---@field adapter NormAdapter
 ---@field provider NormPromiseProvider
@@ -239,6 +276,42 @@ function NormOrm:_m2m_fetch(model, rel, keys, cb)
     end);
 end
 
+--- Internal: eager-load a tree of (possibly nested) relations onto a set of
+--- records. Each relation level is loaded once via `_load_include_batch` (batched,
+--- no N+1); for a level with children, the loaded records are flattened and the
+--- subtree is loaded onto them. Sibling relations are loaded sequentially.
+---@private
+---@param model NormModel
+---@param records NormRecord[]
+---@param tree table name -> subtree
+---@param cb fun(err: any)
+function NormOrm:_load_include_tree(model, records, tree, cb)
+    local names = {};
+    for name in pairs(tree) do names[#names + 1] = name; end
+    table.sort(names); -- deterministic order
+
+    local i = 0;
+    local function step()
+        i = i + 1;
+        local name = names[i];
+        if (not name) then return cb(); end
+        self:_load_include_batch(model, records, name, function(err)
+            if (err ~= nil) then return cb(err); end
+            local subtree = tree[name];
+            if (next(subtree) == nil) then return step(); end -- leaf: nothing nested
+            local rel = model.relations[name];
+            local target = self:model(rel.target);
+            local children = collect_loaded(records, name);
+            if (#children == 0) then return step(); end
+            self:_load_include_tree(target, children, subtree, function(e)
+                if (e ~= nil) then return cb(e); end
+                step();
+            end);
+        end);
+    end
+    step();
+end
+
 --- Internal: batched eager-load of one relation onto a set of parent records.
 --- Runs a single `... IN (...)` query and attaches results. Calls `cb(err?)`.
 ---@private
@@ -330,6 +403,7 @@ function NormOrm:_query_with_includes(model, state, includes, single)
     local d = self.adapter:get_dialect();
     local statement, params = sqlmod.select(state, d);
     self:_trace(statement, params);
+    local tree = build_include_tree(includes);
     return self.provider.new(function(resolve, reject)
         self:_raw_query(statement, params or {}, function(err, rows)
             if (err ~= nil) then return reject(err); end
@@ -339,22 +413,13 @@ function NormOrm:_query_with_includes(model, state, includes, single)
             if (#records == 0) then
                 return resolve(single and nil or records);
             end
-            local index = 0;
-            local function step()
-                index = index + 1;
-                local name = includes[index];
-                if (not name) then
-                    return resolve(single and records[1] or records);
-                end
-                local ok, err2 = pcall(function()
-                    self:_load_include_batch(model, records, name, function(e)
-                        if (e ~= nil) then return reject(e); end
-                        step();
-                    end);
+            local ok, perr = pcall(function()
+                self:_load_include_tree(model, records, tree, function(e)
+                    if (e ~= nil) then return reject(e); end
+                    resolve(single and records[1] or records);
                 end);
-                if (not ok) then reject(err2); end
-            end
-            step();
+            end);
+            if (not ok) then reject(perr); end
         end);
     end);
 end
