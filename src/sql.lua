@@ -12,10 +12,18 @@ local utils = require("utils");
 ---@field column string
 ---@field dir "ASC"|"DESC"
 
+---@class NormHaving
+---@field expr string Raw SQL expression (NOT quoted), e.g. "COUNT(*)".
+---@field op string Operator.
+---@field value any Bound parameter.
+
 ---@class NormQueryState
 ---@field table string
 ---@field columns? string[] Selected columns (nil = "*").
+---@field raw_columns? string[] Raw (unquoted) select expressions, e.g. "COUNT(*) AS n".
 ---@field wheres NormWhere[]
+---@field groups? string[] GROUP BY columns.
+---@field havings? NormHaving[] HAVING conditions (ANDed).
 ---@field orders? NormOrder[]
 ---@field limit? number
 ---@field offset? number
@@ -247,15 +255,34 @@ sql.compile_where = compile_where;
 ---@return string statement, any[] params
 function sql.select(state, d)
     local params = {};
-    local columns = "*";
-    if (state.columns and #state.columns > 0) then
-        local quoted = {};
-        for i = 1, #state.columns do quoted[i] = d.quote(state.columns[i]); end
-        columns = table.concat(quoted, ", ");
+    local cols = {};
+    if (state.columns) then
+        for i = 1, #state.columns do cols[#cols + 1] = d.quote(state.columns[i]); end
     end
+    if (state.raw_columns) then
+        for i = 1, #state.raw_columns do cols[#cols + 1] = state.raw_columns[i]; end
+    end
+    local columns = (#cols > 0) and table.concat(cols, ", ") or "*";
 
     local statement = ("SELECT %s FROM %s"):format(columns, d.quote(state.table));
     statement = statement .. compile_where(state.wheres, d, params);
+
+    if (state.groups and #state.groups > 0) then
+        local g = {};
+        for i = 1, #state.groups do g[i] = d.quote(state.groups[i]); end
+        statement = statement .. " GROUP BY " .. table.concat(g, ", ");
+    end
+
+    if (state.havings and #state.havings > 0) then
+        local frags = {};
+        for i = 1, #state.havings do
+            local h = state.havings[i];
+            params[#params + 1] = normalize(h.value);
+            -- expr is a raw aggregate expression (e.g. COUNT(*)), intentionally unquoted.
+            frags[#frags + 1] = ("%s %s %s"):format(h.expr, (h.op or "="):upper(), d.placeholder(#params));
+        end
+        statement = statement .. " HAVING " .. table.concat(frags, " AND ");
+    end
 
     if (state.orders and #state.orders > 0) then
         local parts = {};
@@ -283,6 +310,22 @@ end
 function sql.count(state, d)
     local params = {};
     local statement = ("SELECT COUNT(*) AS %s FROM %s"):format(d.quote("count"), d.quote(state.table));
+    statement = statement .. compile_where(state.wheres, d, params);
+    return statement, params;
+end
+
+--- Scalar aggregate (`SUM`/`AVG`/`MIN`/`MAX`/`COUNT`) over the WHERE-filtered set.
+--- The result is aliased `aggregate`. `column` is quoted; pass nil for `*`.
+---@param state NormQueryState
+---@param func string Aggregate function name (already upper-case).
+---@param column? string Column to aggregate (nil -> "*").
+---@param d NormDialect
+---@return string statement, any[] params
+function sql.aggregate(state, func, column, d)
+    local params = {};
+    local target = column and d.quote(column) or "*";
+    local statement = ("SELECT %s(%s) AS %s FROM %s"):format(
+        func, target, d.quote("aggregate"), d.quote(state.table));
     statement = statement .. compile_where(state.wheres, d, params);
     return statement, params;
 end
