@@ -48,6 +48,26 @@ function utils.default_pivot(a, b)
     return sb .. "_" .. sa;
 end
 
+--- Current UTC timestamp as `YYYY-MM-DD HH:MM:SS` (portable across MySQL DATETIME
+--- and SQLite TEXT). Returns nil if `os.date` is unavailable.
+---@return string|nil
+function utils.now_utc()
+    if (type(os) ~= "table" or type(os.date) ~= "function") then return nil; end
+    local ok, s = pcall(os.date, "!%Y-%m-%d %H:%M:%S");
+    return ok and s or nil;
+end
+
+--- Append a "not soft-deleted" condition (`<col> IS NULL`) to a query state's
+--- where list when the model uses soft deletes. No-op otherwise.
+---@param state NormQueryState
+---@param model NormModel
+function utils.soft_scope(state, model)
+    if (model.soft_deletes) then
+        state.wheres = state.wheres or {};
+        state.wheres[#state.wheres + 1] = { column = model.soft_deletes, op = "=", bool = "AND" };
+    end
+end
+
 --- Sorted array of a dictionary's keys (stable SQL output).
 ---@param dict table<string, any>
 ---@return string[]
