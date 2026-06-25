@@ -1400,6 +1400,30 @@ check("insert_many stamps timestamps", (function()
     local s = last_sql(tm);
     return s:find("`created_at`", 1, true) ~= nil and s:find("`updated_at`", 1, true) ~= nil;
 end)());
+
+-- { records = true } on a RETURNING-capable adapter returns records WITH ids
+local RBulk = class.extend("ReturningBulkMock", orm.Adapter);
+function RBulk:__init(o) orm.Adapter.__init(self, o); self.calls = {}; end
+function RBulk:supports_returning() return true; end
+function RBulk:raw_query(q, p, cb) self.calls[#self.calls + 1] = q; cb(nil, { { id = 1, name = "x" }, { id = 2, name = "y" } }); end
+function RBulk:raw_execute(q, p, cb) self.calls[#self.calls + 1] = q; cb(nil, { affectedRows = 2 }); end
+local rbm = RBulk({ dialect = "sqlite" });
+local rbdb = orm.new({ adapter = rbm, promise = orm.promise.builtin() });
+local Ev2 = rbdb:define("evs", { id = orm.types.id(), name = orm.types.string({ length = 16 }) });
+local recs;
+Ev2:insert_many({ { name = "x" }, { name = "y" } }, { records = true }):next(function(r) recs = r; end);
+check("insert_many records uses RETURNING", (function()
+    for _, q in ipairs(rbm.calls) do if (q:find("RETURNING", 1, true)) then return true; end end
+    return false;
+end)());
+check("insert_many records returns wrapped records with ids",
+    recs and #recs == 2 and recs[1].id == 1 and recs[2].id == 2, recs and #recs);
+
+-- { records = true } on a non-RETURNING adapter throws
+local NR = orm.new({ adapter = Mock({ dialect = "sqlite" }), promise = orm.promise.builtin() })
+    :define("nr", { id = orm.types.id(), name = orm.types.string({ length = 8 }) });
+check("insert_many records throws without RETURNING support",
+    select(1, pcall(function() NR:insert_many({ { name = "a" } }, { records = true }) end)) == false);
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
