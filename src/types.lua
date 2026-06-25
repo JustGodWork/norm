@@ -1,6 +1,6 @@
 --- Column type factories, exposed as `Norm.types`. Each returns a column
 --- descriptor consumed by `orm:define`. Available: `id, integer, bigint, string,
---- text, float, double, boolean, datetime, date, json` plus `raw` for raw SQL
+--- text, float, double, boolean, datetime, date, json, enum` plus `raw` for raw SQL
 --- defaults. Common options: `{ length, nullable, unique, primary, autoincrement, default }`.
 --- ```lua
 ---     db:define("users", {
@@ -17,7 +17,7 @@ local types = {};
 
 ---@alias NormColumnKind
 ---| "id" | "integer" | "bigint" | "string" | "text" | "float"
----| "double" | "boolean" | "datetime" | "date" | "json"
+---| "double" | "boolean" | "datetime" | "date" | "json" | "enum"
 
 ---@class NormColumnOptions
 ---@field length? number Length for VARCHAR columns.
@@ -27,6 +27,7 @@ local types = {};
 ---@field primary? boolean
 ---@field autoincrement? boolean
 ---@field default? any Literal value, or `Norm.types.raw(...)` for raw SQL.
+---@field values? string[] Allowed values for an `enum` column (required by `enum`).
 
 ---@class NormColumn: NormColumnOptions
 ---@field kind NormColumnKind
@@ -49,6 +50,7 @@ local function make(kind, options)
         primary = options.primary == true,
         autoincrement = options.autoincrement == true,
         default = options.default,
+        values = options.values, -- enum: allowed value list
     };
 end
 
@@ -161,6 +163,27 @@ function types.date(options) return make("date", options); end
 ---@param options? NormColumnOptions
 ---@return NormColumn
 function types.json(options) return make("json", options); end
+
+--- Enumerated string column. Renders as a native `ENUM('a','b',…)` on MySQL and as
+--- `TEXT` with a `CHECK (col IN ('a','b',…))` constraint on SQLite, so an invalid
+--- value is rejected by the database on both engines. Stored and read as a plain
+--- Lua string. `values` is required and must be a non-empty list of strings.
+--- ```lua
+---     sex    = Norm.types.enum({ values = { "male", "female" } }),
+---     status = Norm.types.enum({ values = { "active", "banned" }, default = "active" }),
+--- ```
+---@param options NormColumnOptions Must include `values` (a non-empty list of strings).
+---@return NormColumn
+function types.enum(options)
+    options = options or {};
+    assert(type(options.values) == "table" and #options.values > 0,
+        "[norm] Norm.types.enum requires a non-empty 'values' list");
+    for i = 1, #options.values do
+        assert(type(options.values[i]) == "string",
+            "[norm] Norm.types.enum values must all be strings");
+    end
+    return make("enum", options);
+end
 
 -- ==========================================================================
 -- Relations. Declared inside a schema alongside columns; `define` separates
