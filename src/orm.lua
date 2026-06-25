@@ -96,6 +96,10 @@ function NormOrm:__init(options)
     self._ready = (options.queue_until_ready ~= true);
     self._queue = {};
 
+    -- Active transaction handle (set for the duration of db:transaction); when set,
+    -- data ops route through the adapter's transaction connection.
+    self._tx = nil;
+
     -- JSON provider for `json` columns: explicit > adapter default > auto-detect.
     -- `false` disables it (raw string passthrough).
     local json_opt = options.json;
@@ -131,6 +135,7 @@ end
 --- (sync/migrate themselves bypass this — they're what makes the ORM ready.)
 ---@private
 function NormOrm:_raw_query(query, params, callback)
+    if (self._tx ~= nil) then return self._tx.query(query, params, callback); end
     if (self._ready) then return self.adapter:raw_query(query, params, callback); end
     if (#self._queue == 0) then
         self._logger("DB", "queue_until_ready: holding operations until sync()/migrate()");
@@ -140,6 +145,7 @@ end
 
 ---@private
 function NormOrm:_raw_execute(query, params, callback)
+    if (self._tx ~= nil) then return self._tx.execute(query, params, callback); end
     if (self._ready) then return self.adapter:raw_execute(query, params, callback); end
     if (#self._queue == 0) then
         self._logger("DB", "queue_until_ready: holding operations until sync()/migrate()");
@@ -172,6 +178,57 @@ end
 --- first successful `sync()`/`migrate()`; otherwise always true.
 ---@return boolean
 function NormOrm:is_ready() return self._ready == true; end
+
+--- Whether the configured adapter supports transactions.
+---@return boolean
+function NormOrm:supports_transactions()
+    return type(self.adapter.supports_transactions) == "function" and self.adapter:supports_transactions();
+end
+
+--- Run `fn` inside a database transaction: `BEGIN`, then every operation `fn`
+--- performs (await them) runs on that transaction; `COMMIT` if `fn` returns,
+--- `ROLLBACK` if it raises. Resolves with `fn`'s return value (rejects with its
+--- error after rolling back). Use `:await()` on operations inside `fn` as usual.
+---
+--- **Throws immediately** if the adapter does not support transactions — check
+--- `db:supports_transactions()` first if you need to branch (nanos has no
+--- transaction API, so it always throws there; oxmysql supports them). Do not
+--- overlap transactions on the same Norm instance (the state is per-instance).
+--- ```lua
+---     db:transaction(function()
+---         from.coins = from.coins - 100; from:save():await()
+---         to.coins   = to.coins + 100;   to:save():await()
+---     end):await()
+--- ```
+---@generic T
+---@param fn fun(orm: NormOrm): T
+---@return NormPromise promise resolving to T
+function NormOrm:transaction(fn)
+    utils.assert(self:supports_transactions(), "this adapter does not support transactions");
+    utils.assert(self._tx == nil, "nested transactions are not supported");
+    utils.assert(type(fn) == "function", "transaction() requires a function");
+
+    return self.provider.new(function(resolve, reject)
+        local result, errored, err_value;
+        self.adapter:transaction(
+            -- body: run fn with transaction-scoped routing; signal commit/rollback.
+            function(tx_query, tx_execute)
+                self._tx = { query = tx_query, execute = tx_execute };
+                local ok, res = pcall(fn, self);
+                self._tx = nil;
+                if (ok) then result = res; return true; end -- COMMIT
+                errored, err_value = true, res;             -- ROLLBACK
+                return false;
+            end,
+            -- finish: settle the promise (fn's own error wins over a generic one).
+            function(ferr)
+                if (errored) then return reject(err_value); end
+                if (ferr ~= nil) then return reject(ferr); end
+                resolve(result);
+            end
+        );
+    end);
+end
 
 --- Run a SELECT and transform the rows inside the promise.
 ---@param query string
