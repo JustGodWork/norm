@@ -691,6 +691,20 @@ function NormModel:select(...) return self:query():select(...); end
 ---@return NormQueryBuilder
 function NormModel:select_raw(expr) return self:query():select_raw(expr); end
 
+---@param table_name string
+---@param first string
+---@param op string
+---@param second? string
+---@return NormQueryBuilder
+function NormModel:join(...) return self:query():join(...); end
+
+---@param table_name string
+---@param first string
+---@param op string
+---@param second? string
+---@return NormQueryBuilder
+function NormModel:left_join(...) return self:query():left_join(...); end
+
 ---@param ... string
 ---@return NormQueryBuilder
 function NormModel:group_by(...) return self:query():group_by(...); end
