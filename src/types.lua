@@ -23,6 +23,7 @@ local types = {};
 ---@field length? number Length for VARCHAR columns.
 ---@field nullable? boolean Defaults to true (false for primary keys).
 ---@field unique? boolean
+---@field index? boolean Emit a (non-unique) index on this column at `sync()`.
 ---@field primary? boolean
 ---@field autoincrement? boolean
 ---@field default? any Literal value, or `Norm.types.raw(...)` for raw SQL.
@@ -44,6 +45,7 @@ local function make(kind, options)
         length = options.length,
         nullable = options.nullable ~= false and not options.primary,
         unique = options.unique == true,
+        index = options.index == true,
         primary = options.primary == true,
         autoincrement = options.autoincrement == true,
         default = options.default,
