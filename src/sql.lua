@@ -64,6 +64,28 @@ local function quote_ref(d, ref)
 end
 sql.quote_ref = quote_ref;
 
+--- Render the SQL column type for an `enum` column: native `ENUM('a','b',…)` on
+--- MySQL, `TEXT CHECK (col IN ('a','b',…))` on SQLite (which has no ENUM). The
+--- value list is single-quoted with `'` doubled, so both engines reject anything
+--- outside the set.
+---@param column NormColumn
+---@param d NormDialect
+---@return string
+local function enum_type_sql(column, d)
+    local values = column.values;
+    utils.assert(type(values) == "table" and #values > 0,
+        ("enum column '%s' has no values"):format(tostring(column.name)));
+    local quoted = {};
+    for i = 1, #values do
+        quoted[i] = "'" .. tostring(values[i]):gsub("'", "''") .. "'";
+    end
+    local list = table.concat(quoted, ", ");
+    if (d.name == "sqlite") then
+        return ("TEXT CHECK (%s IN (%s))"):format(d.quote(column.name), list);
+    end
+    return ("ENUM(%s)"):format(list);
+end
+
 --- Build the column definition fragment for CREATE TABLE.
 ---@param column NormColumn
 ---@param d NormDialect
@@ -76,9 +98,14 @@ local function column_def(column, d)
         return d.quote(column.name) .. " INTEGER PRIMARY KEY AUTOINCREMENT";
     end
 
-    local type_sql = d.types[column.kind] or "TEXT";
-    if (column.kind == "string" and column.length and d.name ~= "sqlite") then
-        type_sql = ("VARCHAR(%d)"):format(column.length);
+    local type_sql;
+    if (column.kind == "enum") then
+        type_sql = enum_type_sql(column, d);
+    else
+        type_sql = d.types[column.kind] or "TEXT";
+        if (column.kind == "string" and column.length and d.name ~= "sqlite") then
+            type_sql = ("VARCHAR(%d)"):format(column.length);
+        end
     end
 
     local def = d.quote(column.name) .. " " .. type_sql;
