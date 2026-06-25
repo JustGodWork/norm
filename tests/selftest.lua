@@ -47,6 +47,7 @@ local User = db:define("users", {
     email = orm.types.string({ length = 128, unique = true }),
     admin = orm.types.boolean({ default = false }),
     age   = orm.types.integer({ default = 0 }),
+    role  = orm.types.enum({ values = { "user", "admin" }, default = "user" }),
 });
 
 db:sync();
@@ -57,6 +58,8 @@ check("id is PK auto_increment", create:find("`id` INT PRIMARY KEY AUTO_INCREMEN
 check("name VARCHAR(64) NOT NULL", create:find("`name` VARCHAR(64) NOT NULL", 1, true) ~= nil);
 check("email UNIQUE", create:find("`email` VARCHAR(128) UNIQUE", 1, true) ~= nil);
 check("engine suffix", create:find("ENGINE=InnoDB", 1, true) ~= nil);
+check("mysql enum -> ENUM(values)", create:find("`role` ENUM('user', 'admin')", 1, true) ~= nil);
+check("mysql enum default quoted", create:find("`role` ENUM('user', 'admin') DEFAULT 'user'", 1, true) ~= nil);
 
 local created;
 User:create({ name = "John", email = "john@x.io", admin = true }):next(function(u) created = u; end);
@@ -125,8 +128,9 @@ print("== Test group 2: sqlite dialect DDL ==");
 local mock2 = Mock({ dialect = "sqlite" });
 local db2 = orm.new({ adapter = mock2, promise = orm.promise.builtin() });
 local Item = db2:define("items", {
-    id   = orm.types.id(),
-    name = orm.types.string({ length = 32 }),
+    id     = orm.types.id(),
+    name   = orm.types.string({ length = 32 }),
+    status = orm.types.enum({ values = { "new", "used" } }),
 });
 db2:sync();
 local createS = last_sql(mock2);
@@ -134,6 +138,8 @@ print("  CREATE (sqlite): " .. createS);
 check("sqlite integer pk autoincrement", createS:find("`id` INTEGER PRIMARY KEY AUTOINCREMENT", 1, true) ~= nil);
 check("sqlite string -> TEXT", createS:find("`name` TEXT", 1, true) ~= nil);
 check("sqlite no engine suffix", createS:find("ENGINE", 1, true) == nil);
+check("sqlite enum -> TEXT CHECK IN",
+    createS:find("`status` TEXT CHECK (`status` IN ('new', 'used'))", 1, true) ~= nil);
 
 print("== Test group 3: portability (nanos-style provider with :Then, no :next) ==");
 local FakeP = {};
