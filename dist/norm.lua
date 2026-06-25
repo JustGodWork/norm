@@ -317,6 +317,42 @@ function utils.copy(t)
     return out;
 end
 
+--- Naive singulariser (drops a trailing "s"), for relation key/table defaults.
+---@param name string
+---@return string
+function utils.singularize(name) return (name:gsub("s$", "")); end
+
+--- Default pivot table name for a many-to-many: the two table singulars joined by
+--- "_" in alphabetical order (e.g. `users` + `roles` -> `role_user`).
+---@param a string
+---@param b string
+---@return string
+function utils.default_pivot(a, b)
+    local sa, sb = utils.singularize(a), utils.singularize(b);
+    if (sa <= sb) then return sa .. "_" .. sb; end
+    return sb .. "_" .. sa;
+end
+
+--- Current UTC timestamp as `YYYY-MM-DD HH:MM:SS` (portable across MySQL DATETIME
+--- and SQLite TEXT). Returns nil if `os.date` is unavailable.
+---@return string|nil
+function utils.now_utc()
+    if (type(os) ~= "table" or type(os.date) ~= "function") then return nil; end
+    local ok, s = pcall(os.date, "!%Y-%m-%d %H:%M:%S");
+    return ok and s or nil;
+end
+
+--- Append a "not soft-deleted" condition (`<col> IS NULL`) to a query state's
+--- where list when the model uses soft deletes. No-op otherwise.
+---@param state NormQueryState
+---@param model NormModel
+function utils.soft_scope(state, model)
+    if (model.soft_deletes) then
+        state.wheres = state.wheres or {};
+        state.wheres[#state.wheres + 1] = { column = model.soft_deletes, op = "=", bool = "AND" };
+    end
+end
+
 --- Sorted array of a dictionary's keys (stable SQL output).
 ---@param dict table<string, any>
 ---@return string[]
@@ -444,6 +480,7 @@ local types = {};
 ---@field length? number Length for VARCHAR columns.
 ---@field nullable? boolean Defaults to true (false for primary keys).
 ---@field unique? boolean
+---@field index? boolean Emit a (non-unique) index on this column at `sync()`.
 ---@field primary? boolean
 ---@field autoincrement? boolean
 ---@field default? any Literal value, or `Norm.types.raw(...)` for raw SQL.
@@ -465,6 +502,7 @@ local function make(kind, options)
         length = options.length,
         nullable = options.nullable ~= false and not options.primary,
         unique = options.unique == true,
+        index = options.index == true,
         primary = options.primary == true,
         autoincrement = options.autoincrement == true,
         default = options.default,
@@ -588,10 +626,13 @@ function types.json(options) return make("json", options); end
 
 ---@class NormRelation
 ---@field __relation true
----@field kind "belongs_to"|"has_one"|"has_many"
+---@field kind "belongs_to"|"has_one"|"has_many"|"belongs_to_many"
 ---@field target string The related table name.
----@field key? string FK column (on this model for belongs_to, on the target otherwise).
----@field otherKey? string Referenced column (defaults to the relevant primary key).
+---@field key? string FK column (on this model for belongs_to; on the target / pivot otherwise).
+---@field otherKey? string Referenced column / target-side pivot FK (defaults to the relevant primary key).
+---@field localKey? string Local column for has_*/belongs_to_many (defaults to this model's primary key).
+---@field otherLocalKey? string Target's local column for belongs_to_many (defaults to the target's primary key).
+---@field through? string Pivot (join) table for belongs_to_many.
 ---@field onDelete? string Referential action emitted on the FK (belongs_to only).
 ---@field onUpdate? string Referential action emitted on the FK (belongs_to only).
 ---@field name? string Set by define() from the schema key.
@@ -603,7 +644,10 @@ function types.json(options) return make("json", options); end
 
 ---@class NormRelationOptions
 ---@field key? string FK column name. See each relation for its default.
----@field otherKey? string Referenced column (defaults to the relevant primary key).
+---@field otherKey? string Referenced column / target-side pivot FK (defaults to the relevant primary key).
+---@field localKey? string Local column for has_*/belongs_to_many (defaults to this model's primary key).
+---@field otherLocalKey? string Target's local column for belongs_to_many (defaults to the target's primary key).
+---@field through? string Pivot (join) table for belongs_to_many (defaults to the two singulars joined alphabetically).
 ---@field onDelete? NormReferentialAction Emitted as `ON DELETE …` on the FK (belongs_to only).
 ---@field onUpdate? NormReferentialAction Emitted as `ON UPDATE …` on the FK (belongs_to only).
 
@@ -619,6 +663,9 @@ local function relation(kind, target, options)
         target = target,
         key = options.key,
         otherKey = options.otherKey,
+        localKey = options.localKey,
+        otherLocalKey = options.otherLocalKey,
+        through = options.through,
         onDelete = options.onDelete,
         onUpdate = options.onUpdate,
     };
@@ -676,6 +723,27 @@ function types.hasOne(target, options) return relation("has_one", target, option
 ---@return NormRelation
 function types.hasMany(target, options) return relation("has_many", target, options); end
 
+--- Many-to-many: this model and `target` are linked through a **pivot** (join)
+--- table that holds a foreign key to each side. `record:load(name)` and
+--- `query:include(name)` resolve to an **array** of target records (batched in two
+--- queries — pivot then targets — so no N+1). Defaults, all overridable:
+--- `through` = the two table singulars joined alphabetically (`users`+`roles` ->
+--- `role_user`); `key` = `<thisSingular>_id` (pivot FK to this model); `otherKey`
+--- = `<targetSingular>_id` (pivot FK to the target); `localKey`/`otherLocalKey` =
+--- the respective primary keys. The pivot table is yours to manage — define it as
+--- a normal model if you want `sync()` to create it.
+--- ```lua
+---     db:define("users", {
+---         id    = Norm.types.id(),
+---         roles = Norm.types.belongsToMany("roles"), -- through `role_user`
+---     })
+---     -- user:load("roles"):await()  /  User:query():include("roles"):all():await()
+--- ```
+---@param target string
+---@param options? NormRelationOptions
+---@return NormRelation
+function types.belongsToMany(target, options) return relation("belongs_to_many", target, options); end
+
 return types;
 end
 
@@ -695,10 +763,26 @@ local utils = require("utils");
 ---@field column string
 ---@field dir "ASC"|"DESC"
 
+---@class NormHaving
+---@field expr string Raw SQL expression (NOT quoted), e.g. "COUNT(*)".
+---@field op string Operator.
+---@field value any Bound parameter.
+
+---@class NormJoin
+---@field type "INNER"|"LEFT" Join type.
+---@field table string Joined table.
+---@field first string Left column ref of the ON condition (e.g. "users.id").
+---@field op string ON operator.
+---@field second string Right column ref of the ON condition (e.g. "posts.user_id").
+
 ---@class NormQueryState
 ---@field table string
 ---@field columns? string[] Selected columns (nil = "*").
+---@field raw_columns? string[] Raw (unquoted) select expressions, e.g. "COUNT(*) AS n".
+---@field joins? NormJoin[] JOIN clauses.
 ---@field wheres NormWhere[]
+---@field groups? string[] GROUP BY columns.
+---@field havings? NormHaving[] HAVING conditions (ANDed).
 ---@field orders? NormOrder[]
 ---@field limit? number
 ---@field offset? number
@@ -715,16 +799,32 @@ local function normalize(value)
 end
 sql.normalize = normalize;
 
+--- Quote a column reference, qualifying each dotted segment: "users.id" ->
+--- `` `users`.`id` ``. A bare name quotes whole. Used wherever a join may make
+--- columns ambiguous (where / order / join ON).
+---@param d NormDialect
+---@param ref string
+---@return string
+local function quote_ref(d, ref)
+    if (ref:find(".", 1, true)) then
+        local parts = {};
+        for seg in ref:gmatch("[^.]+") do parts[#parts + 1] = d.quote(seg); end
+        return table.concat(parts, ".");
+    end
+    return d.quote(ref);
+end
+sql.quote_ref = quote_ref;
+
 --- Build the column definition fragment for CREATE TABLE.
 ---@param column NormColumn
 ---@param d NormDialect
 ---@return string
 local function column_def(column, d)
-    -- SQLite needs the exact "INTEGER PRIMARY KEY AUTOINCREMENT" spelling.
-    if (column.primary and d.name == "sqlite") then
-        local def = d.quote(column.name) .. " INTEGER PRIMARY KEY";
-        if (column.autoincrement) then def = def .. " AUTOINCREMENT"; end
-        return def;
+    -- SQLite needs the exact "INTEGER PRIMARY KEY AUTOINCREMENT" spelling for an
+    -- auto-increment PK. A non-autoincrement PK (e.g. a string/UUID key) must keep
+    -- its real type, so only the autoincrement case takes this early path.
+    if (column.primary and d.name == "sqlite" and column.autoincrement) then
+        return d.quote(column.name) .. " INTEGER PRIMARY KEY AUTOINCREMENT";
     end
 
     local type_sql = d.types[column.kind] or "TEXT";
@@ -796,12 +896,14 @@ function sql.create_table(table_name, columns, d, foreign_keys)
         d.quote(table_name), table.concat(parts, ", "), d.table_suffix);
 end
 
---- INSERT.
+--- INSERT. Pass `returning` (a column name) to append a `RETURNING <col>` clause
+--- (SQLite >= 3.35 / PostgreSQL) so the new row's value comes back atomically.
 ---@param table_name string
 ---@param data table<string, any>
 ---@param d NormDialect
+---@param returning? string Column to append in a `RETURNING` clause.
 ---@return string statement, any[] params
-function sql.insert(table_name, data, d)
+function sql.insert(table_name, data, d, returning)
     local cols, marks, params = {}, {}, {};
     for _, key in ipairs(utils.sorted_keys(data)) do
         local value = data[key];
@@ -813,8 +915,100 @@ function sql.insert(table_name, data, d)
             marks[#marks + 1] = d.placeholder(#params);
         end
     end
-    return ("INSERT INTO %s (%s) VALUES (%s)"):format(
-        d.quote(table_name), table.concat(cols, ", "), table.concat(marks, ", ")), params;
+    local statement = ("INSERT INTO %s (%s) VALUES (%s)"):format(
+        d.quote(table_name), table.concat(cols, ", "), table.concat(marks, ", "));
+    if (returning) then
+        statement = statement .. " RETURNING " .. d.quote(returning);
+    end
+    return statement, params;
+end
+
+--- Multi-row INSERT: `INSERT INTO t (cols) VALUES (…), (…)`. `columns` is the
+--- ordered column union; each `data_rows[i]` is an (already-encoded) `{col=value}`
+--- map — a column absent from a row is written as `NULL`. Pass `returning` (a raw
+--- list like "*", on RETURNING-capable engines) to get the inserted rows back.
+---@param table_name string
+---@param columns string[]
+---@param data_rows table<string, any>[]
+---@param d NormDialect
+---@param returning? string Raw RETURNING list (e.g. "*").
+---@return string statement, any[] params
+function sql.insert_many(table_name, columns, data_rows, d, returning)
+    local params, tuples = {}, {};
+    local quoted = {};
+    for i = 1, #columns do quoted[i] = d.quote(columns[i]); end
+    for r = 1, #data_rows do
+        local marks = {};
+        for c = 1, #columns do
+            local v = data_rows[r][columns[c]];
+            if (v == nil) then
+                marks[c] = "NULL";
+            else
+                params[#params + 1] = normalize(v);
+                marks[c] = d.placeholder(#params);
+            end
+        end
+        tuples[r] = "(" .. table.concat(marks, ", ") .. ")";
+    end
+    local statement = ("INSERT INTO %s (%s) VALUES %s"):format(
+        d.quote(table_name), table.concat(quoted, ", "), table.concat(tuples, ", "));
+    if (returning) then statement = statement .. " RETURNING " .. returning; end
+    return statement, params;
+end
+
+--- INSERT with an atomic "on conflict, update" clause (upsert). Dialect-aware:
+--- MySQL/MariaDB emit `ON DUPLICATE KEY UPDATE col = VALUES(col)`; SQLite/Postgres
+--- emit `ON CONFLICT (target) DO UPDATE SET col = excluded.col`. `conflict_cols`
+--- (the unique/PK columns) define the SQLite/Postgres target. With no `update_cols`
+--- the conflict is a no-op (`DO NOTHING`).
+---@param table_name string
+---@param data table<string, any>
+---@param conflict_cols string[] Unique/PK columns identifying a conflict.
+---@param update_cols string[] Columns to overwrite on conflict (may be empty).
+---@param d NormDialect
+---@return string statement, any[] params
+function sql.upsert(table_name, data, conflict_cols, update_cols, d)
+    local cols, marks, params = {}, {}, {};
+    for _, key in ipairs(utils.sorted_keys(data)) do
+        local value = data[key];
+        cols[#cols + 1] = d.quote(key);
+        if (value == nil) then
+            marks[#marks + 1] = "NULL";
+        else
+            params[#params + 1] = normalize(value);
+            marks[#marks + 1] = d.placeholder(#params);
+        end
+    end
+    local head = ("INSERT INTO %s (%s) VALUES (%s)"):format(
+        d.quote(table_name), table.concat(cols, ", "), table.concat(marks, ", "));
+
+    if (d.name == "mysql") then
+        if (#update_cols == 0) then
+            -- keep the statement valid: a no-op assignment on the first conflict col.
+            local c = d.quote(conflict_cols[1]);
+            return head .. " ON DUPLICATE KEY UPDATE " .. c .. " = " .. c, params;
+        end
+        local sets = {};
+        for i = 1, #update_cols do
+            local c = d.quote(update_cols[i]);
+            sets[#sets + 1] = ("%s = VALUES(%s)"):format(c, c);
+        end
+        return head .. " ON DUPLICATE KEY UPDATE " .. table.concat(sets, ", "), params;
+    end
+
+    -- sqlite / postgres
+    local targets = {};
+    for i = 1, #conflict_cols do targets[#targets + 1] = d.quote(conflict_cols[i]); end
+    local target_clause = table.concat(targets, ", ");
+    if (#update_cols == 0) then
+        return head .. (" ON CONFLICT (%s) DO NOTHING"):format(target_clause), params;
+    end
+    local sets = {};
+    for i = 1, #update_cols do
+        local c = d.quote(update_cols[i]);
+        sets[#sets + 1] = ("%s = excluded.%s"):format(c, c);
+    end
+    return head .. (" ON CONFLICT (%s) DO UPDATE SET %s"):format(target_clause, table.concat(sets, ", ")), params;
 end
 
 --- Compile WHERE conditions into a fragment, appending bound params.
@@ -828,20 +1022,48 @@ local function compile_where(wheres, d, params)
     local fragments = {};
     for i = 1, #wheres do
         local cond = wheres[i];
-        local col = d.quote(cond.column);
-        local op = (cond.op or "="):upper();
         local frag;
+
+        if (cond.raw) then
+            -- verbatim fragment (e.g. a correlated `tbl.a = other.b`); no params.
+            frag = cond.raw;
+            fragments[#fragments + 1] = (i == 1) and frag or ((cond.bool or "AND") .. " " .. frag);
+            goto continue;
+        elseif (cond.exists) then
+            -- [NOT] EXISTS (correlated subquery); append the subquery's own params.
+            frag = (cond.negate and "NOT EXISTS " or "EXISTS ") .. cond.sql;
+            if (cond.params) then
+                for j = 1, #cond.params do params[#params + 1] = normalize(cond.params[j]); end
+            end
+            fragments[#fragments + 1] = (i == 1) and frag or ((cond.bool or "AND") .. " " .. frag);
+            goto continue;
+        end
+
+        local col = quote_ref(d, cond.column);
+        local op = (cond.op or "="):upper();
 
         if (cond.value == nil) then
             local negated = (op == "!=" or op == "<>" or op == "NOT");
             frag = col .. (negated and " IS NOT NULL" or " IS NULL");
         elseif (op == "IN" or op == "NOT IN") then
-            local marks = {};
-            for j = 1, #cond.value do
-                params[#params + 1] = normalize(cond.value[j]);
-                marks[#marks + 1] = d.placeholder(#params);
+            if (#cond.value == 0) then
+                -- `IN ()` / `NOT IN ()` is invalid SQL. Emit a constant predicate
+                -- instead: IN nothing is always false, NOT IN nothing always true.
+                frag = (op == "IN") and "1 = 0" or "1 = 1";
+            else
+                local marks = {};
+                for j = 1, #cond.value do
+                    params[#params + 1] = normalize(cond.value[j]);
+                    marks[#marks + 1] = d.placeholder(#params);
+                end
+                frag = ("%s %s (%s)"):format(col, op, table.concat(marks, ", "));
             end
-            frag = ("%s %s (%s)"):format(col, op, table.concat(marks, ", "));
+        elseif (op == "BETWEEN" or op == "NOT BETWEEN") then
+            params[#params + 1] = normalize(cond.value[1]);
+            local lo = d.placeholder(#params);
+            params[#params + 1] = normalize(cond.value[2]);
+            local hi = d.placeholder(#params);
+            frag = ("%s %s %s AND %s"):format(col, op, lo, hi);
         else
             params[#params + 1] = normalize(cond.value);
             frag = ("%s %s %s"):format(col, op, d.placeholder(#params));
@@ -852,6 +1074,7 @@ local function compile_where(wheres, d, params)
         else
             fragments[#fragments + 1] = (cond.bool or "AND") .. " " .. frag;
         end
+        ::continue::
     end
     return " WHERE " .. table.concat(fragments, " ");
 end
@@ -863,21 +1086,49 @@ sql.compile_where = compile_where;
 ---@return string statement, any[] params
 function sql.select(state, d)
     local params = {};
-    local columns = "*";
-    if (state.columns and #state.columns > 0) then
-        local quoted = {};
-        for i = 1, #state.columns do quoted[i] = d.quote(state.columns[i]); end
-        columns = table.concat(quoted, ", ");
+    local cols = {};
+    if (state.columns) then
+        for i = 1, #state.columns do cols[#cols + 1] = d.quote(state.columns[i]); end
     end
+    if (state.raw_columns) then
+        for i = 1, #state.raw_columns do cols[#cols + 1] = state.raw_columns[i]; end
+    end
+    local columns = (#cols > 0) and table.concat(cols, ", ") or "*";
 
     local statement = ("SELECT %s FROM %s"):format(columns, d.quote(state.table));
+
+    if (state.joins and #state.joins > 0) then
+        for i = 1, #state.joins do
+            local j = state.joins[i];
+            statement = statement .. (" %s JOIN %s ON %s %s %s"):format(
+                j.type, d.quote(j.table), quote_ref(d, j.first), (j.op or "="), quote_ref(d, j.second));
+        end
+    end
+
     statement = statement .. compile_where(state.wheres, d, params);
+
+    if (state.groups and #state.groups > 0) then
+        local g = {};
+        for i = 1, #state.groups do g[i] = d.quote(state.groups[i]); end
+        statement = statement .. " GROUP BY " .. table.concat(g, ", ");
+    end
+
+    if (state.havings and #state.havings > 0) then
+        local frags = {};
+        for i = 1, #state.havings do
+            local h = state.havings[i];
+            params[#params + 1] = normalize(h.value);
+            -- expr is a raw aggregate expression (e.g. COUNT(*)), intentionally unquoted.
+            frags[#frags + 1] = ("%s %s %s"):format(h.expr, (h.op or "="):upper(), d.placeholder(#params));
+        end
+        statement = statement .. " HAVING " .. table.concat(frags, " AND ");
+    end
 
     if (state.orders and #state.orders > 0) then
         local parts = {};
         for i = 1, #state.orders do
             local o = state.orders[i];
-            parts[#parts + 1] = d.quote(o.column) .. " " .. (o.dir or "ASC");
+            parts[#parts + 1] = quote_ref(d, o.column) .. " " .. (o.dir or "ASC");
         end
         statement = statement .. " ORDER BY " .. table.concat(parts, ", ");
     end
@@ -899,6 +1150,22 @@ end
 function sql.count(state, d)
     local params = {};
     local statement = ("SELECT COUNT(*) AS %s FROM %s"):format(d.quote("count"), d.quote(state.table));
+    statement = statement .. compile_where(state.wheres, d, params);
+    return statement, params;
+end
+
+--- Scalar aggregate (`SUM`/`AVG`/`MIN`/`MAX`/`COUNT`) over the WHERE-filtered set.
+--- The result is aliased `aggregate`. `column` is quoted; pass nil for `*`.
+---@param state NormQueryState
+---@param func string Aggregate function name (already upper-case).
+---@param column? string Column to aggregate (nil -> "*").
+---@param d NormDialect
+---@return string statement, any[] params
+function sql.aggregate(state, func, column, d)
+    local params = {};
+    local target = column and d.quote(column) or "*";
+    local statement = ("SELECT %s(%s) AS %s FROM %s"):format(
+        func, target, d.quote("aggregate"), d.quote(state.table));
     statement = statement .. compile_where(state.wheres, d, params);
     return statement, params;
 end
@@ -925,6 +1192,25 @@ function sql.update(state, data, d)
     return statement, params;
 end
 
+--- Atomic in-place column arithmetic: `UPDATE t SET col = col + ?[, ...] WHERE ...`.
+--- Each entry is `{ column = ..., amount = ... }` (a negative amount decrements).
+---@param state NormQueryState
+---@param columns {column: string, amount: number}[]
+---@param d NormDialect
+---@return string statement, any[] params
+function sql.increment(state, columns, d)
+    local params, sets = {}, {};
+    for i = 1, #columns do
+        local c = columns[i];
+        params[#params + 1] = normalize(c.amount);
+        local q = d.quote(c.column);
+        sets[#sets + 1] = ("%s = %s + %s"):format(q, q, d.placeholder(#params));
+    end
+    local statement = ("UPDATE %s SET %s"):format(d.quote(state.table), table.concat(sets, ", "));
+    statement = statement .. compile_where(state.wheres, d, params);
+    return statement, params;
+end
+
 --- DELETE from state.
 ---@param state NormQueryState
 ---@param d NormDialect
@@ -934,6 +1220,77 @@ function sql.delete(state, d)
     local statement = ("DELETE FROM %s"):format(d.quote(state.table));
     statement = statement .. compile_where(state.wheres, d, params);
     return statement, params;
+end
+
+-- ==========================================================================
+-- DDL for migrations (ALTER TABLE / indexes). Statement-only, no params.
+-- ==========================================================================
+
+--- `ALTER TABLE t ADD COLUMN <def>`. `column` is a Norm column descriptor (`.name` set).
+---@param table_name string
+---@param column NormColumn
+---@param d NormDialect
+---@return string
+function sql.add_column(table_name, column, d)
+    return ("ALTER TABLE %s ADD COLUMN %s"):format(d.quote(table_name), column_def(column, d));
+end
+
+--- `ALTER TABLE t DROP COLUMN c` (MySQL, MariaDB, SQLite >= 3.35, Postgres).
+---@param table_name string
+---@param name string
+---@param d NormDialect
+---@return string
+function sql.drop_column(table_name, name, d)
+    return ("ALTER TABLE %s DROP COLUMN %s"):format(d.quote(table_name), d.quote(name));
+end
+
+--- `ALTER TABLE t RENAME COLUMN a TO b` (MySQL 8 / MariaDB 10.5.2+ / SQLite 3.25+ / Postgres).
+---@param table_name string
+---@param from string
+---@param to string
+---@param d NormDialect
+---@return string
+function sql.rename_column(table_name, from, to, d)
+    return ("ALTER TABLE %s RENAME COLUMN %s TO %s"):format(
+        d.quote(table_name), d.quote(from), d.quote(to));
+end
+
+--- `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (cols...)`. `if_not_exists`
+--- (used by `sync()` for idempotency) is supported by SQLite/MariaDB/Postgres but
+--- NOT by stock MySQL 8 — manage those indexes via migrations instead.
+---@param table_name string
+---@param index_name string
+---@param columns string[]
+---@param unique boolean
+---@param d NormDialect
+---@param if_not_exists? boolean
+---@return string
+function sql.add_index(table_name, index_name, columns, unique, d, if_not_exists)
+    local cols = {};
+    for i = 1, #columns do cols[i] = d.quote(columns[i]); end
+    return ("CREATE %sINDEX %s%s ON %s (%s)"):format(
+        unique and "UNIQUE " or "", if_not_exists and "IF NOT EXISTS " or "",
+        d.quote(index_name), d.quote(table_name), table.concat(cols, ", "));
+end
+
+--- `DROP INDEX`. MySQL needs the table (`DROP INDEX i ON t`); SQLite/Postgres don't.
+---@param index_name string
+---@param table_name string
+---@param d NormDialect
+---@return string
+function sql.drop_index(index_name, table_name, d)
+    if (d.name == "mysql") then
+        return ("DROP INDEX %s ON %s"):format(d.quote(index_name), d.quote(table_name));
+    end
+    return ("DROP INDEX %s"):format(d.quote(index_name));
+end
+
+--- `DROP TABLE IF EXISTS t`.
+---@param table_name string
+---@param d NormDialect
+---@return string
+function sql.drop_table(table_name, d)
+    return ("DROP TABLE IF EXISTS %s"):format(d.quote(table_name));
 end
 
 return sql;
@@ -953,6 +1310,7 @@ local require = __require
 --- providers need NOT support chaining. That lets us plug in even tiny promise
 --- libraries (such as the nanos one).
 local class = class; -- light-class global (loaded before this bundle)
+local utils = require("utils");
 
 --- A promise provider plugs a framework's promise type into Norm.
 --- Built-in builders: `Norm.promise.builtin|nanos|cfx`. Validate a custom one
@@ -1004,7 +1362,16 @@ function NormPromise:_settle(state, value)
     if (self._await_co) then
         local co = self._await_co;
         self._await_co = nil;
-        coroutine.resume(co);
+        local ok, err = coroutine.resume(co);
+        if (not ok) then
+            -- The awaited continuation raised AFTER being resumed here. resume()
+            -- captured the error and there's no caller to propagate it to, so
+            -- surface it — otherwise it vanishes and the coroutine looks like it
+            -- silently hung. A traceback of the (dead) coroutine pinpoints the line.
+            local tb = (type(debug) == "table" and debug.traceback)
+                and debug.traceback(co, tostring(err)) or tostring(err);
+            utils.logger("ERROR", "uncaught error after await: " .. tb);
+        end
     end
 end
 
@@ -1271,16 +1638,16 @@ function json.define(spec)
 end
 
 --- Wrap a Lua/FiveM-style library exposing `encode` / `decode` (e.g. FiveM's
---- global `json`, or a dkjson-like table). Defaults to the global `json`.
+--- global `json` / rapidjson, or a dkjson-like table). Defaults to the global `json`.
 --- ```lua
----     local db = Norm.new({ adapter = a, json = Norm.json.lua() }) -- uses _ENV.json
+---     local db = Norm.new({ adapter = a, json = Norm.json.rapidjson() }) -- uses _ENV.json
 --- ```
 ---@param lib? table The JSON library (defaults to `_ENV.json`).
 ---@return NormJsonProvider
 function json.rapidjson(lib)
     lib = lib or _ENV.json;
     assert(type(lib) == "table" and type(lib.encode) == "function" and type(lib.decode) == "function",
-        "[norm] json.lua requires a library with encode/decode (e.g. FiveM's `json`)");
+        "[norm] json.rapidjson requires a library with encode/decode (e.g. FiveM's `json`)");
     return {
         name = "rapidjson",
         encode = function(value) return lib.encode(value); end,
@@ -1398,6 +1765,28 @@ function NormAdapter:default_json_provider()
     return nil;
 end
 
+--- Optional: whether this adapter can run an interactive transaction on a pinned
+--- connection. Defaults to false → `db:transaction(...)` throws on this adapter.
+--- An adapter that returns true MUST implement `transaction(body, finish)`:
+---   * the adapter opens the transaction, then calls `body(tx_query, tx_execute)`
+---     where `tx_query(q, p, cb)` / `tx_execute(q, p, cb)` run on the transaction;
+---   * `body` returns `true` to COMMIT, `false` to ROLL BACK;
+---   * the adapter commits/rolls back, then calls `finish(err)` (err nil on commit).
+---@return boolean
+function NormAdapter:supports_transactions()
+    return false;
+end
+
+--- Optional: whether this adapter's engine supports `INSERT ... RETURNING <col>`
+--- (SQLite >= 3.35, PostgreSQL). When true, the ORM reads a new row's
+--- auto-increment id atomically from the INSERT itself, instead of a separate
+--- `LAST_INSERT_ID()` / `last_insert_rowid()` query — which is connection-scoped
+--- and therefore unreliable across a connection pool. Defaults to false.
+---@return boolean
+function NormAdapter:supports_returning()
+    return false;
+end
+
 --- Run a SELECT. Must be overridden.
 ---@param query string
 ---@param params any[]
@@ -1428,6 +1817,7 @@ local require = __require
 --- provider's promise; await it with `:await()` or chain per your provider.
 local class = class;
 local sqlmod = require("sql");
+local utils = require("utils");
 
 ---@class NormQueryBuilder: LightClass
 ---@field model NormModel
@@ -1441,28 +1831,184 @@ function NormQueryBuilder:__init(model)
     self._state = {
         table = model.table,
         columns = nil,
+        raw_columns = nil,
+        joins = nil,
         wheres = {},
+        groups = nil,
+        havings = nil,
         orders = {},
         limit = nil,
         offset = nil,
         includes = nil,
+        trashed = nil, -- nil = exclude soft-deleted; "with" = include; "only" = only trashed
     };
 end
 
---- Eager-load the given relations with the result (one batched query per
---- relation — no N+1), attaching them to each returned record.
+--- Build the query state actually sent to SQL, applying the soft-delete scope for
+--- soft-delete models (excluded by default; honours `with_trashed`/`only_trashed`).
+---@private
+---@return NormQueryState
+function NormQueryBuilder:_effective_state()
+    local model = self.model;
+    local trashed = self._state.trashed;
+    if (not model.soft_deletes or trashed == "with") then
+        return self._state;
+    end
+    local s = {};
+    for k, v in pairs(self._state) do s[k] = v; end
+    local wheres = {};
+    for i = 1, #self._state.wheres do wheres[i] = self._state.wheres[i]; end
+    -- nil value -> compiled as IS NULL ("=") / IS NOT NULL ("!=").
+    wheres[#wheres + 1] = { column = model.soft_deletes, op = (trashed == "only") and "!=" or "=", bool = "AND" };
+    s.wheres = wheres;
+    return s;
+end
+
+--- Include soft-deleted rows in the result (disables the default exclusion).
+---@return NormQueryBuilder self
+function NormQueryBuilder:with_trashed() self._state.trashed = "with"; return self; end
+
+--- Return ONLY soft-deleted rows.
+---@return NormQueryBuilder self
+function NormQueryBuilder:only_trashed() self._state.trashed = "only"; return self; end
+
+---@param self NormQueryBuilder
+---@param jtype "INNER"|"LEFT"
+---@param table_name string
+---@param first string
+---@param op string
+---@param second? string
+---@return NormQueryBuilder self
+local function add_join(self, jtype, table_name, first, op, second)
+    if (second == nil) then second = op; op = "="; end
+    self._state.joins = self._state.joins or {};
+    self._state.joins[#self._state.joins + 1] =
+        { type = jtype, table = table_name, first = first, op = op, second = second };
+    return self;
+end
+
+--- Build a correlated subquery `(SELECT <inner> FROM <related…> WHERE related.fk =
+--- parent.key [AND <configure conditions>])` for a relation — the engine behind
+--- `where_has` (inner = "1") and `with_count` (inner = "COUNT(*)"). Soft-deleted
+--- related rows are excluded. Returns (sql, params).
+---@param self NormQueryBuilder
+---@param rel NormRelation
+---@param inner_select string
+---@param configure? fun(q: NormQueryBuilder)
+---@return string sql, any[] params
+local function relation_subquery(self, rel, inner_select, configure)
+    local model = self.model;
+    local orm = model.orm;
+    local target = orm:model(rel.target);
+    assert(target, ("[norm] relation '%s': target '%s' is not defined"):format(rel.name or "?", rel.target));
+    local d = orm.adapter:get_dialect();
+    local params, wheres = {}, {};
+
+    if (configure) then
+        local sub = NormQueryBuilder(target);
+        configure(sub);
+        for i = 1, #sub._state.wheres do wheres[#wheres + 1] = sub._state.wheres[i]; end
+    end
+    if (target.soft_deletes) then
+        wheres[#wheres + 1] = { raw = sqlmod.quote_ref(d, target.table .. "." .. target.soft_deletes) .. " IS NULL" };
+    end
+
+    if (rel.kind == "belongs_to_many") then
+        local through = rel.through or utils.default_pivot(model.table, target.table);
+        local pivot_main = rel.key;
+        local pivot_other = rel.otherKey or (utils.singularize(target.table) .. "_id");
+        local other_local = rel.otherLocalKey or target.primary_key;
+        local local_key = rel.localKey or model.primary_key;
+        table.insert(wheres, 1, { raw = sqlmod.quote_ref(d, through .. "." .. pivot_main)
+            .. " = " .. sqlmod.quote_ref(d, model.table .. "." .. local_key) });
+        local clause = sqlmod.compile_where(wheres, d, params);
+        local from = ("%s INNER JOIN %s ON %s = %s"):format(
+            d.quote(through), d.quote(target.table),
+            sqlmod.quote_ref(d, target.table .. "." .. other_local),
+            sqlmod.quote_ref(d, through .. "." .. pivot_other));
+        return ("(SELECT %s FROM %s%s)"):format(inner_select, from, clause), params;
+    end
+
+    local corr;
+    if (rel.kind == "belongs_to") then
+        local other_key = rel.otherKey or target.primary_key;
+        corr = sqlmod.quote_ref(d, target.table .. "." .. other_key)
+            .. " = " .. sqlmod.quote_ref(d, model.table .. "." .. rel.key);
+    else -- has_one / has_many
+        local local_key = rel.localKey or model.primary_key;
+        corr = sqlmod.quote_ref(d, target.table .. "." .. rel.key)
+            .. " = " .. sqlmod.quote_ref(d, model.table .. "." .. local_key);
+    end
+    table.insert(wheres, 1, { raw = corr });
+    local clause = sqlmod.compile_where(wheres, d, params);
+    return ("(SELECT %s FROM %s%s)"):format(inner_select, d.quote(target.table), clause), params;
+end
+
+--- Eager-load relations with the result (one batched query per relation level —
+--- no N+1), attaching them to each returned record. Three forms:
+---   * `include("posts", "profile")` — simple relation names.
+---   * `include("posts.comments")` — nested via a dotted path (shared prefixes load once).
+---   * `include("posts", function(q) ... end)` — with per-relation options: call
+---     `where` / `order` / `limit` / `offset` (and nested `include`) on `q`. The
+---     `limit` is applied PER PARENT (e.g. 5 latest posts for each user).
 --- ```lua
----     local users = User:query():include("posts", "profile"):all():await()
----     print(#users[1].posts)
+---     local users = User:query():include("posts.comments"):all():await()
+---     print(#users[1].posts[1].comments)
+---
+---     local u = User:query():include("posts", function(q)
+---         q:where("published", true):order("created_at", "DESC"):limit(5)
+---          :include("comments", function(c) c:order("created_at", "ASC") end)
+---     end):all():await()
 --- ```
----@param ... string relation names declared in the model's schema
+---@param ... string|fun(q: NormQueryBuilder) relation names/paths, or a single name + configurator
 ---@return NormQueryBuilder self
 function NormQueryBuilder:include(...)
+    local args = { ... };
     self._state.includes = self._state.includes or {};
-    local names = { ... };
-    for i = 1, #names do
-        self._state.includes[#self._state.includes + 1] = names[i];
+
+    -- configurator form: include(name, function(q) ... end)
+    if (#args == 2 and type(args[2]) == "function") then
+        local name, configure = args[1], args[2];
+        local rel = self.model.relations[name];
+        assert(rel, ("[norm] include: model '%s' has no relation '%s'"):format(self.model.table, name));
+        local target = self.model.orm:model(rel.target);
+        assert(target, ("[norm] include: relation '%s' target '%s' is not defined"):format(name, rel.target));
+        local sub = NormQueryBuilder(target); -- a builder for the related model; we harvest its state
+        configure(sub);
+        local spec = self._state.includes[name] or { wheres = {}, orders = {}, children = {} };
+        spec.wheres = sub._state.wheres;
+        spec.orders = sub._state.orders;
+        spec.limit = sub._state.limit;
+        spec.offset = sub._state.offset;
+        spec.children = sub._state.includes or {};
+        self._state.includes[name] = spec;
+        return self;
     end
+
+    -- string form: one or more (possibly dotted) paths.
+    for i = 1, #args do
+        local node = self._state.includes;
+        for seg in tostring(args[i]):gmatch("[^.]+") do
+            local spec = node[seg];
+            if (not spec) then spec = { wheres = {}, orders = {}, children = {} }; node[seg] = spec; end
+            node = spec.children;
+        end
+    end
+    return self;
+end
+
+--- Apply a named scope (a reusable query fragment registered on the model with
+--- `Model:scope(name, fn)`), passing it any extra args. Chainable.
+--- ```lua
+---     User:active():scope("older_than", 18):all():await()
+--- ```
+---@param name string
+---@param ... any args forwarded to the scope function
+---@return NormQueryBuilder self
+function NormQueryBuilder:scope(name, ...)
+    local fn = self.model.scopes and self.model.scopes[name];
+    assert(fn, ("[norm] no scope '%s' on model '%s'"):format(tostring(name), self.model.table));
+    fn(self, ...);
     return self;
 end
 
@@ -1474,6 +2020,71 @@ function NormQueryBuilder:select(...)
     if (#args == 1 and type(args[1]) == "table") then args = args[1]; end
     self._state.columns = args;
     return self;
+end
+
+--- Inverse of `select`: select every column of the model EXCEPT the given ones
+--- (e.g. to drop a `password` / large blob without listing all the others). The
+--- omitted columns are simply absent from the returned records.
+--- ```lua
+---     local u = User:omit("password"):find(1):await()
+--- ```
+---@param ... string|string[]
+---@return NormQueryBuilder self
+function NormQueryBuilder:omit(...)
+    local omitted = { ... };
+    if (#omitted == 1 and type(omitted[1]) == "table") then omitted = omitted[1]; end
+    local skip = {};
+    for i = 1, #omitted do skip[omitted[i]] = true; end
+    local cols = {};
+    for i = 1, #self.model.columns do
+        local name = self.model.columns[i].name;
+        if (not skip[name]) then cols[#cols + 1] = name; end
+    end
+    self._state.columns = cols;
+    return self;
+end
+
+--- Add a RAW (unquoted) select expression — for aggregates/computed columns that
+--- the column-quoting `select` can't express. Pair with `:group_by` and `:rows()`.
+--- ```lua
+---     User:select_raw("faction, COUNT(*) AS n"):group_by("faction"):rows():await()
+--- ```
+---@param expr string
+---@return NormQueryBuilder self
+function NormQueryBuilder:select_raw(expr)
+    self._state.raw_columns = self._state.raw_columns or {};
+    self._state.raw_columns[#self._state.raw_columns + 1] = expr;
+    return self;
+end
+
+--- INNER JOIN another table. Use qualified `table.column` refs. Forms:
+--- `join(table, first, second)` (defaults `=`) or `join(table, first, op, second)`.
+--- Joins are for FILTERING/SORTING by a related table — combine with qualified
+--- `where`/`order`. Since joined rows mix columns from both tables, restrict the
+--- projection with `:select_raw("main.*")` if you still want `:all()` to wrap the
+--- main model, or read the flattened rows with `:rows()`.
+--- ```lua
+---     Post:join("users", "users.id", "posts.user_id")
+---         :where("users.admin", true):select_raw("`posts`.*"):all():await()
+--- ```
+---@param table_name string
+---@param first string
+---@param op string Operator, or the right column when called with 3 args.
+---@param second? string
+---@return NormQueryBuilder self
+function NormQueryBuilder:join(table_name, first, op, second)
+    return add_join(self, "INNER", table_name, first, op, second);
+end
+
+--- LEFT JOIN another table (same argument forms as `:join`). Keeps main rows even
+--- when there is no match on the joined side.
+---@param table_name string
+---@param first string
+---@param op string
+---@param second? string
+---@return NormQueryBuilder self
+function NormQueryBuilder:left_join(table_name, first, op, second)
+    return add_join(self, "LEFT", table_name, first, op, second);
 end
 
 ---@param self NormQueryBuilder
@@ -1518,33 +2129,172 @@ function NormQueryBuilder:or_where(column, op, value)
     return push_where(self, column, op, value, "OR");
 end
 
---- Add a `column IN (...)` condition.
+-- Append a where condition with an explicit conjunction.
+---@param self NormQueryBuilder
+local function push(self, cond, bool)
+    cond.bool = bool;
+    self._state.wheres[#self._state.wheres + 1] = cond;
+    return self;
+end
+
+--- `column IN (...)` (and its OR / negated variants).
 --- ```lua
 ---     User:query():where_in("id", { 1, 2, 3 }):all():await()
 --- ```
 ---@param column string
 ---@param list any[]
 ---@return NormQueryBuilder self
-function NormQueryBuilder:where_in(column, list)
-    self._state.wheres[#self._state.wheres + 1] =
-        { column = column, op = "IN", value = list, bool = "AND" };
+function NormQueryBuilder:where_in(column, list) return push(self, { column = column, op = "IN", value = list }, "AND"); end
+---@param column string
+---@param list any[]
+---@return NormQueryBuilder self
+function NormQueryBuilder:or_where_in(column, list) return push(self, { column = column, op = "IN", value = list }, "OR"); end
+---@param column string
+---@param list any[]
+---@return NormQueryBuilder self
+function NormQueryBuilder:where_not_in(column, list) return push(self, { column = column, op = "NOT IN", value = list }, "AND"); end
+---@param column string
+---@param list any[]
+---@return NormQueryBuilder self
+function NormQueryBuilder:or_where_not_in(column, list) return push(self, { column = column, op = "NOT IN", value = list }, "OR"); end
+
+--- `column IS [NOT] NULL` (and OR variants).
+---@param column string
+---@return NormQueryBuilder self
+function NormQueryBuilder:where_null(column) return push(self, { column = column, op = "=" }, "AND"); end
+---@param column string
+---@return NormQueryBuilder self
+function NormQueryBuilder:or_where_null(column) return push(self, { column = column, op = "=" }, "OR"); end
+---@param column string
+---@return NormQueryBuilder self
+function NormQueryBuilder:where_not_null(column) return push(self, { column = column, op = "!=" }, "AND"); end
+---@param column string
+---@return NormQueryBuilder self
+function NormQueryBuilder:or_where_not_null(column) return push(self, { column = column, op = "!=" }, "OR"); end
+
+--- `column != value` (and OR variant).
+---@param column string
+---@param value any
+---@return NormQueryBuilder self
+function NormQueryBuilder:where_not(column, value) return push(self, { column = column, op = "!=", value = value }, "AND"); end
+---@param column string
+---@param value any
+---@return NormQueryBuilder self
+function NormQueryBuilder:or_where_not(column, value) return push(self, { column = column, op = "!=", value = value }, "OR"); end
+
+--- `column [NOT] LIKE pattern` (use `%` / `_` wildcards). With OR / negated variants.
+--- ```lua
+---     User:query():where_like("name", "John%"):all():await()
+--- ```
+---@param column string
+---@param pattern string
+---@return NormQueryBuilder self
+function NormQueryBuilder:where_like(column, pattern) return push(self, { column = column, op = "LIKE", value = pattern }, "AND"); end
+---@param column string
+---@param pattern string
+---@return NormQueryBuilder self
+function NormQueryBuilder:or_where_like(column, pattern) return push(self, { column = column, op = "LIKE", value = pattern }, "OR"); end
+---@param column string
+---@param pattern string
+---@return NormQueryBuilder self
+function NormQueryBuilder:where_not_like(column, pattern) return push(self, { column = column, op = "NOT LIKE", value = pattern }, "AND"); end
+---@param column string
+---@param pattern string
+---@return NormQueryBuilder self
+function NormQueryBuilder:or_where_not_like(column, pattern) return push(self, { column = column, op = "NOT LIKE", value = pattern }, "OR"); end
+
+--- `column [NOT] BETWEEN min AND max` (inclusive). With OR / negated variants.
+--- ```lua
+---     Player:query():where_between("level", 10, 20):all():await()
+--- ```
+---@param column string
+---@param min any
+---@param max any
+---@return NormQueryBuilder self
+function NormQueryBuilder:where_between(column, min, max) return push(self, { column = column, op = "BETWEEN", value = { min, max } }, "AND"); end
+---@param column string
+---@param min any
+---@param max any
+---@return NormQueryBuilder self
+function NormQueryBuilder:or_where_between(column, min, max) return push(self, { column = column, op = "BETWEEN", value = { min, max } }, "OR"); end
+---@param column string
+---@param min any
+---@param max any
+---@return NormQueryBuilder self
+function NormQueryBuilder:where_not_between(column, min, max) return push(self, { column = column, op = "NOT BETWEEN", value = { min, max } }, "AND"); end
+---@param column string
+---@param min any
+---@param max any
+---@return NormQueryBuilder self
+function NormQueryBuilder:or_where_not_between(column, min, max) return push(self, { column = column, op = "NOT BETWEEN", value = { min, max } }, "OR"); end
+
+--- Keep only rows that HAVE at least one related row for `name` (optionally
+--- matching the `configure` conditions). Compiles to `EXISTS (correlated subquery)`.
+--- ```lua
+---     User:where_has("posts"):all():await()                       -- users with any post
+---     User:where_has("posts", function(q) q:where("published", true) end):all():await()
+--- ```
+---@param name string Relation name.
+---@param configure? fun(q: NormQueryBuilder) Conditions on the related rows.
+---@return NormQueryBuilder self
+function NormQueryBuilder:where_has(name, configure)
+    local rel = self.model.relations[name];
+    assert(rel, ("[norm] where_has: model '%s' has no relation '%s'"):format(self.model.table, name));
+    local sql, params = relation_subquery(self, rel, "1", configure);
+    self._state.wheres[#self._state.wheres + 1] = { exists = true, negate = false, sql = sql, params = params, bool = "AND" };
     return self;
 end
 
----@param column string
+--- Inverse of `where_has`: keep only rows with NO matching related row
+--- (`NOT EXISTS (...)`).
+---@param name string Relation name.
+---@param configure? fun(q: NormQueryBuilder)
 ---@return NormQueryBuilder self
-function NormQueryBuilder:where_null(column)
-    self._state.wheres[#self._state.wheres + 1] =
-        { column = column, op = "=", value = nil, bool = "AND" };
+function NormQueryBuilder:where_doesnt_have(name, configure)
+    local rel = self.model.relations[name];
+    assert(rel, ("[norm] where_doesnt_have: model '%s' has no relation '%s'"):format(self.model.table, name));
+    local sql, params = relation_subquery(self, rel, "1", configure);
+    self._state.wheres[#self._state.wheres + 1] = { exists = true, negate = true, sql = sql, params = params, bool = "AND" };
     return self;
 end
 
----@param column string
+--- Add a `<name>_count` field to each returned record: the number of related rows,
+--- without loading them (a correlated `COUNT(*)` subquery). Soft-deleted related
+--- rows aren't counted.
+--- ```lua
+---     local users = User:with_count("posts"):all():await()
+---     print(users[1].posts_count)
+--- ```
+---@param ... string relation names
 ---@return NormQueryBuilder self
-function NormQueryBuilder:where_not_null(column)
-    self._state.wheres[#self._state.wheres + 1] =
-        { column = column, op = "!=", value = nil, bool = "AND" };
+function NormQueryBuilder:with_count(...)
+    self._state.with_counts = self._state.with_counts or {};
+    local names = { ... };
+    for i = 1, #names do self._state.with_counts[#self._state.with_counts + 1] = names[i]; end
     return self;
+end
+
+--- Internal: fold `with_count` relations into a select state (adds `*` + the count
+--- subqueries to `raw_columns`). Returns (state, counts) — counts is nil if none.
+---@private
+---@param state NormQueryState
+---@return NormQueryState state, string[]|nil counts
+function NormQueryBuilder:_prepare_counts(state)
+    local counts = self._state.with_counts;
+    if (not counts or #counts == 0) then return state, nil; end
+    local d = self.model.orm.adapter:get_dialect();
+    local s = {};
+    for k, v in pairs(state) do s[k] = v; end
+    s.raw_columns = {};
+    if (state.raw_columns) then for i = 1, #state.raw_columns do s.raw_columns[i] = state.raw_columns[i]; end end
+    if (not s.columns or #s.columns == 0) then s.raw_columns[#s.raw_columns + 1] = "*"; end
+    for i = 1, #counts do
+        local rel = self.model.relations[counts[i]];
+        assert(rel, ("[norm] with_count: model '%s' has no relation '%s'"):format(self.model.table, counts[i]));
+        local sub = relation_subquery(self, rel, "COUNT(*)", nil); -- param-free (no configure)
+        s.raw_columns[#s.raw_columns + 1] = sub .. " AS " .. d.quote(counts[i] .. "_count");
+    end
+    return s, counts;
 end
 
 --- Add an ORDER BY clause (call again for secondary orderings).
@@ -1573,6 +2323,37 @@ function NormQueryBuilder:limit(n) self._state.limit = n; return self; end
 ---@return NormQueryBuilder self
 function NormQueryBuilder:offset(n) self._state.offset = n; return self; end
 
+--- Add GROUP BY columns (call again, or pass several, to group by more).
+--- ```lua
+---     Player:select_raw("faction, COUNT(*) AS n"):group_by("faction"):rows():await()
+--- ```
+---@param ... string
+---@return NormQueryBuilder self
+function NormQueryBuilder:group_by(...)
+    self._state.groups = self._state.groups or {};
+    local args = { ... };
+    for i = 1, #args do self._state.groups[#self._state.groups + 1] = args[i]; end
+    return self;
+end
+
+--- Add a HAVING condition (ANDed) on a RAW aggregate expression. Forms:
+--- `having(expr, value)` or `having(expr, op, value)`. The expression is emitted
+--- verbatim (so you can reference `COUNT(*)`, `SUM(\`coins\`)`, …); the value is bound.
+--- ```lua
+---     Player:select_raw("faction, COUNT(*) AS n"):group_by("faction")
+---           :having("COUNT(*)", ">", 10):rows():await()
+--- ```
+---@param expr string Raw SQL expression (not quoted).
+---@param op? string Operator, or the value when called with 2 args.
+---@param value? any
+---@return NormQueryBuilder self
+function NormQueryBuilder:having(expr, op, value)
+    if (value == nil) then value = op; op = "="; end
+    self._state.havings = self._state.havings or {};
+    self._state.havings[#self._state.havings + 1] = { expr = expr, op = op, value = value };
+    return self;
+end
+
 -- ---------- terminal methods (return promises) ----------
 
 --- Execute the query and resolve with all matching records.
@@ -1583,14 +2364,21 @@ function NormQueryBuilder:offset(n) self._state.offset = n; return self; end
 function NormQueryBuilder:all()
     local model = self.model;
     local includes = self._state.includes;
-    if (includes and #includes > 0) then
-        return model.orm:_query_with_includes(model, self._state, includes, false);
+    local state, counts = self:_prepare_counts(self:_effective_state());
+    if (includes and next(includes) ~= nil) then
+        return model.orm:_query_with_includes(model, state, includes, false);
     end
     local d = model.orm.adapter:get_dialect();
-    local statement, params = sqlmod.select(self._state, d);
+    local statement, params = sqlmod.select(state, d);
     return model.orm:_query_map(statement, params, function(rows)
         local out = {};
-        for i = 1, #rows do out[i] = model:wrap(rows[i]); end
+        for i = 1, #rows do
+            local rec = model:wrap(rows[i]);
+            if (counts) then
+                for j = 1, #counts do rec[counts[j] .. "_count"] = tonumber(rows[i][counts[j] .. "_count"]) or 0; end
+            end
+            out[i] = rec;
+        end
         return out;
     end);
 end
@@ -1604,14 +2392,20 @@ function NormQueryBuilder:first()
     self._state.limit = 1;
     local model = self.model;
     local includes = self._state.includes;
-    if (includes and #includes > 0) then
-        return model.orm:_query_with_includes(model, self._state, includes, true);
+    local state, counts = self:_prepare_counts(self:_effective_state());
+    if (includes and next(includes) ~= nil) then
+        return model.orm:_query_with_includes(model, state, includes, true);
     end
     local d = model.orm.adapter:get_dialect();
-    local statement, params = sqlmod.select(self._state, d);
+    local statement, params = sqlmod.select(state, d);
     return model.orm:_query_map(statement, params, function(rows)
         local row = rows[1];
-        return row and model:wrap(row) or nil;
+        if (not row) then return nil; end
+        local rec = model:wrap(row);
+        if (counts) then
+            for j = 1, #counts do rec[counts[j] .. "_count"] = tonumber(row[counts[j] .. "_count"]) or 0; end
+        end
+        return rec;
     end);
 end
 
@@ -1623,12 +2417,128 @@ end
 function NormQueryBuilder:count()
     local model = self.model;
     local d = model.orm.adapter:get_dialect();
-    local statement, params = sqlmod.count(self._state, d);
+    local statement, params = sqlmod.count(self:_effective_state(), d);
     return model.orm:_query_map(statement, params, function(rows)
         local row = rows[1] or {};
         return tonumber(row.count or row.COUNT or row["COUNT(*)"]) or 0;
     end);
 end
+
+--- Paginate the current query. Runs a `COUNT(*)` over the filter plus a
+--- `LIMIT/OFFSET` page query, resolving with
+--- `{ data, total, page, per_page, last_page, from, to }`. Honours `where`,
+--- `order`, soft-delete scope, and `with_count`.
+--- ```lua
+---     local p = User:where("admin", true):order("name"):paginate(2, 20):await()
+---     print(p.page, p.last_page, #p.data, p.total)
+--- ```
+---@param page? number 1-based page (default 1).
+---@param per_page? number rows per page (default 15).
+---@return NormPromise promise resolving to a pagination table
+function NormQueryBuilder:paginate(page, per_page)
+    page = math.max(1, math.floor(page or 1));
+    per_page = math.max(1, math.floor(per_page or 15));
+    local model = self.model;
+    local orm = model.orm;
+    local d = orm.adapter:get_dialect();
+
+    local effective = self:_effective_state();
+    local count_sql, count_params = sqlmod.count({ table = effective.table, wheres = effective.wheres }, d);
+
+    local data_state, counts = self:_prepare_counts(effective);
+    local ds = {};
+    for k, v in pairs(data_state) do ds[k] = v; end
+    ds.limit = per_page;
+    ds.offset = (page - 1) * per_page;
+    local data_sql, data_params = sqlmod.select(ds, d);
+
+    return orm.provider.new(function(resolve, reject)
+        orm:_trace(count_sql, count_params);
+        orm:_raw_query(count_sql, count_params, function(cerr, crows)
+            if (cerr ~= nil) then return reject(cerr); end
+            local total = tonumber(((crows or {})[1] or {}).count) or 0;
+            orm:_trace(data_sql, data_params);
+            orm:_raw_query(data_sql, data_params, function(derr, drows)
+                if (derr ~= nil) then return reject(derr); end
+                drows = drows or {};
+                local data = {};
+                for i = 1, #drows do
+                    local rec = model:wrap(drows[i]);
+                    if (counts) then
+                        for j = 1, #counts do rec[counts[j] .. "_count"] = tonumber(drows[i][counts[j] .. "_count"]) or 0; end
+                    end
+                    data[i] = rec;
+                end
+                resolve({
+                    data = data,
+                    total = total,
+                    page = page,
+                    per_page = per_page,
+                    last_page = math.max(1, math.ceil(total / per_page)),
+                    from = (#data > 0) and (ds.offset + 1) or 0,
+                    to = ds.offset + #data,
+                });
+            end);
+        end);
+    end);
+end
+
+--- Execute the query and resolve with the RAW rows (no record wrapping). Use this
+--- for grouped aggregates built with `:select_raw` / `:group_by` / `:having`.
+--- ```lua
+---     local stats = Player:select_raw("faction, COUNT(*) AS n, SUM(`coins`) AS total")
+---         :group_by("faction"):having("COUNT(*)", ">", 10):rows():await()
+--- ```
+---@return NormRowsPromise promise resolving to table[]
+function NormQueryBuilder:rows()
+    local model = self.model;
+    local d = model.orm.adapter:get_dialect();
+    local statement, params = sqlmod.select(self:_effective_state(), d);
+    return model.orm:_query_map(statement, params, function(rows) return rows; end);
+end
+
+--- Run a scalar aggregate over the current WHERE filter, resolving the value.
+---@param self NormQueryBuilder
+---@param func string
+---@param column? string
+---@param numeric boolean Coerce the result with tonumber (SUM/AVG/COUNT).
+---@return NormNumberPromise
+local function aggregate(self, func, column, numeric)
+    local model = self.model;
+    local d = model.orm.adapter:get_dialect();
+    local statement, params = sqlmod.aggregate(self:_effective_state(), func, column, d);
+    return model.orm:_query_map(statement, params, function(rows)
+        local value = (rows[1] or {}).aggregate;
+        if (numeric) then return tonumber(value) or 0; end
+        return value;
+    end);
+end
+
+--- SUM of a column over the current filter. Resolves with a number (0 if empty).
+--- ```lua
+---     local bank = User:where("admin", false):sum("coins"):await()
+--- ```
+---@param column string
+---@return NormNumberPromise promise resolving to number
+function NormQueryBuilder:sum(column) return aggregate(self, "SUM", column, true); end
+
+--- AVG of a column over the current filter. Resolves with a number.
+---@param column string
+---@return NormNumberPromise promise resolving to number
+function NormQueryBuilder:avg(column) return aggregate(self, "AVG", column, true); end
+
+--- MIN of a column over the current filter. Resolves with the raw value.
+---@param column string
+---@return NormNumberPromise promise resolving to the column's value type
+function NormQueryBuilder:min(column) return aggregate(self, "MIN", column, false); end
+
+--- MAX of a column over the current filter. Resolves with the raw value.
+--- ```lua
+---     local top = Player:max("score"):await()
+--- ```
+---@param column string
+---@return NormNumberPromise promise resolving to the column's value type
+function NormQueryBuilder:max(column) return aggregate(self, "MAX", column, false); end
 
 --- Bulk-update every matching row in one statement (no records loaded).
 --- Resolves with the affected row count.
@@ -1640,19 +2550,64 @@ end
 function NormQueryBuilder:update(data)
     local model = self.model;
     local d = model.orm.adapter:get_dialect();
-    local statement, params = sqlmod.update(self._state, model:_encode_write(data), d);
+    -- Don't update rows already soft-deleted (unless with_trashed/only_trashed).
+    local statement, params = sqlmod.update(self:_effective_state(), model:_encode_write(data), d);
     return model.orm:_execute_map(statement, params, function(res)
         return res and res.affectedRows or 0;
     end);
 end
 
---- Bulk-delete every matching row in one statement. Resolves with the affected
---- row count.
+--- Bulk-delete every matching row. On a soft-delete model this marks the rows
+--- (sets `deleted_at`) rather than removing them; use `force_delete` to remove.
+--- Resolves with the affected row count.
 --- ```lua
 ---     local n = User:query():where("coins", 0):delete():await()
 --- ```
 ---@return NormNumberPromise promise resolving to number
 function NormQueryBuilder:delete()
+    local model = self.model;
+    local d = model.orm.adapter:get_dialect();
+    if (model.soft_deletes) then
+        -- soft: UPDATE deleted_at = now over the (non-trashed) matched rows.
+        local statement, params = sqlmod.update(self:_effective_state(), { [model.soft_deletes] = utils.now_utc() }, d);
+        return model.orm:_execute_map(statement, params, function(res)
+            return res and res.affectedRows or 0;
+        end);
+    end
+    local statement, params = sqlmod.delete(self._state, d);
+    return model.orm:_execute_map(statement, params, function(res)
+        return res and res.affectedRows or 0;
+    end);
+end
+
+--- Atomically add `amount` (default 1) to a column on every matching row, in one
+--- `SET col = col + ?` statement (no read-modify-write, race-free). Resolves with
+--- the affected row count.
+--- ```lua
+---     Player:where("id", id):increment("coins", 50):await()
+--- ```
+---@param column string
+---@param amount? number Defaults to 1.
+---@return NormNumberPromise promise resolving to number
+function NormQueryBuilder:increment(column, amount)
+    local model = self.model;
+    local d = model.orm.adapter:get_dialect();
+    local statement, params = sqlmod.increment(self:_effective_state(), { { column = column, amount = amount or 1 } }, d);
+    return model.orm:_execute_map(statement, params, function(res) return res and res.affectedRows or 0; end);
+end
+
+--- Atomically subtract `amount` (default 1) from a column on every matching row.
+---@param column string
+---@param amount? number Defaults to 1.
+---@return NormNumberPromise promise resolving to number
+function NormQueryBuilder:decrement(column, amount)
+    return self:increment(column, -(amount or 1));
+end
+
+--- Bulk physical-DELETE every matching row, even on a soft-delete model.
+--- Resolves with the affected row count.
+---@return NormNumberPromise promise resolving to number
+function NormQueryBuilder:force_delete()
     local model = self.model;
     local d = model.orm.adapter:get_dialect();
     local statement, params = sqlmod.delete(self._state, d);
@@ -1672,6 +2627,58 @@ local class = class;
 local utils = require("utils");
 local sqlmod = require("sql");
 local NormQueryBuilder = require("query");
+
+local now_utc = utils.now_utc;
+
+--- Merge two attribute tables (`b` overrides `a`), both optional.
+---@param a? table<string, any>
+---@param b? table<string, any>
+---@return table<string, any>
+local function merge_attrs(a, b)
+    local out = {};
+    if (a) then for k, v in pairs(a) do out[k] = v; end end
+    if (b) then for k, v in pairs(b) do out[k] = v; end end
+    return out;
+end
+
+--- Normalise an id argument into a flat array of key values. Accepts a single
+--- value, an array of values, a single record, or an array of records (records
+--- are reduced to their primary key).
+---@param ids any
+---@return any[]
+local function to_id_list(ids)
+    if (ids == nil) then return {}; end
+    if (type(ids) ~= "table") then return { ids }; end
+    if (ids.__model) then return { ids[ids.__model.primary_key] }; end -- a single record
+    local out = {};
+    for i = 1, #ids do
+        local v = ids[i];
+        if (type(v) == "table" and v.__model) then out[#out + 1] = v[v.__model.primary_key];
+        else out[#out + 1] = v; end
+    end
+    return out;
+end
+
+-- Lifecycle hook events a model can register handlers for.
+local HOOK_EVENTS = {
+    "before_create", "after_create", "before_update", "after_update",
+    "before_save", "after_save", "before_delete", "after_delete", "after_find",
+};
+local VALID_HOOK = {};
+for i = 1, #HOOK_EVENTS do VALID_HOOK[HOOK_EVENTS[i]] = true; end
+
+--- Fire one or more hook events on a model for a record, captured in a pcall so a
+--- throwing hook becomes a cancelled operation. Returns (ok, err).
+---@param model NormModel
+---@param record NormRecord
+---@param ... string event names, in order
+---@return boolean ok, any err
+local function pfire(model, record, ...)
+    local events = { ... };
+    return pcall(function()
+        for i = 1, #events do model:_fire(events[i], record); end
+    end);
+end
 
 ---@class NormModelModule
 ---@field Record NormRecord
@@ -1708,6 +2715,45 @@ function NormRecord:__init(model, row, persisted)
             end
         end
     end
+    -- Snapshot persisted records so :save() can diff (dirty tracking).
+    if (self.__persisted) then self:_snapshot(); end
+end
+
+--- Capture the current column values as the "clean" baseline for dirty tracking.
+---@private
+function NormRecord:_snapshot()
+    local snap = {};
+    local cols = self.__model.columns;
+    for i = 1, #cols do
+        local name = cols[i].name;
+        snap[name] = self[name];
+    end
+    self.__original = snap;
+end
+
+--- Columns whose value differs from the snapshot (the write-set for an UPDATE).
+--- Only non-nil values are returned (clearing to NULL via save() is unsupported,
+--- as before). `json` columns holding a table are always considered changed —
+--- their contents may have been mutated in place, which a reference check misses.
+---@private
+---@return table<string, any>
+function NormRecord:_changed_columns()
+    local model = self.__model;
+    local original = self.__original or {};
+    local out = {};
+    for i = 1, #model.columns do
+        local col = model.columns[i];
+        local name = col.name;
+        local cur = self[name];
+        if (cur ~= nil) then
+            if (col.kind == "json" and type(cur) == "table") then
+                out[name] = cur;
+            elseif (cur ~= original[name]) then
+                out[name] = cur;
+            end
+        end
+    end
+    return out;
 end
 
 --- Plain `{ column = value }` table for this record (e.g. to serialise it).
@@ -1737,8 +2783,123 @@ function NormRecord:_persistable()
     return out;
 end
 
---- Persist the record: INSERT if new, UPDATE if it was loaded from the database.
---- Resolves with the record itself.
+--- Callback-based INSERT primitive (stamps timestamps, encodes, reads the new id
+--- via RETURNING when supported, snapshots). Shared by `:save()` and the
+--- `*OrCreate` helpers so they compose without relying on promise chaining.
+---@private
+---@param cb fun(err: any)
+function NormRecord:_do_insert(cb)
+    local model = self.__model;
+    local orm = model.orm;
+    local d = orm.adapter:get_dialect();
+    local ts = model.timestamps;
+
+    if (model._has_hooks) then
+        local ok, herr = pfire(model, self, "before_save", "before_create");
+        if (not ok) then return cb(herr); end
+    end
+
+    -- stamp created_at / updated_at unless the caller set them explicitly.
+    if (ts) then
+        local nowv = now_utc();
+        if (nowv ~= nil) then
+            if (ts.created and self[ts.created] == nil) then self[ts.created] = nowv; end
+            if (ts.updated and self[ts.updated] == nil) then self[ts.updated] = nowv; end
+        end
+    end
+
+    local data = self:_persistable();
+    if (model.autoincrement_pk) then data[model.primary_key] = nil; end
+
+    -- fire after-create/after-save once the insert succeeds.
+    local function fired(then_cb)
+        if (model._has_hooks) then
+            local ok, herr = pfire(model, self, "after_create", "after_save");
+            if (not ok) then return cb(herr); end
+        end
+        then_cb();
+    end
+
+    -- INSERT ... RETURNING (SQLite >= 3.35 / PostgreSQL / MariaDB) reads the new id
+    -- atomically (pool-safe) — routed as a query, since it returns a row.
+    local can_return = model.autoincrement_pk
+        and type(orm.adapter.supports_returning) == "function"
+        and orm.adapter:supports_returning();
+
+    if (can_return) then
+        local statement, params = sqlmod.insert(model.table, model:_encode_write(data), d, model.primary_key);
+        orm:_trace(statement, params);
+        orm:_raw_query(statement, params, function(err, rows)
+            if (err ~= nil) then return cb(err); end
+            rows = rows or {};
+            self.__persisted = true;
+            local row = rows[1];
+            if (row and row[model.primary_key] ~= nil) then
+                self[model.primary_key] = row[model.primary_key];
+            end
+            self:_snapshot();
+            fired(function() cb(nil); end);
+        end);
+        return;
+    end
+
+    local statement, params = sqlmod.insert(model.table, model:_encode_write(data), d);
+    orm:_trace(statement, params);
+    orm:_raw_execute(statement, params, function(err, res)
+        if (err ~= nil) then return cb(err); end
+        self.__persisted = true;
+        if (model.autoincrement_pk and res and res.insertId ~= nil) then
+            self[model.primary_key] = res.insertId;
+        end
+        self:_snapshot();
+        fired(function() cb(nil); end);
+    end);
+end
+
+--- Callback-based UPDATE primitive (dirty tracking + updated_at bump). Calls
+--- `cb(nil)` with NO query when nothing changed. Shared by `:save()` /
+--- `updateOrCreate`.
+---@private
+---@param cb fun(err: any)
+function NormRecord:_do_update(cb)
+    local model = self.__model;
+    local orm = model.orm;
+    local d = orm.adapter:get_dialect();
+    local ts = model.timestamps;
+    local pk = model.primary_key;
+    utils.assert(pk, ("model '%s' has no primary key; cannot update"):format(model.table));
+
+    -- before hooks run BEFORE the dirty check, so a hook may mutate the record and
+    -- have those changes persisted.
+    if (model._has_hooks) then
+        local ok, herr = pfire(model, self, "before_save", "before_update");
+        if (not ok) then return cb(herr); end
+    end
+
+    local changed = self:_changed_columns();
+    changed[pk] = nil; -- never update the primary key
+    if (next(changed) == nil) then return cb(nil); end -- nothing changed: no query
+    if (ts and ts.updated) then
+        local nowv = now_utc();
+        if (nowv ~= nil) then self[ts.updated] = nowv; changed[ts.updated] = nowv; end
+    end
+
+    local state = { table = model.table, wheres = { { column = pk, op = "=", value = self[pk] } } };
+    local statement, params = sqlmod.update(state, model:_encode_write(changed), d);
+    orm:_trace(statement, params);
+    orm:_raw_execute(statement, params, function(err)
+        if (err ~= nil) then return cb(err); end
+        self:_snapshot();
+        if (model._has_hooks) then
+            local ok, herr = pfire(model, self, "after_update", "after_save");
+            if (not ok) then return cb(herr); end
+        end
+        cb(nil);
+    end);
+end
+
+--- Persist the record: INSERT if new, UPDATE (only changed columns) if it was
+--- loaded from the database. Resolves with the record itself.
 --- ```lua
 ---     local user = User:find(1):await()
 ---     user.coins = user.coins + 50
@@ -1748,31 +2909,25 @@ end
 function NormRecord:save()
     local model = self.__model;
     local orm = model.orm;
-    local d = orm.adapter:get_dialect();
-    local data = self:_persistable();
-
     if (self.__persisted) then
-        utils.assert(model.primary_key, ("model '%s' has no primary key; cannot update"):format(model.table));
-        local pk = model.primary_key;
-        data[pk] = nil;
-        local state = { table = model.table, wheres = { { column = pk, op = "=", value = self[pk] } } };
-        local statement, params = sqlmod.update(state, model:_encode_write(data), d);
-        return orm:_execute_map(statement, params, function() return self; end);
+        return orm.provider.new(function(resolve, reject)
+            self:_do_update(function(err)
+                if (err ~= nil) then return reject(err); end
+                resolve(self);
+            end);
+        end);
     end
-
-    if (model.autoincrement_pk) then data[model.primary_key] = nil; end
-    local statement, params = sqlmod.insert(model.table, model:_encode_write(data), d);
-    return orm:_execute_map(statement, params, function(res)
-        self.__persisted = true;
-        if (model.autoincrement_pk and res and res.insertId ~= nil) then
-            self[model.primary_key] = res.insertId;
-        end
-        return self;
+    return orm.provider.new(function(resolve, reject)
+        self:_do_insert(function(err)
+            if (err ~= nil) then return reject(err); end
+            resolve(self);
+        end);
     end);
 end
 
---- DELETE this record from the database by its primary key. Resolves with the
---- record (now flagged as not persisted, so a later `:save()` re-inserts it).
+--- Delete this record. For a soft-delete model this sets the `deleted_at` column
+--- (the row stays, but queries exclude it by default); otherwise it physically
+--- removes the row. Resolves with the record.
 --- ```lua
 ---     local user = User:find(1):await()
 ---     user:delete():await()
@@ -1780,14 +2935,285 @@ end
 ---@return NormRecordPromise promise resolving to NormRecord (self)
 function NormRecord:delete()
     local model = self.__model;
+    local orm = model.orm;
     utils.assert(model.primary_key, ("model '%s' has no primary key; cannot delete"):format(model.table));
-    local d = model.orm.adapter:get_dialect();
+    local d = orm.adapter:get_dialect();
+    local pk = model.primary_key;
+
+    return orm.provider.new(function(resolve, reject)
+        if (model._has_hooks) then
+            local ok, herr = pfire(model, self, "before_delete");
+            if (not ok) then return reject(herr); end
+        end
+        local function done()
+            if (model._has_hooks) then
+                local ok, herr = pfire(model, self, "after_delete");
+                if (not ok) then return reject(herr); end
+            end
+            resolve(self);
+        end
+        local state = { table = model.table, wheres = { { column = pk, op = "=", value = self[pk] } } };
+        if (model.soft_deletes) then
+            local col = model.soft_deletes;
+            local nowv = now_utc();
+            self[col] = nowv;
+            local statement, params = sqlmod.update(state, { [col] = nowv }, d);
+            orm:_trace(statement, params);
+            orm:_raw_execute(statement, params, function(err)
+                if (err ~= nil) then return reject(err); end
+                self:_snapshot(); done();
+            end);
+        else
+            local statement, params = sqlmod.delete(state, d);
+            orm:_trace(statement, params);
+            orm:_raw_execute(statement, params, function(err)
+                if (err ~= nil) then return reject(err); end
+                self.__persisted = false; done();
+            end);
+        end
+    end);
+end
+
+--- Physically DELETE this record by its primary key, even on a soft-delete model.
+--- The record is flagged not-persisted (a later `:save()` re-inserts it). Resolves
+--- with the record. Fires `before_delete` / `after_delete`.
+---@return NormRecordPromise promise resolving to NormRecord (self)
+function NormRecord:force_delete()
+    local model = self.__model;
+    local orm = model.orm;
+    utils.assert(model.primary_key, ("model '%s' has no primary key; cannot delete"):format(model.table));
+    local d = orm.adapter:get_dialect();
+    local pk = model.primary_key;
+    return orm.provider.new(function(resolve, reject)
+        if (model._has_hooks) then
+            local ok, herr = pfire(model, self, "before_delete");
+            if (not ok) then return reject(herr); end
+        end
+        local state = { table = model.table, wheres = { { column = pk, op = "=", value = self[pk] } } };
+        local statement, params = sqlmod.delete(state, d);
+        orm:_trace(statement, params);
+        orm:_raw_execute(statement, params, function(err)
+            if (err ~= nil) then return reject(err); end
+            self.__persisted = false;
+            if (model._has_hooks) then
+                local ok, herr = pfire(model, self, "after_delete");
+                if (not ok) then return reject(herr); end
+            end
+            resolve(self);
+        end);
+    end);
+end
+
+--- Un-delete a soft-deleted record (clears `deleted_at`). Resolves with the record.
+--- ```lua
+---     local post = Post:only_trashed():where("id", 5):first():await()
+---     post:restore():await()
+--- ```
+---@return NormRecordPromise promise resolving to NormRecord (self)
+function NormRecord:restore()
+    local model = self.__model;
+    local orm = model.orm;
+    local col = utils.assert(model.soft_deletes, ("model '%s' does not use soft deletes"):format(model.table));
+    utils.assert(model.primary_key, ("model '%s' has no primary key; cannot restore"):format(model.table));
+    local d = orm.adapter:get_dialect();
+    local params = {};
+    -- explicit `SET col = NULL` (a nil value can't be carried through a data table).
+    local where = sqlmod.compile_where({ { column = model.primary_key, op = "=", value = self[model.primary_key] } }, d, params);
+    local statement = ("UPDATE %s SET %s = NULL%s"):format(d.quote(model.table), d.quote(col), where);
+    self[col] = nil;
+    return orm:_execute_map(statement, params, function() self:_snapshot(); return self; end);
+end
+
+--- Whether this record is currently soft-deleted (its `deleted_at` is set).
+---@return boolean
+function NormRecord:trashed()
+    local col = self.__model.soft_deletes;
+    return col ~= nil and self[col] ~= nil;
+end
+
+--- Atomically add `amount` (default 1) to a column of THIS record
+--- (`SET col = col + ?` by primary key — no read-modify-write). Also updates the
+--- in-memory value when it is a number, and resnapshots. Resolves with the record.
+--- ```lua
+---     player:increment("coins", 50):await()  -- player.coins is updated locally too
+--- ```
+---@param column string
+---@param amount? number Defaults to 1.
+---@return NormRecordPromise promise resolving to NormRecord (self)
+function NormRecord:increment(column, amount)
+    amount = amount or 1;
+    local model = self.__model;
+    local orm = model.orm;
+    utils.assert(model.primary_key, ("model '%s' has no primary key; cannot increment"):format(model.table));
+    local d = orm.adapter:get_dialect();
     local pk = model.primary_key;
     local state = { table = model.table, wheres = { { column = pk, op = "=", value = self[pk] } } };
-    local statement, params = sqlmod.delete(state, d);
-    return model.orm:_execute_map(statement, params, function()
-        self.__persisted = false;
+    local statement, params = sqlmod.increment(state, { { column = column, amount = amount } }, d);
+    return orm:_execute_map(statement, params, function()
+        if (type(self[column]) == "number") then self[column] = self[column] + amount; end
+        self:_snapshot(); -- the column now matches the DB
         return self;
+    end);
+end
+
+--- Atomically subtract `amount` (default 1) from a column of this record.
+---@param column string
+---@param amount? number Defaults to 1.
+---@return NormRecordPromise promise resolving to NormRecord (self)
+function NormRecord:decrement(column, amount)
+    return self:increment(column, -(amount or 1));
+end
+
+--- Resolve a `belongs_to_many` relation into its pivot coordinates (asserts the
+--- relation exists and is many-to-many).
+---@private
+---@param name string
+---@return table info
+function NormRecord:_pivot_info(name)
+    local model = self.__model;
+    local orm = model.orm;
+    local rel = model.relations[name];
+    utils.assert(rel and rel.kind == "belongs_to_many",
+        ("model '%s' has no belongs_to_many relation '%s'"):format(model.table, name));
+    local target = orm:model(rel.target);
+    utils.assert(target, ("relation '%s': target model '%s' is not defined"):format(name, rel.target));
+    return {
+        orm = orm,
+        d = orm.adapter:get_dialect(),
+        through = rel.through or utils.default_pivot(model.table, target.table),
+        main = rel.key,                                              -- pivot FK -> this model
+        other = rel.otherKey or (utils.singularize(target.table) .. "_id"), -- pivot FK -> target
+        local_value = self[rel.localKey or model.primary_key],
+    };
+end
+
+--- Link this record to one or more `target` rows of a `belongs_to_many` relation
+--- by inserting pivot rows. `ids` is a key value, an array of them, or record(s).
+--- `pivot` adds extra columns to each pivot row. Resolves with the number attached.
+--- ```lua
+---     user:attach("roles", { 1, 2 }):await()
+---     user:attach("roles", role, { granted_by = adminId }):await()
+--- ```
+---@param name string Relation name.
+---@param ids any Key value(s) or record(s) on the target side.
+---@param pivot? table<string, any> Extra pivot-row columns.
+---@return NormNumberPromise promise resolving to the number of rows inserted
+function NormRecord:attach(name, ids, pivot)
+    local info = self:_pivot_info(name);
+    local list = to_id_list(ids);
+    local orm = info.orm;
+    return orm.provider.new(function(resolve, reject)
+        if (info.local_value == nil) then
+            return reject("[norm] attach: this record has no key value yet (save it first)");
+        end
+        if (#list == 0) then return resolve(0); end
+        local i = 0;
+        local function step()
+            i = i + 1;
+            if (i > #list) then return resolve(#list); end
+            local row = { [info.main] = info.local_value, [info.other] = list[i] };
+            if (pivot) then for k, v in pairs(pivot) do row[k] = v; end end
+            local statement, params = sqlmod.insert(info.through, row, info.d);
+            orm:_trace(statement, params);
+            orm:_raw_execute(statement, params, function(err)
+                if (err ~= nil) then return reject(err); end
+                step();
+            end);
+        end
+        step();
+    end);
+end
+
+--- Unlink this record from `target` rows of a `belongs_to_many` relation by
+--- deleting pivot rows. With `ids` -> only those; without -> ALL links. Resolves
+--- with the affected row count.
+--- ```lua
+---     user:detach("roles", { 1 }):await()  -- remove one link
+---     user:detach("roles"):await()          -- remove every link
+--- ```
+---@param name string Relation name.
+---@param ids? any Key value(s) or record(s); omit to detach everything.
+---@return NormNumberPromise promise resolving to the number of rows deleted
+function NormRecord:detach(name, ids)
+    local info = self:_pivot_info(name);
+    local orm = info.orm;
+    local list = (ids ~= nil) and to_id_list(ids) or nil;
+    return orm.provider.new(function(resolve, reject)
+        if (info.local_value == nil) then return resolve(0); end
+        if (list and #list == 0) then return resolve(0); end -- explicit empty set: no-op
+        local wheres = { { column = info.main, op = "=", value = info.local_value } };
+        if (list) then wheres[#wheres + 1] = { column = info.other, op = "IN", value = list }; end
+        local statement, params = sqlmod.delete({ table = info.through, wheres = wheres }, info.d);
+        orm:_trace(statement, params);
+        orm:_raw_execute(statement, params, function(err, res)
+            if (err ~= nil) then return reject(err); end
+            resolve((res and res.affectedRows) or 0);
+        end);
+    end);
+end
+
+--- Make this record's pivot links for a `belongs_to_many` relation exactly match
+--- `ids`: attach the missing, detach the extra, leave the rest. Resolves with
+--- `{ attached = n, detached = m }`.
+--- ```lua
+---     user:sync_pivot("roles", { 1, 2, 3 }):await()
+--- ```
+---@param name string Relation name.
+---@param ids any Key value(s) or record(s) that should remain linked.
+---@return NormPromise promise resolving to { attached: number, detached: number }
+function NormRecord:sync_pivot(name, ids)
+    local info = self:_pivot_info(name);
+    local orm = info.orm;
+    local desired = to_id_list(ids);
+    return orm.provider.new(function(resolve, reject)
+        if (info.local_value == nil) then
+            return reject("[norm] sync_pivot: this record has no key value yet (save it first)");
+        end
+        local sel, sparams = sqlmod.select({
+            table = info.through, columns = { info.other },
+            wheres = { { column = info.main, op = "=", value = info.local_value } },
+        }, info.d);
+        orm:_trace(sel, sparams);
+        orm:_raw_query(sel, sparams, function(err, rows)
+            if (err ~= nil) then return reject(err); end
+            rows = rows or {};
+            local current, desired_set = {}, {};
+            for i = 1, #rows do current[rows[i][info.other]] = true; end
+            for i = 1, #desired do desired_set[desired[i]] = true; end
+            local to_attach, to_detach = {}, {};
+            for i = 1, #desired do if (not current[desired[i]]) then to_attach[#to_attach + 1] = desired[i]; end end
+            for id in pairs(current) do if (not desired_set[id]) then to_detach[#to_detach + 1] = id; end end
+
+            local function do_attach()
+                local i = 0;
+                local function step()
+                    i = i + 1;
+                    if (i > #to_attach) then return resolve({ attached = #to_attach, detached = #to_detach }); end
+                    local statement, params = sqlmod.insert(info.through,
+                        { [info.main] = info.local_value, [info.other] = to_attach[i] }, info.d);
+                    orm:_trace(statement, params);
+                    orm:_raw_execute(statement, params, function(ierr)
+                        if (ierr ~= nil) then return reject(ierr); end
+                        step();
+                    end);
+                end
+                step();
+            end
+
+            if (#to_detach == 0) then return do_attach(); end
+            local statement, params = sqlmod.delete({
+                table = info.through,
+                wheres = {
+                    { column = info.main, op = "=", value = info.local_value },
+                    { column = info.other, op = "IN", value = to_detach },
+                },
+            }, info.d);
+            orm:_trace(statement, params);
+            orm:_raw_execute(statement, params, function(derr)
+                if (derr ~= nil) then return reject(derr); end
+                do_attach();
+            end);
+        end);
     end);
 end
 
@@ -1814,6 +3240,7 @@ function NormRecord:reload()
                 end
             end
         end
+        self:_snapshot(); -- reloaded values are the new clean baseline
         return self;
     end);
 end
@@ -1835,6 +3262,24 @@ function NormRecord:load(name)
     utils.assert(target, ("relation '%s': target model '%s' is not defined"):format(name, rel.target));
     local d = orm.adapter:get_dialect();
 
+    if (rel.kind == "belongs_to_many") then
+        -- Two-step batched fetch (pivot -> targets); cache the array on self[name].
+        local local_key = rel.localKey or model.primary_key;
+        local local_value = self[local_key];
+        if (local_value == nil) then
+            self[name] = {};
+            return orm.provider.resolve({});
+        end
+        return orm.provider.new(function(resolve, reject)
+            orm:_m2m_fetch(model, rel, { local_value }, nil, function(err, by_main)
+                if (err ~= nil) then return reject(err); end
+                local list = (by_main and by_main[local_value]) or {};
+                self[name] = list;
+                resolve(list);
+            end);
+        end);
+    end
+
     if (rel.kind == "belongs_to") then
         local other_key = rel.otherKey or target.primary_key;
         local fk = self[rel.key];
@@ -1843,6 +3288,7 @@ function NormRecord:load(name)
             return orm.provider.resolve(nil);
         end
         local state = { table = target.table, limit = 1, wheres = { { column = other_key, op = "=", value = fk } } };
+        utils.soft_scope(state, target);
         local statement, params = sqlmod.select(state, d);
         return orm:_query_map(statement, params, function(rows)
             local rec = rows[1] and target:wrap(rows[1]) or nil;
@@ -1860,6 +3306,7 @@ function NormRecord:load(name)
     end
     local state = { table = target.table, wheres = { { column = rel.key, op = "=", value = local_value } } };
     if (rel.kind == "has_one") then state.limit = 1; end
+    utils.soft_scope(state, target);
     local statement, params = sqlmod.select(state, d);
     return orm:_query_map(statement, params, function(rows)
         if (rel.kind == "has_one") then
@@ -1889,6 +3336,9 @@ module.Record = NormRecord;
 ---@field primary_key? string
 ---@field autoincrement_pk boolean
 ---@field record_class NormRecord
+---@field timestamps? {created: string, updated: string} Auto-managed timestamp columns (nil if disabled).
+---@field soft_deletes? string The soft-delete column name (nil if disabled).
+---@field indexes? {name: string, columns: string[], unique: boolean}[] Indexes emitted at sync().
 ---@overload fun(orm: NormOrm, table_name: string, columns: NormColumn[], record_class: NormRecord): NormModel
 local NormModel = class.new("NormModel");
 
@@ -1905,6 +3355,9 @@ function NormModel:__init(orm, table_name, columns, record_class)
     self.primary_key = nil;
     self.autoincrement_pk = false;
     self.record_class = record_class;
+    self.hooks = nil;        -- event -> { fn, ... }, created on first registration
+    self._has_hooks = false; -- fast-path flag so hook-less models pay nothing
+    self.scopes = nil;       -- name -> fn(query, ...), reusable query fragments
     for i = 1, #columns do
         local c = columns[i];
         self.columns_by_name[c.name] = c;
@@ -1964,10 +3417,67 @@ function NormModel:_encode_write(data)
     return out;
 end
 
---- Wrap a DB row into a persisted record.
+--- Wrap a DB row into a persisted record (fires `after_find`).
 ---@param row table<string, any>
 ---@return NormRecord
-function NormModel:wrap(row) return self.record_class(self, row, true); end
+function NormModel:wrap(row)
+    local record = self.record_class(self, row, true);
+    if (self._has_hooks) then self:_fire("after_find", record); end
+    return record;
+end
+
+--- Register a lifecycle hook handler. Events: `before_create`, `after_create`,
+--- `before_update`, `after_update`, `before_save`, `after_save`, `before_delete`,
+--- `after_delete`, `after_find`. Handlers run **synchronously** with the record;
+--- a `before_*` handler that raises cancels the operation (the promise rejects).
+--- Convenience methods exist per event (e.g. `Model:before_save(fn)`).
+--- ```lua
+---     User:before_save(function(u) assert(u.name ~= nil, "name required") end)
+---     User:after_create(function(u) print("created #" .. u.id) end)
+--- ```
+---@param event string
+---@param fn fun(record: NormRecord)
+---@return NormModel self
+function NormModel:hook(event, fn)
+    utils.assert(VALID_HOOK[event], ("unknown hook event '%s'"):format(tostring(event)));
+    utils.assert(type(fn) == "function", "hook handler must be a function");
+    self.hooks = self.hooks or {};
+    self.hooks[event] = self.hooks[event] or {};
+    self.hooks[event][#self.hooks[event] + 1] = fn;
+    self._has_hooks = true;
+    return self;
+end
+
+--- Run every handler registered for `event`, in registration order.
+---@param event string
+---@param record NormRecord
+function NormModel:_fire(event, record)
+    local hs = self.hooks and self.hooks[event];
+    if (hs) then for i = 1, #hs do hs[i](record); end end
+end
+
+--- Register a reusable, named query fragment. `fn(query, ...)` applies conditions
+--- to a query builder. The scope becomes callable as a starter (`Model:active()`)
+--- and chainable (`query:scope("active")`). The name must not collide with a
+--- built-in method.
+--- ```lua
+---     User:scope("active", function(q) q:where("active", true) end)
+---     User:scope("older_than", function(q, age) q:where("age", ">", age) end)
+---     User:active():scope("older_than", 18):all():await()
+--- ```
+---@param name string
+---@param fn fun(query: NormQueryBuilder, ...: any)
+---@return NormModel self
+function NormModel:scope(name, fn)
+    utils.assert(type(name) == "string", "scope: name must be a string");
+    utils.assert(type(fn) == "function", "scope: handler must be a function");
+    utils.assert(rawget(NormModel, name) == nil, ("scope '%s' collides with a built-in method"):format(name));
+    self.scopes = self.scopes or {};
+    self.scopes[name] = fn;
+    -- starter convenience on the model instance: Model:<name>(...) -> query():scope(...)
+    self[name] = function(s, ...) return s:query():scope(name, ...); end
+    return self;
+end
 
 --- Build an *unsaved* record from a data table (nothing hits the database until
 --- you call `:save()`). Useful to prepare a record then persist it later.
@@ -1989,6 +3499,67 @@ function NormModel:build(data) return self.record_class(self, data, false); end
 ---@param data table<string, any>
 ---@return NormRecordPromise promise resolving to NormRecord
 function NormModel:create(data) return self:build(data):save(); end
+
+--- Bulk-insert many rows in ONE statement. A fast path: it does NOT fire create
+--- hooks. Timestamps are stamped; auto-increment ids are left to the DB; columns
+--- missing from a row are inserted as NULL.
+---
+--- By default (no per-row ids available from a multi-row insert) it resolves with
+--- the affected row count. Pass `{ records = true }` to get the inserted rows back
+--- as records WITH their ids — this uses `INSERT ... RETURNING *` and therefore
+--- requires a RETURNING-capable adapter (SQLite >= 3.35 / PostgreSQL / MariaDB >=
+--- 10.5); it **throws** otherwise.
+--- ```lua
+---     local n    = Log:insert_many({ { level = "info" }, { level = "warn" } }):await()
+---     local recs = Log:insert_many(rows, { records = true }):await()  -- recs[1].id, …
+--- ```
+---@param rows table<string, any>[]
+---@param opts? { records?: boolean }
+---@return NormNumberPromise|NormRecordListPromise promise resolving to a count, or records
+function NormModel:insert_many(rows, opts)
+    opts = opts or {};
+    utils.assert(type(rows) == "table", "insert_many: expected a list of rows");
+    local orm = self.orm;
+    local want_records = opts.records == true;
+    if (want_records) then
+        utils.assert(type(orm.adapter.supports_returning) == "function" and orm.adapter:supports_returning(),
+            ("insert_many{ records = true } needs an adapter with RETURNING support (model '%s')"):format(self.table));
+    end
+    if (#rows == 0) then return orm.provider.resolve(want_records and {} or 0); end
+    local d = orm.adapter:get_dialect();
+    local ts = self.timestamps;
+    local nowv = ts and now_utc() or nil;
+
+    local encoded, colset = {}, {};
+    for i = 1, #rows do
+        local data = {};
+        for k, v in pairs(rows[i]) do data[k] = v; end
+        if (ts and nowv ~= nil) then
+            if (ts.created and data[ts.created] == nil) then data[ts.created] = nowv; end
+            if (ts.updated and data[ts.updated] == nil) then data[ts.updated] = nowv; end
+        end
+        if (self.autoincrement_pk) then data[self.primary_key] = nil; end
+        local enc = self:_encode_write(data);
+        encoded[i] = enc;
+        for k in pairs(enc) do colset[k] = true; end
+    end
+
+    local columns = {};
+    for k in pairs(colset) do columns[#columns + 1] = k; end
+    table.sort(columns); -- stable column order
+
+    if (want_records) then
+        local statement, params = sqlmod.insert_many(self.table, columns, encoded, d, "*");
+        return orm:_query_map(statement, params, function(back)
+            local out = {};
+            for i = 1, #back do out[i] = self:wrap(back[i]); end
+            return out;
+        end);
+    end
+
+    local statement, params = sqlmod.insert_many(self.table, columns, encoded, d);
+    return orm:_execute_map(statement, params, function(res) return (res and res.affectedRows) or #rows; end);
+end
 
 --- Start a chainable query against this model's table.
 --- ```lua
@@ -2022,6 +3593,86 @@ function NormModel:limit(...) return self:query():limit(...); end
 ---@return NormQueryBuilder
 function NormModel:select(...) return self:query():select(...); end
 
+---@param column string
+---@param value any
+---@return NormQueryBuilder
+function NormModel:where_not(column, value) return self:query():where_not(column, value); end
+
+---@param column string
+---@param list any[]
+---@return NormQueryBuilder
+function NormModel:where_in(column, list) return self:query():where_in(column, list); end
+
+---@param column string
+---@param list any[]
+---@return NormQueryBuilder
+function NormModel:where_not_in(column, list) return self:query():where_not_in(column, list); end
+
+---@param column string
+---@param pattern string
+---@return NormQueryBuilder
+function NormModel:where_like(column, pattern) return self:query():where_like(column, pattern); end
+
+---@param column string
+---@param min any
+---@param max any
+---@return NormQueryBuilder
+function NormModel:where_between(column, min, max) return self:query():where_between(column, min, max); end
+
+---@param expr string
+---@return NormQueryBuilder
+function NormModel:select_raw(expr) return self:query():select_raw(expr); end
+
+---@param ... string|string[]
+---@return NormQueryBuilder
+function NormModel:omit(...) return self:query():omit(...); end
+
+---@param name string
+---@param configure? fun(q: NormQueryBuilder)
+---@return NormQueryBuilder
+function NormModel:where_has(name, configure) return self:query():where_has(name, configure); end
+
+---@param name string
+---@param configure? fun(q: NormQueryBuilder)
+---@return NormQueryBuilder
+function NormModel:where_doesnt_have(name, configure) return self:query():where_doesnt_have(name, configure); end
+
+---@param ... string
+---@return NormQueryBuilder
+function NormModel:with_count(...) return self:query():with_count(...); end
+
+--- Start a query that INCLUDES soft-deleted rows (soft-delete models only).
+---@return NormQueryBuilder
+function NormModel:with_trashed() return self:query():with_trashed(); end
+
+--- Start a query over ONLY soft-deleted rows (soft-delete models only).
+---@return NormQueryBuilder
+function NormModel:only_trashed() return self:query():only_trashed(); end
+
+---@param table_name string
+---@param first string
+---@param op string
+---@param second? string
+---@return NormQueryBuilder
+function NormModel:join(...) return self:query():join(...); end
+
+---@param table_name string
+---@param first string
+---@param op string
+---@param second? string
+---@return NormQueryBuilder
+function NormModel:left_join(...) return self:query():left_join(...); end
+
+---@param ... string
+---@return NormQueryBuilder
+function NormModel:group_by(...) return self:query():group_by(...); end
+
+---@param expr string
+---@param op? string
+---@param value? any
+---@return NormQueryBuilder
+function NormModel:having(...) return self:query():having(...); end
+
 --- Resolves with every record in the table.
 --- ```lua
 ---     local users = User:all():await()
@@ -2036,6 +3687,35 @@ function NormModel:all() return self:query():all(); end
 --- ```
 ---@return NormNumberPromise promise resolving to number
 function NormModel:count() return self:query():count(); end
+
+--- Paginate the whole table. See `NormQueryBuilder:paginate`.
+---@param page? number
+---@param per_page? number
+---@return NormPromise
+function NormModel:paginate(page, per_page) return self:query():paginate(page, per_page); end
+
+--- SUM of a column across the whole table.
+--- ```lua
+---     local total = User:sum("coins"):await()
+--- ```
+---@param column string
+---@return NormNumberPromise promise resolving to number
+function NormModel:sum(column) return self:query():sum(column); end
+
+--- AVG of a column across the whole table.
+---@param column string
+---@return NormNumberPromise promise resolving to number
+function NormModel:avg(column) return self:query():avg(column); end
+
+--- MIN of a column across the whole table.
+---@param column string
+---@return NormNumberPromise promise resolving to the column's value type
+function NormModel:min(column) return self:query():min(column); end
+
+--- MAX of a column across the whole table.
+---@param column string
+---@return NormNumberPromise promise resolving to the column's value type
+function NormModel:max(column) return self:query():max(column); end
 
 --- Find a single record by its primary key. Resolves with the record or nil.
 --- ```lua
@@ -2059,6 +3739,181 @@ function NormModel:find_by(filter)
     return self:query():where(filter):first();
 end
 
+--- Callback-based "first row matching an ANDed `{ col = value }` filter". Used by
+--- the `*OrCreate` helpers (which must compose without promise chaining).
+---@private
+---@param attributes table<string, any>
+---@param cb fun(err: any, record?: NormRecord|nil)
+function NormModel:_find_by_attrs(attributes, cb)
+    local orm = self.orm;
+    local d = orm.adapter:get_dialect();
+    local state = { table = self.table, limit = 1, wheres = {} };
+    for _, k in ipairs(utils.sorted_keys(attributes)) do
+        state.wheres[#state.wheres + 1] = { column = k, op = "=", value = attributes[k] };
+    end
+    local statement, params = sqlmod.select(state, d);
+    orm:_trace(statement, params);
+    orm:_raw_query(statement, params, function(err, rows)
+        if (err ~= nil) then return cb(err); end
+        rows = rows or {};
+        cb(nil, rows[1] and self:wrap(rows[1]) or nil);
+    end);
+end
+
+--- Find the first record matching `attributes`; if none exists, return an
+--- **unsaved** record built from `attributes` merged with `values` (nothing is
+--- written until you `:save()` it). Resolves with the record.
+--- ```lua
+---     local u = User:find_or_new({ email = "a@b.c" }, { name = "Anon" }):await()
+---     if (not u.__persisted) then u:save():await() end
+--- ```
+---@param attributes table<string, any> Columns to match on.
+---@param values? table<string, any> Extra columns for a freshly built record.
+---@return NormRecordOrNilPromise promise resolving to NormRecord
+function NormModel:find_or_new(attributes, values)
+    local model = self;
+    return self.orm.provider.new(function(resolve, reject)
+        model:_find_by_attrs(attributes, function(err, record)
+            if (err ~= nil) then return reject(err); end
+            resolve(record or model:build(merge_attrs(attributes, values)));
+        end);
+    end);
+end
+
+--- Find the first record matching `attributes`; if none exists, INSERT one built
+--- from `attributes` merged with `values`. Resolves with the (existing or newly
+--- created) record. Not atomic: a unique constraint is the only true guard
+--- against a concurrent double-insert.
+--- ```lua
+---     local player = Player:find_or_create({ account_id = id }, { name = "Guest" }):await()
+--- ```
+---@param attributes table<string, any> Columns to match on (and seed a new record).
+---@param values? table<string, any> Extra columns applied only when creating.
+---@return NormRecordPromise promise resolving to NormRecord
+function NormModel:find_or_create(attributes, values)
+    local model = self;
+    return self.orm.provider.new(function(resolve, reject)
+        model:_find_by_attrs(attributes, function(err, record)
+            if (err ~= nil) then return reject(err); end
+            if (record) then return resolve(record); end
+            local fresh = model:build(merge_attrs(attributes, values));
+            fresh:_do_insert(function(ierr)
+                if (ierr ~= nil) then return reject(ierr); end
+                resolve(fresh);
+            end);
+        end);
+    end);
+end
+
+--- Find the first record matching `attributes` and UPDATE it with `values`; if
+--- none exists, INSERT one from `attributes` merged with `values`. Resolves with
+--- the record. (Application-level upsert; not atomic.)
+--- ```lua
+---     local p = Player:update_or_create({ account_id = id }, { last_seen = now, name = nick }):await()
+--- ```
+---@param attributes table<string, any> Columns to match on (and seed a new record).
+---@param values? table<string, any> Columns to write (on both update and create).
+---@return NormRecordPromise promise resolving to NormRecord
+function NormModel:update_or_create(attributes, values)
+    local model = self;
+    return self.orm.provider.new(function(resolve, reject)
+        model:_find_by_attrs(attributes, function(err, record)
+            if (err ~= nil) then return reject(err); end
+            if (record) then
+                if (values) then for k, v in pairs(values) do record[k] = v; end end
+                record:_do_update(function(uerr)
+                    if (uerr ~= nil) then return reject(uerr); end
+                    resolve(record);
+                end);
+                return;
+            end
+            local fresh = model:build(merge_attrs(attributes, values));
+            fresh:_do_insert(function(ierr)
+                if (ierr ~= nil) then return reject(ierr); end
+                resolve(fresh);
+            end);
+        end);
+    end);
+end
+
+--- **Atomic** upsert: a single `INSERT ... ON CONFLICT/ON DUPLICATE KEY UPDATE`
+--- statement (race-safe, unlike `find_or_create`). `data` is inserted; if a row
+--- with the same `opts.conflict` columns exists it is updated instead. The write
+--- is one statement; the canonical row is then read back and resolved as a record.
+---
+--- The conflict columns MUST carry a UNIQUE (or PRIMARY KEY) constraint — that is
+--- what the database matches on. `opts.conflict` defaults to the primary key;
+--- `opts.update` defaults to every written column except the conflict columns (and
+--- `created_at`, preserved on an existing row).
+--- ```lua
+---     -- create the player, or update name/last_seen if account_id already exists
+---     local p = Player:upsert(
+---         { account_id = id, name = nick, last_seen = ts },
+---         { conflict = { "account_id" } }
+---     ):await()
+--- ```
+---@param data table<string, any> Columns to insert (and update on conflict).
+---@param opts? {conflict?: string[], update?: string[]}
+---@return NormRecordOrNilPromise promise resolving to NormRecord
+function NormModel:upsert(data, opts)
+    opts = opts or {};
+    local model = self;
+    local orm = self.orm;
+    local d = orm.adapter:get_dialect();
+    local ts = model.timestamps;
+
+    local conflict = opts.conflict;
+    if (conflict == nil and model.primary_key) then conflict = { model.primary_key }; end
+    utils.assert(type(conflict) == "table" and #conflict > 0,
+        ("upsert on '%s' needs conflict columns (opts.conflict) or a primary key"):format(model.table));
+
+    -- write payload (+ timestamps for the INSERT branch).
+    local write = {};
+    for k, v in pairs(data) do write[k] = v; end
+    if (ts) then
+        local nowv = now_utc();
+        if (nowv ~= nil) then
+            if (ts.created and write[ts.created] == nil) then write[ts.created] = nowv; end
+            if (ts.updated and write[ts.updated] == nil) then write[ts.updated] = nowv; end
+        end
+    end
+
+    -- update-set: all written columns except the conflict target and created_at
+    -- (so an existing row keeps its original created_at).
+    local conflict_set = {};
+    for _, c in ipairs(conflict) do conflict_set[c] = true; end
+    local update_cols = opts.update;
+    if (update_cols == nil) then
+        update_cols = {};
+        for _, name in ipairs(utils.sorted_keys(write)) do
+            if (not conflict_set[name] and not (ts and name == ts.created)) then
+                update_cols[#update_cols + 1] = name;
+            end
+        end
+    end
+
+    local statement, params = sqlmod.upsert(model.table, model:_encode_write(write), conflict, update_cols, d);
+
+    return orm.provider.new(function(resolve, reject)
+        orm:_trace(statement, params);
+        orm:_raw_execute(statement, params, function(err)
+            if (err ~= nil) then return reject(err); end
+            -- the write is atomic; read the canonical row back by the conflict key.
+            local state = { table = model.table, limit = 1, wheres = {} };
+            for _, c in ipairs(conflict) do
+                state.wheres[#state.wheres + 1] = { column = c, op = "=", value = write[c] };
+            end
+            local sel, sparams = sqlmod.select(state, d);
+            orm:_trace(sel, sparams);
+            orm:_raw_query(sel, sparams, function(serr, rows)
+                if (serr ~= nil) then return reject(serr); end
+                rows = rows or {};
+                resolve(rows[1] and model:wrap(rows[1]) or nil);
+            end);
+        end);
+    end);
+end
+
 --- Create this model's table (CREATE TABLE IF NOT EXISTS). Prefer `orm:sync()`
 --- to create every model at once (it also orders tables by their foreign-key
 --- dependencies). Emits this model's `belongsTo` foreign keys when enabled.
@@ -2071,8 +3926,32 @@ function NormModel:sync()
     local orm = self.orm;
     local d = orm.adapter:get_dialect();
     local fks = orm:_should_emit_fk(d) and orm:_collect_foreign_keys(self) or nil;
-    local statement = sqlmod.create_table(self.table, self.columns, d, fks);
-    return orm:_execute_map(statement, {}, function() return true; end);
+    local statements = { sqlmod.create_table(self.table, self.columns, d, fks) };
+    if (self.indexes) then
+        for _, ix in ipairs(self.indexes) do
+            statements[#statements + 1] = sqlmod.add_index(self.table, ix.name, ix.columns, ix.unique, d, true);
+        end
+    end
+    -- Schema prep: bypass the readiness queue (like orm:sync) and flush on success.
+    return orm.provider.new(function(resolve, reject)
+        local i = 0;
+        local function step()
+            i = i + 1;
+            if (i > #statements) then orm:_flush_ready(); return resolve(true); end
+            orm:_trace(statements[i], {});
+            orm.adapter:raw_execute(statements[i], {}, function(err)
+                if (err ~= nil) then return reject(err); end
+                step();
+            end);
+        end
+        step();
+    end);
+end
+
+-- Per-event convenience registrars: NormModel:before_save(fn), :after_create(fn), …
+for i = 1, #HOOK_EVENTS do
+    local event = HOOK_EVENTS[i];
+    NormModel[event] = function(self, fn) return self:hook(event, fn); end
 end
 
 module.Model = NormModel;
@@ -2089,12 +3968,22 @@ local function unique_record_name(table_name)
     return ("NormRecord_%s_%d"):format(table_name, record_counter);
 end
 
+--- Options controlling how a model behaves (3rd arg of `define`).
+---@class NormDefineOptions
+---@field timestamps? boolean|{created?: string, updated?: string} Auto-manage created_at/updated_at (Norm-side, UTC; portable across SQLite/MySQL). `true` uses the default names; pass a table to rename.
+---@field soft_deletes? boolean|{column?: string} Mark rows deleted (set a `deleted_at`) instead of removing them; queries then exclude them by default. `true` uses `deleted_at`; pass a table to rename.
+---@field hooks? table<string, fun(record: NormRecord)|fun(record: NormRecord)[]> Lifecycle hooks per event (see `NormModel:hook`), as a single handler or a list.
+---@field scopes? table<string, fun(query: NormQueryBuilder, ...: any)> Named reusable query fragments (see `NormModel:scope`).
+---@field indexes? {columns?: string[], column?: string, unique?: boolean, name?: string}[] Table indexes emitted at `sync()` (composite via `columns`, single via `column`).
+
 --- Build a Model (+ dedicated Record subclass) from a schema definition.
 ---@param orm NormOrm
 ---@param table_name string
 ---@param schema table<string, NormColumn>
+---@param options? NormDefineOptions
 ---@return NormModel
-function module.define(orm, table_name, schema)
+function module.define(orm, table_name, schema, options)
+    options = options or {};
     utils.assert(type(table_name) == "string", "define: table name must be a string");
     utils.assert(type(schema) == "table", "define: schema must be a table");
 
@@ -2115,6 +4004,29 @@ function module.define(orm, table_name, schema)
         end
     end
 
+    -- Managed `datetime` columns (added unless already declared).
+    local function ensure_datetime_column(name)
+        for i = 1, #columns do if (columns[i].name == name) then return; end end
+        columns[#columns + 1] = { kind = "datetime", nullable = true, name = name };
+    end
+
+    -- Timestamps.
+    local timestamps = nil;
+    if (options.timestamps) then
+        local conf = (type(options.timestamps) == "table") and options.timestamps or {};
+        timestamps = { created = conf.created or "created_at", updated = conf.updated or "updated_at" };
+        ensure_datetime_column(timestamps.created);
+        ensure_datetime_column(timestamps.updated);
+    end
+
+    -- Soft deletes (a nullable `deleted_at`; rows are marked, not removed).
+    local soft_deletes = nil;
+    local sd = options.soft_deletes or options.softDeletes;
+    if (sd) then
+        soft_deletes = (type(sd) == "table" and sd.column) or "deleted_at";
+        ensure_datetime_column(soft_deletes);
+    end
+
     -- Stable order: primary key(s) first, then alphabetical.
     table.sort(columns, function(a, b)
         if (a.primary and not b.primary) then return true; end
@@ -2131,12 +4043,52 @@ function module.define(orm, table_name, schema)
     end
 
     local model = NormModel(orm, table_name, columns, record_class);
+    model.timestamps = timestamps;
+    model.soft_deletes = soft_deletes;
+
+    -- Collect indexes: per-column `index = true`, plus table-level `options.indexes`.
+    local indexes = {};
+    for i = 1, #columns do
+        local c = columns[i];
+        if (c.index and not c.unique and not c.primary) then
+            indexes[#indexes + 1] = { name = "idx_" .. table_name .. "_" .. c.name, columns = { c.name }, unique = false };
+        end
+    end
+    if (type(options.indexes) == "table") then
+        for _, ix in ipairs(options.indexes) do
+            local cols = ix.columns or { ix.column };
+            local name = ix.name or ("idx_" .. table_name .. "_" .. table.concat(cols, "_"));
+            indexes[#indexes + 1] = { name = name, columns = cols, unique = ix.unique == true };
+        end
+    end
+    model.indexes = indexes;
+
+    -- Register lifecycle hooks passed at define time.
+    if (type(options.hooks) == "table") then
+        for event, handler in pairs(options.hooks) do
+            if (type(handler) == "function") then
+                model:hook(event, handler);
+            elseif (type(handler) == "table") then
+                for i = 1, #handler do model:hook(event, handler[i]); end
+            end
+        end
+    end
+
+    -- Register named scopes passed at define time.
+    if (type(options.scopes) == "table") then
+        for name, fn in pairs(options.scopes) do model:scope(name, fn); end
+    end
 
     -- Resolve relation key defaults now that the model (and its primary key) exists.
     local singular = (table_name:gsub("s$", ""));
     for name, rel in pairs(relations) do
         if (rel.kind == "belongs_to") then
             rel.key = rel.key or (name .. "_id");
+        elseif (rel.kind == "belongs_to_many") then
+            -- key = pivot FK to THIS model; otherKey/through/otherLocalKey depend
+            -- on the target and are resolved lazily (the target may not exist yet).
+            rel.key = rel.key or (singular .. "_id");
+            rel.localKey = rel.localKey or model.primary_key;
         else
             rel.key = rel.key or (singular .. "_id");
             rel.localKey = rel.localKey or model.primary_key;
@@ -2161,6 +4113,43 @@ local promise = require("promise");
 local jsonmod = require("json");
 local model_module = require("model");
 
+local singularize = utils.singularize;
+local default_pivot = utils.default_pivot;
+
+--- Take `list[offset+1 .. offset+limit]` (used for per-parent limit on an included
+--- collection). Returns the list unchanged when `limit` is nil.
+---@param list any[]
+---@param offset? number
+---@param limit? number
+---@return any[]
+local function slice(list, offset, limit)
+    if (not limit) then return list; end
+    offset = offset or 0;
+    local out = {};
+    for i = offset + 1, math.min(#list, offset + limit) do out[#out + 1] = list[i]; end
+    return out;
+end
+
+--- Flatten the records loaded under `name` across a set of parents (handles a
+--- single record, nil, or an array) into one list for the next nesting level.
+---@param records NormRecord[]
+---@param name string
+---@return NormRecord[]
+local function collect_loaded(records, name)
+    local out = {};
+    for i = 1, #records do
+        local v = records[i][name];
+        if (v ~= nil) then
+            if (v.__model) then
+                out[#out + 1] = v;                       -- single record (belongs_to / has_one)
+            else
+                for j = 1, #v do out[#out + 1] = v[j]; end -- array (has_many / belongs_to_many)
+            end
+        end
+    end
+    return out;
+end
+
 ---@class NormOrm: LightClass
 ---@field adapter NormAdapter
 ---@field provider NormPromiseProvider
@@ -2180,6 +4169,7 @@ local NormOrm = class.new("NormOrm");
 ---@field logger? fun(level: string, message: string)
 ---@field foreignKeys? boolean|"auto" Emit SQL FOREIGN KEY constraints from `belongsTo` relations. `"auto"` (default) emits on MySQL, skips on SQLite (with a one-time warning); `true` always emits; `false` never emits (no warning).
 ---@field json? NormJsonProvider|"auto"|false JSON provider for `json` columns. `"auto"` (default) uses the adapter's, else auto-detects (Nanos `JSON` / Lua `json`), else raw passthrough; `false` disables (de)serialisation.
+---@field queue_until_ready? boolean Hold data operations in a queue until the first successful `sync()`/`migrate()`, then flush them (default false: run immediately).
 
 ---@param options NormOptions
 function NormOrm:__init(options)
@@ -2206,6 +4196,15 @@ function NormOrm:__init(options)
     self._logger = options.logger or utils.logger;
     self.foreign_keys = (options.foreignKeys == nil) and "auto" or options.foreignKeys;
     self._warned_sqlite_fk = false;
+
+    -- Readiness gate. When queueing is requested, data ops are held until the
+    -- first sync()/migrate() flips this ready and flushes them.
+    self._ready = (options.queue_until_ready ~= true);
+    self._queue = {};
+
+    -- Active transaction handle (set for the duration of db:transaction); when set,
+    -- data ops route through the adapter's transaction connection.
+    self._tx = nil;
 
     -- JSON provider for `json` columns: explicit > adapter default > auto-detect.
     -- `false` disables it (raw string passthrough).
@@ -2237,6 +4236,106 @@ function NormOrm:_trace(query, params)
     self._logger("SQL", query .. suffix);
 end
 
+--- The single gate every data operation goes through. Runs against the adapter
+--- when ready; otherwise holds the call until `sync()`/`migrate()` flushes it.
+--- (sync/migrate themselves bypass this — they're what makes the ORM ready.)
+---@private
+function NormOrm:_raw_query(query, params, callback)
+    if (self._tx ~= nil) then return self._tx.query(query, params, callback); end
+    if (self._ready) then return self.adapter:raw_query(query, params, callback); end
+    if (#self._queue == 0) then
+        self._logger("DB", "queue_until_ready: holding operations until sync()/migrate()");
+    end
+    self._queue[#self._queue + 1] = { kind = "query", query = query, params = params, callback = callback };
+end
+
+---@private
+function NormOrm:_raw_execute(query, params, callback)
+    if (self._tx ~= nil) then return self._tx.execute(query, params, callback); end
+    if (self._ready) then return self.adapter:raw_execute(query, params, callback); end
+    if (#self._queue == 0) then
+        self._logger("DB", "queue_until_ready: holding operations until sync()/migrate()");
+    end
+    self._queue[#self._queue + 1] = { kind = "execute", query = query, params = params, callback = callback };
+end
+
+--- Mark the ORM ready and replay any queued operations in FIFO order. No-op if
+--- already ready. Called by `sync()`/`migrate()` on success.
+---@private
+function NormOrm:_flush_ready()
+    if (self._ready) then return; end
+    self._ready = true;
+    local queue = self._queue;
+    self._queue = {};
+    if (#queue > 0) then
+        self._logger("DB", ("ready: flushing %d queued operation(s)"):format(#queue));
+    end
+    for i = 1, #queue do
+        local op = queue[i];
+        if (op.kind == "query") then
+            self.adapter:raw_query(op.query, op.params, op.callback);
+        else
+            self.adapter:raw_execute(op.query, op.params, op.callback);
+        end
+    end
+end
+
+--- Whether operations run immediately. With `queue_until_ready`, false until the
+--- first successful `sync()`/`migrate()`; otherwise always true.
+---@return boolean
+function NormOrm:is_ready() return self._ready == true; end
+
+--- Whether the configured adapter supports transactions.
+---@return boolean
+function NormOrm:supports_transactions()
+    return type(self.adapter.supports_transactions) == "function" and self.adapter:supports_transactions();
+end
+
+--- Run `fn` inside a database transaction: `BEGIN`, then every operation `fn`
+--- performs (await them) runs on that transaction; `COMMIT` if `fn` returns,
+--- `ROLLBACK` if it raises. Resolves with `fn`'s return value (rejects with its
+--- error after rolling back). Use `:await()` on operations inside `fn` as usual.
+---
+--- **Throws immediately** if the adapter does not support transactions — check
+--- `db:supports_transactions()` first if you need to branch (nanos has no
+--- transaction API, so it always throws there; oxmysql supports them). Do not
+--- overlap transactions on the same Norm instance (the state is per-instance).
+--- ```lua
+---     db:transaction(function()
+---         from.coins = from.coins - 100; from:save():await()
+---         to.coins   = to.coins + 100;   to:save():await()
+---     end):await()
+--- ```
+---@generic T
+---@param fn fun(orm: NormOrm): T
+---@return NormPromise promise resolving to T
+function NormOrm:transaction(fn)
+    utils.assert(self:supports_transactions(), "this adapter does not support transactions");
+    utils.assert(self._tx == nil, "nested transactions are not supported");
+    utils.assert(type(fn) == "function", "transaction() requires a function");
+
+    return self.provider.new(function(resolve, reject)
+        local result, errored, err_value;
+        self.adapter:transaction(
+            -- body: run fn with transaction-scoped routing; signal commit/rollback.
+            function(tx_query, tx_execute)
+                self._tx = { query = tx_query, execute = tx_execute };
+                local ok, res = pcall(fn, self);
+                self._tx = nil;
+                if (ok) then result = res; return true; end -- COMMIT
+                errored, err_value = true, res;             -- ROLLBACK
+                return false;
+            end,
+            -- finish: settle the promise (fn's own error wins over a generic one).
+            function(ferr)
+                if (errored) then return reject(err_value); end
+                if (ferr ~= nil) then return reject(ferr); end
+                resolve(result);
+            end
+        );
+    end);
+end
+
 --- Run a SELECT and transform the rows inside the promise.
 ---@param query string
 ---@param params? any[]
@@ -2245,7 +4344,7 @@ end
 function NormOrm:_query_map(query, params, transform)
     self:_trace(query, params);
     return self.provider.new(function(resolve, reject)
-        self.adapter:raw_query(query, params or {}, function(err, rows)
+        self:_raw_query(query, params or {}, function(err, rows)
             if (err ~= nil) then return reject(err); end
             local ok, mapped = pcall(transform, rows or {});
             if (not ok) then return reject(mapped); end
@@ -2262,7 +4361,7 @@ end
 function NormOrm:_execute_map(query, params, transform)
     self:_trace(query, params);
     return self.provider.new(function(resolve, reject)
-        self.adapter:raw_execute(query, params or {}, function(err, result)
+        self:_raw_execute(query, params or {}, function(err, result)
             if (err ~= nil) then return reject(err); end
             local ok, mapped = pcall(transform, result or {});
             if (not ok) then return reject(mapped); end
@@ -2271,14 +4370,137 @@ function NormOrm:_execute_map(query, params, transform)
     end);
 end
 
+--- Internal: fetch many-to-many target records for a set of parent keys, in two
+--- batched queries (pivot then targets) — no N+1 regardless of cardinality. The
+--- target-dependent defaults (`through`, `otherKey`, `otherLocalKey`) are resolved
+--- here, since the target model may have been defined after this one.
+---@private
+---@param model NormModel
+---@param rel NormRelation
+---@param keys any[] Unique parent local-key values.
+---@param spec? table Include spec (`wheres`/`orders`/`limit`/`offset`) applied to the target.
+---@param cb fun(err: any, by_main?: table<any, NormRecord[]>) `by_main[parentKey]` = linked target records.
+function NormOrm:_m2m_fetch(model, rel, keys, spec, cb)
+    local target = self:model(rel.target);
+    if (not target) then
+        return cb(("relation '%s': target model '%s' is not defined"):format(rel.name or "?", rel.target));
+    end
+    if (#keys == 0) then return cb(nil, {}); end
+
+    local d = self.adapter:get_dialect();
+    local through = rel.through or default_pivot(model.table, target.table);
+    local pivot_main = rel.key;                                          -- pivot col -> this model
+    local pivot_other = rel.otherKey or (singularize(target.table) .. "_id"); -- pivot col -> target
+    local other_local = rel.otherLocalKey or target.primary_key;         -- target's local key
+
+    -- 1) pivot rows: parent key + related key.
+    local pstate = { table = through, columns = { pivot_main, pivot_other },
+        wheres = { { column = pivot_main, op = "IN", value = keys } } };
+    local pstmt, pparams = sqlmod.select(pstate, d);
+    self:_trace(pstmt, pparams);
+    self:_raw_query(pstmt, pparams, function(perr, prows)
+        if (perr ~= nil) then return cb(perr); end
+        prows = prows or {};
+        local main_to_related, related_ids, seen = {}, {}, {};
+        for i = 1, #prows do
+            local mk, rk = prows[i][pivot_main], prows[i][pivot_other];
+            if (mk ~= nil and rk ~= nil) then
+                local lst = main_to_related[mk];
+                if (not lst) then lst = {}; main_to_related[mk] = lst; end
+                lst[#lst + 1] = rk;
+                if (not seen[rk]) then seen[rk] = true; related_ids[#related_ids + 1] = rk; end
+            end
+        end
+        if (#related_ids == 0) then return cb(nil, {}); end
+
+        -- 2) target rows, fetched once by their local key (+ any include filters/order).
+        local tstate = { table = target.table,
+            wheres = { { column = other_local, op = "IN", value = related_ids } } };
+        if (spec and spec.wheres) then for i = 1, #spec.wheres do tstate.wheres[#tstate.wheres + 1] = spec.wheres[i]; end end
+        if (spec and spec.orders and #spec.orders > 0) then tstate.orders = spec.orders; end
+        utils.soft_scope(tstate, target); -- exclude soft-deleted related rows
+        local tstmt, tparams = sqlmod.select(tstate, d);
+        self:_trace(tstmt, tparams);
+        -- invert pivot mapping: related key -> the parent keys linked to it.
+        local related_to_mains = {};
+        for mk, rks in pairs(main_to_related) do
+            for j = 1, #rks do
+                local rk = rks[j];
+                local l = related_to_mains[rk];
+                if (not l) then l = {}; related_to_mains[rk] = l; end
+                l[#l + 1] = mk;
+            end
+        end
+        self:_raw_query(tstmt, tparams, function(terr, trows)
+            if (terr ~= nil) then return cb(terr); end
+            trows = trows or {};
+            local by_main = {};
+            for mk in pairs(main_to_related) do by_main[mk] = {}; end
+            -- iterate target rows in SQL order so any include `order` is honoured.
+            for i = 1, #trows do
+                local rec = target:wrap(trows[i]);
+                local owners = related_to_mains[trows[i][other_local]];
+                if (owners) then
+                    for j = 1, #owners do
+                        local g = by_main[owners[j]];
+                        g[#g + 1] = rec;
+                    end
+                end
+            end
+            if (spec and spec.limit) then
+                for mk, list in pairs(by_main) do by_main[mk] = slice(list, spec.offset, spec.limit); end
+            end
+            cb(nil, by_main);
+        end);
+    end);
+end
+
+--- Internal: eager-load a map of include specs onto a set of records. Each
+--- relation is loaded once via `_load_include_batch` (batched, no N+1) with its
+--- spec (per-relation `wheres`/`orders`/`limit`); a spec with `children` then
+--- recurses onto the flattened loaded records. Siblings load sequentially.
+---@private
+---@param model NormModel
+---@param records NormRecord[]
+---@param includes table<string, table> name -> spec { wheres, orders, limit, offset, children }
+---@param cb fun(err: any)
+function NormOrm:_load_includes(model, records, includes, cb)
+    local names = {};
+    for name in pairs(includes) do names[#names + 1] = name; end
+    table.sort(names); -- deterministic order
+
+    local i = 0;
+    local function step()
+        i = i + 1;
+        local name = names[i];
+        if (not name) then return cb(); end
+        local spec = includes[name];
+        self:_load_include_batch(model, records, name, spec, function(err)
+            if (err ~= nil) then return cb(err); end
+            local children = spec.children;
+            if (not children or next(children) == nil) then return step(); end -- leaf
+            local rel = model.relations[name];
+            local target = self:model(rel.target);
+            local kids = collect_loaded(records, name);
+            if (#kids == 0) then return step(); end
+            self:_load_includes(target, kids, children, function(e)
+                if (e ~= nil) then return cb(e); end
+                step();
+            end);
+        end);
+    end
+    step();
+end
+
 --- Internal: batched eager-load of one relation onto a set of parent records.
 --- Runs a single `... IN (...)` query and attaches results. Calls `cb(err?)`.
 ---@private
 ---@param model NormModel
 ---@param mains NormRecord[]
 ---@param name string
+---@param spec? table Include spec (`wheres`/`orders`/`limit`/`offset`).
 ---@param cb fun(err: any)
-function NormOrm:_load_include_batch(model, mains, name, cb)
+function NormOrm:_load_include_batch(model, mains, name, spec, cb)
     local rel = model.relations[name];
     if (not rel) then
         return cb(("model '%s' has no relation '%s'"):format(model.table, name));
@@ -2297,19 +4519,31 @@ function NormOrm:_load_include_batch(model, mains, name, cb)
         if (v ~= nil and not seen[v]) then seen[v] = true; keys[#keys + 1] = v; end
     end
 
-    local empty = (rel.kind == "has_many") and {} or nil;
+    local empty = (rel.kind == "has_many" or rel.kind == "belongs_to_many") and {} or nil;
     if (#keys == 0) then
         for i = 1, #mains do mains[i][name] = empty; end
         return cb();
     end
 
+    if (rel.kind == "belongs_to_many") then
+        self:_m2m_fetch(model, rel, keys, spec, function(err, by_main)
+            if (err ~= nil) then return cb(err); end
+            for i = 1, #mains do mains[i][name] = (by_main and by_main[mains[i][source_key]]) or {}; end
+            cb();
+        end);
+        return;
+    end
+
     if (rel.kind == "belongs_to") then
         local other_key = rel.otherKey or target.primary_key;
         local state = { table = target.table, wheres = { { column = other_key, op = "IN", value = keys } } };
+        if (spec and spec.wheres) then for i = 1, #spec.wheres do state.wheres[#state.wheres + 1] = spec.wheres[i]; end end
+        utils.soft_scope(state, target); -- exclude soft-deleted related rows
         local statement, params = sqlmod.select(state, d);
         self:_trace(statement, params);
-        self.adapter:raw_query(statement, params, function(err, rows)
+        self:_raw_query(statement, params, function(err, rows)
             if (err ~= nil) then return cb(err); end
+            rows = rows or {};
             local by_key = {};
             for i = 1, #rows do by_key[rows[i][other_key]] = target:wrap(rows[i]); end
             for i = 1, #mains do mains[i][name] = by_key[mains[i][rel.key]]; end
@@ -2320,10 +4554,14 @@ function NormOrm:_load_include_batch(model, mains, name, cb)
 
     -- has_one / has_many: group target rows by their foreign key.
     local state = { table = target.table, wheres = { { column = rel.key, op = "IN", value = keys } } };
+    if (spec and spec.wheres) then for i = 1, #spec.wheres do state.wheres[#state.wheres + 1] = spec.wheres[i]; end end
+    if (spec and spec.orders and #spec.orders > 0) then state.orders = spec.orders; end
+    utils.soft_scope(state, target); -- exclude soft-deleted related rows
     local statement, params = sqlmod.select(state, d);
     self:_trace(statement, params);
-    self.adapter:raw_query(statement, params, function(err, rows)
+    self:_raw_query(statement, params, function(err, rows)
         if (err ~= nil) then return cb(err); end
+        rows = rows or {};
         local groups = {};
         for i = 1, #rows do
             local k = rows[i][rel.key];
@@ -2333,6 +4571,7 @@ function NormOrm:_load_include_batch(model, mains, name, cb)
         end
         for i = 1, #mains do
             local g = groups[mains[i][source_key]] or {};
+            if (spec and spec.limit and rel.kind == "has_many") then g = slice(g, spec.offset, spec.limit); end
             mains[i][name] = (rel.kind == "has_one") and (g[1] or nil) or g;
         end
         cb();
@@ -2344,7 +4583,7 @@ end
 ---@private
 ---@param model NormModel
 ---@param state NormQueryState
----@param includes string[]
+---@param includes table<string, table> include spec map (name -> { wheres, orders, limit, offset, children })
 ---@param single boolean
 ---@return NormPromise
 function NormOrm:_query_with_includes(model, state, includes, single)
@@ -2352,29 +4591,21 @@ function NormOrm:_query_with_includes(model, state, includes, single)
     local statement, params = sqlmod.select(state, d);
     self:_trace(statement, params);
     return self.provider.new(function(resolve, reject)
-        self.adapter:raw_query(statement, params or {}, function(err, rows)
+        self:_raw_query(statement, params or {}, function(err, rows)
             if (err ~= nil) then return reject(err); end
+            rows = rows or {};
             local records = {};
             for i = 1, #rows do records[i] = model:wrap(rows[i]); end
             if (#records == 0) then
                 return resolve(single and nil or records);
             end
-            local index = 0;
-            local function step()
-                index = index + 1;
-                local name = includes[index];
-                if (not name) then
-                    return resolve(single and records[1] or records);
-                end
-                local ok, err2 = pcall(function()
-                    self:_load_include_batch(model, records, name, function(e)
-                        if (e ~= nil) then return reject(e); end
-                        step();
-                    end);
+            local ok, perr = pcall(function()
+                self:_load_includes(model, records, includes, function(e)
+                    if (e ~= nil) then return reject(e); end
+                    resolve(single and records[1] or records);
                 end);
-                if (not ok) then reject(err2); end
-            end
-            step();
+            end);
+            if (not ok) then reject(perr); end
         end);
     end);
 end
@@ -2416,11 +4647,12 @@ end
 --- ```
 ---@param table_name string
 ---@param schema table<string, NormColumn>
+---@param options? NormDefineOptions
 ---@return NormModel
-function NormOrm:define(table_name, schema)
+function NormOrm:define(table_name, schema, options)
     utils.assert(not self.models[table_name],
         ("Norm: model '%s' is already defined"):format(table_name));
-    local model = model_module.define(self, table_name, schema);
+    local model = model_module.define(self, table_name, schema, options);
     self.models[table_name] = model;
     return model;
 end
@@ -2566,13 +4798,22 @@ function NormOrm:sync()
         local m = self.models[name];
         local fks = emit_fk and self:_collect_foreign_keys(m) or nil;
         statements[#statements + 1] = sqlmod.create_table(m.table, m.columns, d, fks);
+        -- each table's indexes, right after it's created (idempotent via IF NOT EXISTS).
+        if (m.indexes) then
+            for _, ix in ipairs(m.indexes) do
+                statements[#statements + 1] = sqlmod.add_index(m.table, ix.name, ix.columns, ix.unique, d, true);
+            end
+        end
     end
 
     return self.provider.new(function(resolve, reject)
         local index = 0;
         local function step()
             index = index + 1;
-            if (index > #statements) then return resolve(true); end
+            if (index > #statements) then
+                self:_flush_ready(); -- schema prepared: release any queued data ops
+                return resolve(true);
+            end
             self:_trace(statements[index], {});
             self.adapter:raw_execute(statements[index], {}, function(err)
                 if (err ~= nil) then return reject(err); end
@@ -2580,6 +4821,124 @@ function NormOrm:sync()
             end);
         end
         step();
+    end);
+end
+
+--- Schema-change builder handed to a migration's `up(m)`. Each call appends a DDL
+--- statement (dialect-aware) to be run in order. Chainable.
+---@param d NormDialect
+---@return table
+local function make_migration_builder(d)
+    local b = { _statements = {} };
+    local function push(stmt) b._statements[#b._statements + 1] = stmt; end
+    --- Add a column. `descriptor` is a `Norm.types.*` value.
+    function b:add_column(table_name, name, descriptor)
+        local col = utils.copy(descriptor); col.name = name;
+        push(sqlmod.add_column(table_name, col, d)); return self;
+    end
+    function b:drop_column(table_name, name) push(sqlmod.drop_column(table_name, name, d)); return self; end
+    function b:rename_column(table_name, from, to) push(sqlmod.rename_column(table_name, from, to, d)); return self; end
+    --- `opts.unique` for a UNIQUE index.
+    function b:add_index(table_name, index_name, columns, opts)
+        opts = opts or {};
+        push(sqlmod.add_index(table_name, index_name, columns, opts.unique == true, d)); return self;
+    end
+    function b:drop_index(index_name, table_name) push(sqlmod.drop_index(index_name, table_name, d)); return self; end
+    function b:drop_table(table_name) push(sqlmod.drop_table(table_name, d)); return self; end
+    --- Raw DDL escape hatch (run verbatim).
+    function b:raw(statement) push(statement); return self; end
+    return b;
+end
+
+---@class NormMigration
+---@field id string Unique, stable identifier (applied once). Order them by sorting-friendly ids.
+---@field up fun(m: table) Receives the schema builder; record changes via m:add_column(...) etc.
+
+--- Run pending schema migrations in order, recording applied ones in a
+--- `norm_migrations` table so each runs exactly once. Idempotent: re-running
+--- applies only what's new. Resolves with the list of ids applied this run.
+--- ```lua
+---     db:migrate({
+---         { id = "2026_06_25_add_last_seen", up = function(m)
+---             m:add_column("players", "last_seen", Norm.types.datetime())
+---             m:add_index("players", "idx_players_account", { "account_id" }, { unique = true })
+---         end },
+---     }):await()
+--- ```
+---@param migrations NormMigration[]
+---@return NormPromise promise resolving to string[] (applied ids)
+function NormOrm:migrate(migrations)
+    utils.assert(type(migrations) == "table", "Norm: migrate() needs a list of migrations");
+    for i = 1, #migrations do
+        utils.assert(type(migrations[i].id) == "string", "Norm: each migration needs a string `id`");
+        utils.assert(type(migrations[i].up) == "function", "Norm: each migration needs an `up` function");
+    end
+
+    local d = self.adapter:get_dialect();
+    local create = sqlmod.create_table("norm_migrations", {
+        { name = "id", kind = "string", length = 191, primary = true, nullable = false },
+        { name = "applied_at", kind = "datetime", nullable = true },
+    }, d);
+    local now;
+    if (type(os) == "table" and type(os.date) == "function") then
+        local ok, s = pcall(os.date, "!%Y-%m-%d %H:%M:%S");
+        if (ok) then now = s; end
+    end
+
+    return self.provider.new(function(resolve, reject)
+        self:_trace(create, {});
+        self.adapter:raw_execute(create, {}, function(cerr)
+            if (cerr ~= nil) then return reject(cerr); end
+            local list_sql = ("SELECT %s FROM %s"):format(d.quote("id"), d.quote("norm_migrations"));
+            self:_trace(list_sql, {});
+            self.adapter:raw_query(list_sql, {}, function(qerr, rows)
+                if (qerr ~= nil) then return reject(qerr); end
+                rows = rows or {};
+                local done = {};
+                for i = 1, #rows do done[rows[i].id] = true; end
+
+                local applied, index = {}, 0;
+                local function next_migration()
+                    index = index + 1;
+                    local mig = migrations[index];
+                    -- NOTE: migrate() does NOT mark the ORM ready. It evolves an
+                    -- existing schema (ALTERs) and does not create the model tables
+                    -- — only sync() does, so only sync() flips readiness. Run sync()
+                    -- before migrate().
+                    if (not mig) then return resolve(applied); end
+                    if (done[mig.id]) then return next_migration(); end
+
+                    local builder = make_migration_builder(d);
+                    local ok, err = pcall(mig.up, builder);
+                    if (not ok) then return reject(err); end
+                    local statements = builder._statements;
+
+                    local si = 0;
+                    local function run_next()
+                        si = si + 1;
+                        if (si > #statements) then
+                            -- record this migration as applied.
+                            local ins, iparams = sqlmod.insert("norm_migrations",
+                                { id = mig.id, applied_at = now }, d);
+                            self:_trace(ins, iparams);
+                            self.adapter:raw_execute(ins, iparams, function(ierr)
+                                if (ierr ~= nil) then return reject(ierr); end
+                                applied[#applied + 1] = mig.id;
+                                next_migration();
+                            end);
+                            return;
+                        end
+                        self:_trace(statements[si], {});
+                        self.adapter:raw_execute(statements[si], {}, function(serr)
+                            if (serr ~= nil) then return reject(serr); end
+                            run_next();
+                        end);
+                    end
+                    run_next();
+                end
+                next_migration();
+            end);
+        end);
     end);
 end
 
@@ -2601,10 +4960,12 @@ local jsonlib = require("json");
 ---@field connection? string Connection string / file path.
 ---@field pool_size? integer Number of pooled connections (nanos default if omitted).
 ---@field database? table An already-built nanos `Database` instance to reuse.
+---@field returning? boolean Force `INSERT ... RETURNING` on/off. Default: auto — on for SQLite/PostgreSQL, auto-detected for MariaDB >= 10.5 (off for real MySQL).
 
 ---@class NormNanosAdapter: NormAdapter
 ---@field database table The underlying nanos `Database`.
 ---@field private _resolved_dialect "mysql"|"sqlite"
+---@field private _supports_returning boolean
 ---@overload fun(options?: NormNanosAdapterOptions): NormNanosAdapter
 local NormNanosAdapter = class.extend("NormNanosAdapter", NormAdapter);
 
@@ -2620,12 +4981,48 @@ local function engine_to_dialect(engine)
     return "mysql";
 end
 
+--- Whether a DatabaseEngine supports `INSERT ... RETURNING` (SQLite >= 3.35,
+--- PostgreSQL — both bundled by nanos satisfy this; MySQL does not). Returns nil
+--- when the engine is unknown (e.g. a pre-built `database` instance was passed).
+---@param engine integer|nil
+---@return boolean|nil
+local function engine_supports_returning(engine)
+    local E = _ENV.DatabaseEngine;
+    if (not E or engine == nil) then return nil; end
+    return engine == E.SQLite or engine == E.PostgreSQL;
+end
+
+--- MariaDB >= 10.5 supports `INSERT ... RETURNING`; real MySQL does not. The
+--- nanos `MySQL` engine can point at either, so probe the server banner once
+--- (`SELECT VERSION()` -> e.g. "11.6.2-MariaDB"). Best-effort: any failure or an
+--- unrecognised banner yields false (falls back to the LAST_INSERT_ID path).
+---@param db table
+---@return boolean
+local function detect_mariadb_returning(db)
+    if (type(db) ~= "table" or type(db.Select) ~= "function") then return false; end
+    local ok, rows = pcall(function() return db:Select("SELECT VERSION() AS v"); end);
+    if (not ok or type(rows) ~= "table" or type(rows[1]) ~= "table") then return false; end
+    local v = tostring(rows[1].v or "");
+    if (not v:find("MariaDB", 1, true)) then return false; end
+    local major, minor = v:match("^(%d+)%.(%d+)");
+    major, minor = tonumber(major), tonumber(minor);
+    if (not major or not minor) then return false; end
+    return (major > 10) or (major == 10 and minor >= 5);
+end
+
 ---@param options? NormNanosAdapterOptions
 function NormNanosAdapter:__init(options)
     options = options or {};
     self._resolved_dialect = options.dialect
         or (options.engine ~= nil and engine_to_dialect(options.engine))
         or "sqlite";
+
+    -- RETURNING support is engine-driven (PostgreSQL maps to the "mysql" dialect,
+    -- so the dialect name alone can't tell it apart). When the engine is unknown,
+    -- only assume support for SQLite.
+    local sr = engine_supports_returning(options.engine);
+    if (sr == nil) then sr = (self._resolved_dialect == "sqlite"); end
+    self._supports_returning = sr;
 
     NormAdapter.__init(self, options); -- light-class: explicit super constructor call
 
@@ -2647,11 +5044,40 @@ function NormNanosAdapter:__init(options)
         self.database = db;
         utils.log("DB", "connected to nanos database '%s' (pool=%d)", tostring(options.connection), options.pool_size);
     end
+
+    -- RETURNING availability on the mysql dialect isn't known from the engine
+    -- alone: nanos `MySQL` may be real MySQL (no RETURNING) OR MariaDB (>= 10.5,
+    -- which supports it). Honour an explicit override, else probe the server once.
+    if (options.returning ~= nil) then
+        self._supports_returning = options.returning == true;
+    elseif (not self._supports_returning and self._resolved_dialect == "mysql") then
+        if (detect_mariadb_returning(self.database)) then
+            self._supports_returning = true;
+            utils.log("DB", "MariaDB >= 10.5 detected: using INSERT ... RETURNING for atomic insertId");
+        end
+    end
 end
 
 ---@return "mysql"|"sqlite"
 function NormNanosAdapter:get_dialect_name()
     return self._resolved_dialect or "sqlite";
+end
+
+--- Nanos' `Database` exposes no transaction API (no Begin/Commit, no connection
+--- pinning across the pool), so transactions are unavailable: `db:transaction(...)`
+--- throws rather than silently running non-atomically.
+---@return boolean
+function NormNanosAdapter:supports_transactions()
+    return false;
+end
+
+--- SQLite, PostgreSQL and MariaDB (>= 10.5, auto-detected at init) support
+--- `INSERT ... RETURNING`, letting the ORM fetch a new id atomically (pool-safe).
+--- Real MySQL does not, and falls back to a best-effort `LAST_INSERT_ID()` query
+--- (see `raw_execute`).
+---@return boolean
+function NormNanosAdapter:supports_returning()
+    return self._supports_returning == true;
 end
 
 --- If nanos-promise is loaded in this package (global `Promise`), use it.
@@ -2679,13 +5105,35 @@ end
 
 --- Nanos binds parameters with NUMBERED placeholders (`:0`, `:1`, ... 0-indexed),
 --- not `?`. Norm's SQL builder emits `?`, so the adapter rewrites them in order.
---- Safe because the builder only ever emits `?` as a placeholder (never inside a
---- string literal; identifiers are backtick-quoted).
+--- Only `?` outside string literals (`'...'`) and quoted identifiers (`` `...` ``)
+--- are treated as placeholders, so a literal `?` in a value/DEFAULT is preserved
+--- (`''` and ``` `` ``` are handled as in-literal escaped quotes).
 ---@param query string
 ---@return string
 local function to_nanos_placeholders(query)
-    local i = -1;
-    return (query:gsub("%?", function() i = i + 1; return ":" .. i; end));
+    local out, i, n, idx = {}, 1, #query, -1;
+    local in_str, in_id = false, false;
+    while (i <= n) do
+        local c = query:sub(i, i);
+        if (in_str) then
+            out[#out + 1] = c;
+            if (c == "'") then
+                if (query:sub(i + 1, i + 1) == "'") then out[#out + 1] = "'"; i = i + 1; -- escaped ''
+                else in_str = false; end
+            end
+        elseif (in_id) then
+            out[#out + 1] = c;
+            if (c == "`") then
+                if (query:sub(i + 1, i + 1) == "`") then out[#out + 1] = "`"; i = i + 1; -- escaped ``
+                else in_id = false; end
+            end
+        elseif (c == "'") then out[#out + 1] = c; in_str = true;
+        elseif (c == "`") then out[#out + 1] = c; in_id = true;
+        elseif (c == "?") then idx = idx + 1; out[#out + 1] = ":" .. idx;
+        else out[#out + 1] = c; end
+        i = i + 1;
+    end
+    return table.concat(out);
 end
 
 --- Internal: run a SELECT (async if available, else synchronous).
@@ -2729,6 +5177,13 @@ function NormNanosAdapter:raw_query(query, params, callback)
     do_select(self.database, query, params, callback);
 end
 
+--- Run a write. For models on SQLite/PostgreSQL the id is fetched via `INSERT ...
+--- RETURNING` (see the model layer), so this path is only used for those engines
+--- by raw `execute()` calls. On MySQL (no RETURNING) inserts fall back to a
+--- separate `LAST_INSERT_ID()` query: this is best-effort, because that function
+--- is connection-scoped and the pool may run it on another connection. Prefer a
+--- client-generated id (or `pool_size = 1`) if a correct insertId is critical on
+--- MySQL + nanos.
 ---@param query string
 ---@param params any[]
 ---@param callback NormExecuteCallback
@@ -2826,6 +5281,12 @@ function NormOxMySQLAdapter:get_dialect_name()
     return "mysql";
 end
 
+--- oxmysql supports interactive transactions via the `startTransaction` export.
+---@return boolean
+function NormOxMySQLAdapter:supports_transactions()
+    return true;
+end
+
 --- FiveM resources have a native `promise` library; use it by default.
 ---@return NormPromiseProvider|nil
 function NormOxMySQLAdapter:default_provider()
@@ -2840,7 +5301,7 @@ end
 ---@return NormJsonProvider|nil
 function NormOxMySQLAdapter:default_json_provider()
     if (type(_ENV.json) == "table") then
-        local ok, provider = pcall(jsonlib.lua, _ENV.json);
+        local ok, provider = pcall(jsonlib.rapidjson, _ENV.json);
         if (ok) then return provider; end
     end
     return nil; -- fall back to auto-detection / raw passthrough
@@ -2874,6 +5335,23 @@ function NormOxMySQLAdapter:raw_execute(query, params, callback)
     self.ox:execute(query, params, function(result)
         callback(nil, normalize(result));
     end);
+end
+
+--- Run an interactive transaction through the `startTransaction` export (the same
+--- one `MySQL.startTransaction` forwards to: `oxmysql:startTransaction(handler)`). The handler's `query(sql, params)` is SYNCHRONOUS (oxmysql awaits
+--- internally), so the ORM's callbacks resolve immediately; the handler returning
+--- `false` (or erroring) rolls back, anything else commits. The export returns the
+--- commit boolean. `body` already returns true=commit / false=rollback.
+---@param body fun(tx_query: fun(q:string,p:any[],cb:function), tx_execute: fun(q:string,p:any[],cb:function)): boolean
+---@param finish fun(err: any)
+function NormOxMySQLAdapter:transaction(body, finish)
+    local committed = self.ox:startTransaction(function(query)
+        return body(
+            function(q, p, cb) cb(nil, query(q, p) or {}); end,     -- tx_query (SELECT)
+            function(q, p, cb) cb(nil, normalize(query(q, p))); end  -- tx_execute (writes)
+        );
+    end);
+    finish(committed and nil or "[norm] transaction rolled back");
 end
 
 ---@class NormOxMySQLAdapterModule
@@ -2911,7 +5389,7 @@ local NormOrm = require("orm");
 ---@field Adapter NormAdapter Base adapter class — extend (or duck-type) for custom adapters.
 ---@field types NormTypes Column type factories.
 ---@field promise NormPromiseLib Promise providers + builders.
----@field json NormJsonLib JSON providers for `json` columns.
+---@field json NormJsonLib JSON providers (`nanos`/`rapidjson`/`raw`/`detect`/`define`) for `json` columns.
 ---@field dialect NormDialects Built-in SQL dialects.
 ---@field adapters NormAdapters Built-in adapters.
 local Norm = {};
