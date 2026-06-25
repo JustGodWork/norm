@@ -25,6 +25,24 @@ local function merge_attrs(a, b)
     return out;
 end
 
+--- Normalise an id argument into a flat array of key values. Accepts a single
+--- value, an array of values, a single record, or an array of records (records
+--- are reduced to their primary key).
+---@param ids any
+---@return any[]
+local function to_id_list(ids)
+    if (ids == nil) then return {}; end
+    if (type(ids) ~= "table") then return { ids }; end
+    if (ids.__model) then return { ids[ids.__model.primary_key] }; end -- a single record
+    local out = {};
+    for i = 1, #ids do
+        local v = ids[i];
+        if (type(v) == "table" and v.__model) then out[#out + 1] = v[v.__model.primary_key];
+        else out[#out + 1] = v; end
+    end
+    return out;
+end
+
 ---@class NormModelModule
 ---@field Record NormRecord
 ---@field Model NormModel
@@ -262,6 +280,159 @@ function NormRecord:delete()
     return model.orm:_execute_map(statement, params, function()
         self.__persisted = false;
         return self;
+    end);
+end
+
+--- Resolve a `belongs_to_many` relation into its pivot coordinates (asserts the
+--- relation exists and is many-to-many).
+---@private
+---@param name string
+---@return table info
+function NormRecord:_pivot_info(name)
+    local model = self.__model;
+    local orm = model.orm;
+    local rel = model.relations[name];
+    utils.assert(rel and rel.kind == "belongs_to_many",
+        ("model '%s' has no belongs_to_many relation '%s'"):format(model.table, name));
+    local target = orm:model(rel.target);
+    utils.assert(target, ("relation '%s': target model '%s' is not defined"):format(name, rel.target));
+    return {
+        orm = orm,
+        d = orm.adapter:get_dialect(),
+        through = rel.through or utils.default_pivot(model.table, target.table),
+        main = rel.key,                                              -- pivot FK -> this model
+        other = rel.otherKey or (utils.singularize(target.table) .. "_id"), -- pivot FK -> target
+        local_value = self[rel.localKey or model.primary_key],
+    };
+end
+
+--- Link this record to one or more `target` rows of a `belongs_to_many` relation
+--- by inserting pivot rows. `ids` is a key value, an array of them, or record(s).
+--- `pivot` adds extra columns to each pivot row. Resolves with the number attached.
+--- ```lua
+---     user:attach("roles", { 1, 2 }):await()
+---     user:attach("roles", role, { granted_by = adminId }):await()
+--- ```
+---@param name string Relation name.
+---@param ids any Key value(s) or record(s) on the target side.
+---@param pivot? table<string, any> Extra pivot-row columns.
+---@return NormNumberPromise promise resolving to the number of rows inserted
+function NormRecord:attach(name, ids, pivot)
+    local info = self:_pivot_info(name);
+    local list = to_id_list(ids);
+    local orm = info.orm;
+    return orm.provider.new(function(resolve, reject)
+        if (info.local_value == nil) then
+            return reject("[norm] attach: this record has no key value yet (save it first)");
+        end
+        if (#list == 0) then return resolve(0); end
+        local i = 0;
+        local function step()
+            i = i + 1;
+            if (i > #list) then return resolve(#list); end
+            local row = { [info.main] = info.local_value, [info.other] = list[i] };
+            if (pivot) then for k, v in pairs(pivot) do row[k] = v; end end
+            local statement, params = sqlmod.insert(info.through, row, info.d);
+            orm:_trace(statement, params);
+            orm.adapter:raw_execute(statement, params, function(err)
+                if (err ~= nil) then return reject(err); end
+                step();
+            end);
+        end
+        step();
+    end);
+end
+
+--- Unlink this record from `target` rows of a `belongs_to_many` relation by
+--- deleting pivot rows. With `ids` -> only those; without -> ALL links. Resolves
+--- with the affected row count.
+--- ```lua
+---     user:detach("roles", { 1 }):await()  -- remove one link
+---     user:detach("roles"):await()          -- remove every link
+--- ```
+---@param name string Relation name.
+---@param ids? any Key value(s) or record(s); omit to detach everything.
+---@return NormNumberPromise promise resolving to the number of rows deleted
+function NormRecord:detach(name, ids)
+    local info = self:_pivot_info(name);
+    local orm = info.orm;
+    local list = (ids ~= nil) and to_id_list(ids) or nil;
+    return orm.provider.new(function(resolve, reject)
+        if (info.local_value == nil) then return resolve(0); end
+        if (list and #list == 0) then return resolve(0); end -- explicit empty set: no-op
+        local wheres = { { column = info.main, op = "=", value = info.local_value } };
+        if (list) then wheres[#wheres + 1] = { column = info.other, op = "IN", value = list }; end
+        local statement, params = sqlmod.delete({ table = info.through, wheres = wheres }, info.d);
+        orm:_trace(statement, params);
+        orm.adapter:raw_execute(statement, params, function(err, res)
+            if (err ~= nil) then return reject(err); end
+            resolve((res and res.affectedRows) or 0);
+        end);
+    end);
+end
+
+--- Make this record's pivot links for a `belongs_to_many` relation exactly match
+--- `ids`: attach the missing, detach the extra, leave the rest. Resolves with
+--- `{ attached = n, detached = m }`.
+--- ```lua
+---     user:sync_pivot("roles", { 1, 2, 3 }):await()
+--- ```
+---@param name string Relation name.
+---@param ids any Key value(s) or record(s) that should remain linked.
+---@return NormPromise promise resolving to { attached: number, detached: number }
+function NormRecord:sync_pivot(name, ids)
+    local info = self:_pivot_info(name);
+    local orm = info.orm;
+    local desired = to_id_list(ids);
+    return orm.provider.new(function(resolve, reject)
+        if (info.local_value == nil) then
+            return reject("[norm] sync_pivot: this record has no key value yet (save it first)");
+        end
+        local sel, sparams = sqlmod.select({
+            table = info.through, columns = { info.other },
+            wheres = { { column = info.main, op = "=", value = info.local_value } },
+        }, info.d);
+        orm:_trace(sel, sparams);
+        orm.adapter:raw_query(sel, sparams, function(err, rows)
+            if (err ~= nil) then return reject(err); end
+            rows = rows or {};
+            local current, desired_set = {}, {};
+            for i = 1, #rows do current[rows[i][info.other]] = true; end
+            for i = 1, #desired do desired_set[desired[i]] = true; end
+            local to_attach, to_detach = {}, {};
+            for i = 1, #desired do if (not current[desired[i]]) then to_attach[#to_attach + 1] = desired[i]; end end
+            for id in pairs(current) do if (not desired_set[id]) then to_detach[#to_detach + 1] = id; end end
+
+            local function do_attach()
+                local i = 0;
+                local function step()
+                    i = i + 1;
+                    if (i > #to_attach) then return resolve({ attached = #to_attach, detached = #to_detach }); end
+                    local statement, params = sqlmod.insert(info.through,
+                        { [info.main] = info.local_value, [info.other] = to_attach[i] }, info.d);
+                    orm:_trace(statement, params);
+                    orm.adapter:raw_execute(statement, params, function(ierr)
+                        if (ierr ~= nil) then return reject(ierr); end
+                        step();
+                    end);
+                end
+                step();
+            end
+
+            if (#to_detach == 0) then return do_attach(); end
+            local statement, params = sqlmod.delete({
+                table = info.through,
+                wheres = {
+                    { column = info.main, op = "=", value = info.local_value },
+                    { column = info.other, op = "IN", value = to_detach },
+                },
+            }, info.d);
+            orm:_trace(statement, params);
+            orm.adapter:raw_execute(statement, params, function(derr)
+                if (derr ~= nil) then return reject(derr); end
+                do_attach();
+            end);
+        end);
     end);
 end
 
