@@ -52,7 +52,9 @@ local function make_database(engine, conn)
     end
     function db:SelectAsync(q, cb, ...)
         self.calls[#self.calls + 1] = { kind = "select", q = q, params = { ... } };
-        if (q:find("last_insert_rowid", 1, true) or q:find("LAST_INSERT_ID", 1, true)) then
+        -- INSERT ... RETURNING (sqlite/postgres) and the legacy LAST_INSERT_ID
+        -- fallback both yield the new id row.
+        if (q:find("RETURNING", 1, true) or q:find("last_insert_rowid", 1, true) or q:find("LAST_INSERT_ID", 1, true)) then
             cb({ { id = 7 } });
         else
             cb(self.rows);
@@ -93,22 +95,26 @@ async(function()
 end);
 
 check("sync completed via async/await", results.synced == true);
-check("insertId via last_insert_rowid()", results.created_id == 7, results.created_id);
+check("insertId via RETURNING", results.created_id == 7, results.created_id);
 check("record persisted after create", results.persisted == true);
 check("find returned wrapped record", results.found_name == "John", results.found_name);
 check("boolean parsed from int", results.found_admin == true, tostring(results.found_admin));
 
--- verify the adapter actually issued the last-insert-id query
-local issued_lastid = false;
+-- sqlite supports RETURNING: the INSERT must carry it AND no separate
+-- last_insert_rowid query may be issued (that path is connection-pool unsafe).
+local issued_returning, issued_lastid = false, false;
 for _, c in ipairs(adapter.database.calls) do
-    if (c.kind == "select" and c.q:find("last_insert_rowid", 1, true)) then issued_lastid = true; end
+    if (c.q:find("RETURNING", 1, true)) then issued_returning = true; end
+    if (c.q:find("last_insert_rowid", 1, true)) then issued_lastid = true; end
 end
-check("adapter queried last_insert_rowid", issued_lastid);
+check("adapter uses INSERT ... RETURNING", issued_returning);
+check("no separate last_insert_rowid query (pool-safe)", not issued_lastid);
 
--- verify INSERT parameters were bound as VARARGS (the NOT NULL bug fix)
+-- verify INSERT parameters were bound as VARARGS (the NOT NULL bug fix).
+-- With RETURNING the insert is routed through SelectAsync, so look in all calls.
 local insert_call;
 for _, c in ipairs(adapter.database.calls) do
-    if (c.kind == "exec" and c.q:find("^%s*INSERT")) then insert_call = c; end
+    if (c.q:find("^%s*INSERT")) then insert_call = c; end
 end
 -- INSERT INTO `users` (`admin`, `name`) VALUES (?, ?) -> params {1, "John"}
 check("insert bound 2 varargs params", insert_call and #insert_call.params == 2, insert_call and #insert_call.params);

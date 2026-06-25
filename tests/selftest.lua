@@ -479,8 +479,41 @@ local fakeJSON = { stringify = function(v) return "S(" .. tostring(v.x) .. ")"; 
 local np = orm.json.nanos(fakeJSON);
 check("json.nanos wraps stringify/parse", np.encode({ x = 3 }) == "S(3)" and np.decode("z").p == "z");
 local fakejson = { encode = function(_) return "E"; end, decode = function(_) return "D"; end };
-local lp = orm.json.lua(fakejson);
-check("json.lua wraps encode/decode", lp.encode({}) == "E" and lp.decode("x") == "D");
+local lp = orm.json.rapidjson(fakejson);
+check("json.rapidjson wraps encode/decode", lp.encode({}) == "E" and lp.decode("x") == "D");
+
+-- ===============================================================
+print("== Test group 11: INSERT ... RETURNING (returning-capable adapter) ==");
+-- An adapter that advertises RETURNING support must have its inserts routed
+-- through raw_query (the statement returns a row), with the id read from that
+-- row — never from raw_execute's insertId (which we deliberately leave nil here).
+local RMock = class.extend("ReturningMock", orm.Adapter);
+function RMock:__init(opts)
+    orm.Adapter.__init(self, opts);
+    self.calls = {};
+end
+function RMock:supports_returning() return true; end
+function RMock:raw_query(q, p, cb)
+    self.calls[#self.calls + 1] = { kind = "query", sql = q, params = p };
+    if (q:find("RETURNING", 1, true)) then cb(nil, { { id = 99 } }); else cb(nil, {}); end
+end
+function RMock:raw_execute(q, p, cb)
+    self.calls[#self.calls + 1] = { kind = "execute", sql = q, params = p };
+    cb(nil, { affectedRows = 1 }); -- NO insertId on purpose: id must come from RETURNING
+end
+
+local rmock = RMock({ dialect = "sqlite" });
+local rdb = orm.new({ adapter = rmock, promise = orm.promise.builtin() });
+local RUser = rdb:define("players", { id = orm.types.id(), name = orm.types.string() });
+
+local rcreated;
+RUser:create({ name = "Zoe" }):next(function(u) rcreated = u; end);
+local rlast = rmock.calls[#rmock.calls];
+check("returning: insert routed through raw_query", rlast.kind == "query", rlast.kind);
+check("returning: INSERT ... RETURNING `id` emitted", rlast.sql:find("RETURNING `id`", 1, true) ~= nil, rlast.sql);
+check("returning: insert omits autoincrement id", rlast.sql:find("(`id`", 1, true) == nil);
+check("returning: id read from RETURNING row", rcreated and rcreated.id == 99, rcreated and rcreated.id);
+check("returning: record persisted", rcreated and rcreated.__persisted == true);
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
 if (failed > 0) then error("self-test failed"); end
