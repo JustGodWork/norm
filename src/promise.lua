@@ -10,6 +10,7 @@
 --- providers need NOT support chaining. That lets us plug in even tiny promise
 --- libraries (such as the nanos one).
 local class = class; -- light-class global (loaded before this bundle)
+local utils = require("utils");
 
 --- A promise provider plugs a framework's promise type into Norm.
 --- Built-in builders: `Norm.promise.builtin|nanos|cfx`. Validate a custom one
@@ -61,7 +62,16 @@ function NormPromise:_settle(state, value)
     if (self._await_co) then
         local co = self._await_co;
         self._await_co = nil;
-        coroutine.resume(co);
+        local ok, err = coroutine.resume(co);
+        if (not ok) then
+            -- The awaited continuation raised AFTER being resumed here. resume()
+            -- captured the error and there's no caller to propagate it to, so
+            -- surface it — otherwise it vanishes and the coroutine looks like it
+            -- silently hung. A traceback of the (dead) coroutine pinpoints the line.
+            local tb = (type(debug) == "table" and debug.traceback)
+                and debug.traceback(co, tostring(err)) or tostring(err);
+            utils.logger("ERROR", "uncaught error after await: " .. tb);
+        end
     end
 end
 
