@@ -893,5 +893,37 @@ check("sync_pivot computes attach/detach counts", synced and synced.attached == 
 check("sync_pivot deletes the removed id", count_matching(pm, "DELETE FROM `role_user`") == 1);
 check("sync_pivot inserts the new id", count_matching(pm, "INSERT INTO `role_user`") == 1);
 
+-- ===============================================================
+print("== Test group 19: joins (filter/sort by a related column) ==");
+local jm = Mock({ dialect = "mysql" });
+jm.query_result = { { id = 10, user_id = 1, title = "A" } };
+local jdb = orm.new({ adapter = jm, promise = orm.promise.builtin() });
+local Post = jdb:define("posts", {
+    id = orm.types.id(), user_id = orm.types.integer(), title = orm.types.string({ length = 120 }),
+});
+
+-- inner join + filter by a joined column + project main.* so :all() still wraps
+local posts;
+Post:join("users", "users.id", "=", "posts.user_id")
+    :where("users.admin", true)
+    :select_raw("`posts`.*")
+    :all():next(function(r) posts = r; end);
+local jsql = last_sql(jm);
+print("  JOIN: " .. jsql);
+check("inner join clause emitted",
+    jsql:find("INNER JOIN `users` ON `users`.`id` = `posts`.`user_id`", 1, true) ~= nil, jsql);
+check("where on qualified column", jsql:find("WHERE `users`.`admin` = ?", 1, true) ~= nil, jsql);
+check("select_raw projects the main table", jsql:find("SELECT `posts`.* FROM `posts`", 1, true) ~= nil, jsql);
+check("joined rows still wrap into records", posts and posts[1] and posts[1].title == "A", posts and posts[1] and posts[1].title);
+
+-- left join, 3-arg form (default `=`), order by a joined column
+jm.query_result = {};
+Post:left_join("users", "users.id", "posts.user_id"):order("users.name", "DESC"):all();
+local lsql = last_sql(jm);
+print("  LEFT: " .. lsql);
+check("left join clause emitted",
+    lsql:find("LEFT JOIN `users` ON `users`.`id` = `posts`.`user_id`", 1, true) ~= nil, lsql);
+check("order by a qualified column", lsql:find("ORDER BY `users`.`name` DESC", 1, true) ~= nil, lsql);
+
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
 if (failed > 0) then error("self-test failed"); end
