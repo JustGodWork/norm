@@ -780,5 +780,59 @@ check("group_by emits GROUP BY", gsql:find("GROUP BY `faction`", 1, true) ~= nil
 check("having emits HAVING with a bound param", gsql:find("HAVING COUNT(*) > ?", 1, true) ~= nil, gsql);
 check("rows() returns raw rows (no wrapping)", stats and #stats == 2 and stats[1].faction == "red", stats and #stats);
 
+-- ===============================================================
+print("== Test group 17: migrations ==");
+local function find_sql(mock, needle)
+    for _, c in ipairs(mock.calls) do if (c.sql:find(needle, 1, true)) then return c.sql; end end
+end
+
+-- fresh DB: nothing applied -> both migrations run, in order, and get recorded
+local mm = Mock({ dialect = "sqlite" });
+local mdb = orm.new({ adapter = mm, promise = orm.promise.builtin() });
+mm.query_result = {};
+local applied;
+mdb:migrate({
+    { id = "001_add_last_seen", up = function(m)
+        m:add_column("players", "last_seen", orm.types.datetime());
+        m:add_index("players", "idx_acc", { "account_id" }, { unique = true });
+    end },
+    { id = "002_drop_temp", up = function(m) m:drop_column("players", "temp"); end },
+}):next(function(list) applied = list; end);
+
+check("migrate creates the tracking table", find_sql(mm, "CREATE TABLE IF NOT EXISTS `norm_migrations`") ~= nil);
+check("migrate string PK is TEXT on sqlite (not forced INTEGER)",
+    (function() local s = find_sql(mm, "norm_migrations"); return s and s:find("`id` TEXT PRIMARY KEY", 1, true) ~= nil, s; end)());
+check("migrate emits ADD COLUMN", find_sql(mm, "ALTER TABLE `players` ADD COLUMN `last_seen`") ~= nil);
+check("migrate emits CREATE UNIQUE INDEX", find_sql(mm, "CREATE UNIQUE INDEX `idx_acc` ON `players` (`account_id`)") ~= nil);
+check("migrate emits DROP COLUMN", find_sql(mm, "ALTER TABLE `players` DROP COLUMN `temp`") ~= nil);
+check("migrate records applied ids", find_sql(mm, "INSERT INTO `norm_migrations`") ~= nil);
+check("migrate returns the applied list", applied and #applied == 2, applied and #applied);
+
+-- idempotency: 001 already applied -> only 002 runs
+local mm2 = Mock({ dialect = "sqlite" });
+local mdb2 = orm.new({ adapter = mm2, promise = orm.promise.builtin() });
+mm2.query_result = { { id = "001_add_last_seen" } };
+local applied2;
+mdb2:migrate({
+    { id = "001_add_last_seen", up = function(m) m:add_column("players", "x", orm.types.integer()); end },
+    { id = "002_drop_temp", up = function(m) m:drop_column("players", "temp"); end },
+}):next(function(list) applied2 = list; end);
+check("migrate skips already-applied", applied2 and #applied2 == 1 and applied2[1] == "002_drop_temp", applied2 and applied2[1]);
+check("migrate does not re-run an applied migration", find_sql(mm2, "ADD COLUMN `x`") == nil);
+
+-- drop_index dialect difference
+local mmx = Mock({ dialect = "mysql" });
+local mdbx = orm.new({ adapter = mmx, promise = orm.promise.builtin() });
+mmx.query_result = {};
+mdbx:migrate({ { id = "di", up = function(m) m:drop_index("idx_acc", "players"); end } });
+check("mysql drop_index targets the table", find_sql(mmx, "DROP INDEX `idx_acc` ON `players`") ~= nil);
+
+local mms = Mock({ dialect = "sqlite" });
+local mdbs = orm.new({ adapter = mms, promise = orm.promise.builtin() });
+mms.query_result = {};
+mdbs:migrate({ { id = "di", up = function(m) m:drop_index("idx_acc", "players"); end } });
+check("sqlite drop_index omits ON table",
+    find_sql(mms, "DROP INDEX `idx_acc`") ~= nil and find_sql(mms, "DROP INDEX `idx_acc` ON") == nil);
+
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
 if (failed > 0) then error("self-test failed"); end
