@@ -1019,5 +1019,54 @@ check("omit is not SELECT *", osql:find("SELECT *", 1, true) == nil, osql);
 check("omitted column is absent on the record", omitted and omitted.password == nil and omitted.name == "Al",
     omitted and omitted.name);
 
+-- ===============================================================
+print("== Test group 23: include with options (where / order / limit per parent) ==");
+local im = Routed({ dialect = "mysql" });
+im.rows.users = { { id = 1, name = "A" }, { id = 2, name = "B" } };
+im.rows.posts = {
+    { id = 10, user_id = 1, published = 1, created_at = "2026-01-03" },
+    { id = 11, user_id = 1, published = 1, created_at = "2026-01-02" },
+    { id = 12, user_id = 1, published = 1, created_at = "2026-01-01" },
+    { id = 13, user_id = 2, published = 1, created_at = "2026-01-05" },
+};
+im.rows.comments = { { id = 100, post_id = 10 }, { id = 101, post_id = 11 } };
+local idb = orm.new({ adapter = im, promise = orm.promise.builtin() });
+local IUser = idb:define("users", {
+    id = orm.types.id(), name = orm.types.string({ length = 32 }),
+    posts = orm.types.hasMany("posts", { key = "user_id" }),
+});
+idb:define("posts", {
+    id = orm.types.id(), user_id = orm.types.integer(),
+    published = orm.types.boolean(), created_at = orm.types.datetime(),
+    comments = orm.types.hasMany("comments", { key = "post_id" }),
+});
+idb:define("comments", { id = orm.types.id(), post_id = orm.types.integer() });
+
+-- options: where + order + per-parent limit
+im.queries = {};
+local iusers;
+IUser:query():include("posts", function(q)
+    q:where("published", true):order("created_at", "DESC"):limit(2);
+end):all():next(function(r) iusers = r; end);
+local posts_sql;
+for _, q in ipairs(im.queries) do if (q:find("FROM `posts`", 1, true)) then posts_sql = q; end end
+print("  POSTS: " .. tostring(posts_sql));
+check("include options: WHERE merged onto the relation", posts_sql and posts_sql:find("`published` = ?", 1, true) ~= nil, posts_sql);
+check("include options: IN still present (batched)", posts_sql and posts_sql:find("`user_id` IN", 1, true) ~= nil, posts_sql);
+check("include options: ORDER BY emitted", posts_sql and posts_sql:find("ORDER BY `created_at` DESC", 1, true) ~= nil, posts_sql);
+check("include options: limit applied PER PARENT", iusers and #iusers[1].posts == 2, iusers and #iusers[1].posts);
+check("include options: other parent unaffected", iusers and #iusers[2].posts == 1, iusers and #iusers[2].posts);
+check("include options: still 2 queries (no N+1)", #im.queries == 2, #im.queries);
+
+-- nested configurator: posts -> comments
+im.queries = {};
+local iu2;
+IUser:query():include("posts", function(q)
+    q:include("comments", function(c) c:order("id", "ASC"); end);
+end):all():next(function(r) iu2 = r; end);
+check("nested configurator loads the deeper relation",
+    iu2 and iu2[1].posts[1] and iu2[1].posts[1].comments ~= nil);
+check("nested configurator still batched (3 queries)", #im.queries == 3, #im.queries);
+
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
 if (failed > 0) then error("self-test failed"); end
