@@ -1369,6 +1369,37 @@ check("paginate count query honours the WHERE", (function()
     end
     return false;
 end)());
+end do
+print("== Test group 30: insert_many ==");
+local bm = Mock({ dialect = "sqlite" });
+local bdb = orm.new({ adapter = bm, promise = orm.promise.builtin() });
+local Log = bdb:define("logs", {
+    id = orm.types.id(), level = orm.types.string({ length = 8 }), msg = orm.types.string({ length = 64 }),
+});
+
+local n;
+Log:insert_many({ { level = "info", msg = "a" }, { level = "warn", msg = "b" }, { level = "info" } }):next(function(c) n = c; end);
+local bsql = last_sql(bm);
+print("  BULK: " .. bsql);
+check("insert_many builds one multi-row INSERT", bsql:find("INSERT INTO `logs` (`level`, `msg`) VALUES (", 1, true) ~= nil, bsql);
+check("insert_many NULLs a column missing from a row", bsql:find("NULL", 1, true) ~= nil, bsql);
+check("insert_many binds every present value (5)", #bm.calls[#bm.calls].params == 5, #bm.calls[#bm.calls].params);
+check("insert_many resolves a count", type(n) == "number", n);
+
+-- empty input is a no-op resolving 0
+local z;
+Log:insert_many({}):next(function(c) z = c; end);
+check("insert_many empty resolves 0", z == 0, z);
+
+-- timestamps are stamped on every row
+local tm = Mock({ dialect = "sqlite" });
+local tdb = orm.new({ adapter = tm, promise = orm.promise.builtin() });
+local Ev = tdb:define("events", { id = orm.types.id(), name = orm.types.string({ length = 16 }) }, { timestamps = true });
+Ev:insert_many({ { name = "x" }, { name = "y" } });
+check("insert_many stamps timestamps", (function()
+    local s = last_sql(tm);
+    return s:find("`created_at`", 1, true) ~= nil and s:find("`updated_at`", 1, true) ~= nil;
+end)());
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
