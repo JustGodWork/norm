@@ -4,6 +4,7 @@ local class = class;
 local utils = require("utils");
 local NormAdapter = require("adapter");
 local promise = require("promise");
+local jsonlib = require("json");
 
 ---@class NormNanosAdapterOptions: NormAdapterOptions
 ---@field engine? integer A `DatabaseEngine` enum value (required unless `database` is given).
@@ -73,6 +74,17 @@ function NormNanosAdapter:default_provider()
         if (ok) then return provider; end
     end
     return nil; -- fall back to the built-in provider
+end
+
+--- Nanos exposes a global `JSON` class (`stringify`/`parse`); use it to
+--- (de)serialise `json` columns automatically.
+---@return NormJsonProvider|nil
+function NormNanosAdapter:default_json_provider()
+    if (type(_ENV.JSON) == "table") then
+        local ok, provider = pcall(jsonlib.nanos, _ENV.JSON);
+        if (ok) then return provider; end
+    end
+    return nil; -- fall back to auto-detection / raw passthrough
 end
 
 --- Nanos binds parameters with NUMBERED placeholders (`:0`, `:1`, ... 0-indexed),

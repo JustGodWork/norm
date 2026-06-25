@@ -3,6 +3,7 @@ local class = class;
 local utils = require("utils");
 local NormAdapter = require("adapter");
 local promise = require("promise");
+local jsonlib = require("json");
 
 ---@class NormOxMySQLAdapterOptions: NormAdapterOptions
 ---@field oxmysql? table Inject the oxmysql export (defaults to `exports.oxmysql`).
@@ -55,6 +56,17 @@ function NormOxMySQLAdapter:default_provider()
         return promise.cfx(_ENV.promise);
     end
     return nil;
+end
+
+--- FiveM exposes a global `json` (`encode`/`decode`); use it to (de)serialise
+--- `json` columns automatically.
+---@return NormJsonProvider|nil
+function NormOxMySQLAdapter:default_json_provider()
+    if (type(_ENV.json) == "table") then
+        local ok, provider = pcall(jsonlib.lua, _ENV.json);
+        if (ok) then return provider; end
+    end
+    return nil; -- fall back to auto-detection / raw passthrough
 end
 
 ---@param result number|table
