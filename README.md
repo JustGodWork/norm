@@ -82,11 +82,13 @@ support, which is why even a minimal promise library works.
 
 ## API
 
-### `Norm.new({ adapter, promise?, log?, logger?, foreignKeys? })` → ORM
+### `Norm.new({ adapter, promise?, log?, logger?, foreignKeys?, json? })` → ORM
 `promise` defaults to the adapter's `default_provider()`, then to the built-in
 provider. Passing a raw promise *class* (e.g. `promise = Promise`) auto-wraps it.
 `foreignKeys` (`"auto"` default / `true` / `false`) controls SQL `FOREIGN KEY`
-emission in `sync()` — see [Foreign keys](#foreign-keys).
+emission in `sync()` — see [Foreign keys](#foreign-keys). `json` (`"auto"` default
+/ a provider / `false`) controls `json` column (de)serialisation — see
+[JSON columns](#json-columns).
 
 ### Column types — `Norm.types`
 `id, integer, bigint, string, text, float, double, boolean, datetime, date, json`,
@@ -179,6 +181,26 @@ SQLite only enforces FKs when `PRAGMA foreign_keys = ON`, which is per-connectio
 and off by default — Norm can't guarantee it across a pool, hence the `"auto"`
 skip. Use `foreignKeys = false` to silence the warning, or handle cascades in
 application code (delete children before the parent).
+
+## JSON columns
+
+A `json` column is (de)serialised automatically: assign a Lua table, read a Lua
+table back. The provider is resolved from the `json` option, then the adapter's
+default, then auto-detection (Nanos `JSON`, then a Lua/FiveM `json`), else a no-op
+raw passthrough.
+
+```lua
+local Char = db:define("characters", { id = Norm.types.id(), pos = Norm.types.json() })
+
+local c = Char:create({ pos = { x = 1, y = 2 } }):await() -- stored as '{"x":1,"y":2}'
+local r = Char:find(c.id):await()
+print(r.pos.x) -- 1  (decoded back to a table)
+```
+
+Providers (`Norm.json`): `nanos(JSON)` (stringify/parse), `lua(json)`
+(encode/decode), `raw()` (no-op), `define{ encode, decode }` (custom). Pass one
+as the `json` option, or `json = false` to keep `json` columns as raw strings.
+A value already a string is passed through unchanged (no double-encoding).
 
 ## Promises & `await`
 
