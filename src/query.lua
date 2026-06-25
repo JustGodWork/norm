@@ -47,13 +47,18 @@ local function add_join(self, jtype, table_name, first, op, second)
     return self;
 end
 
---- Eager-load the given relations with the result (one batched query per
---- relation — no N+1), attaching them to each returned record.
+--- Eager-load the given relations with the result (one batched query per relation
+--- level — no N+1), attaching them to each returned record. Nest with a dotted
+--- path to load a relation of a relation (`"posts.comments"`); shared prefixes are
+--- loaded once.
 --- ```lua
 ---     local users = User:query():include("posts", "profile"):all():await()
 ---     print(#users[1].posts)
+---     -- nested: each user's posts, and each of those posts' comments
+---     local u = User:query():include("posts.comments"):all():await()
+---     print(#u[1].posts[1].comments)
 --- ```
----@param ... string relation names declared in the model's schema
+---@param ... string relation names (or dotted nested paths) declared in the schema
 ---@return NormQueryBuilder self
 function NormQueryBuilder:include(...)
     self._state.includes = self._state.includes or {};
@@ -71,6 +76,28 @@ function NormQueryBuilder:select(...)
     local args = { ... };
     if (#args == 1 and type(args[1]) == "table") then args = args[1]; end
     self._state.columns = args;
+    return self;
+end
+
+--- Inverse of `select`: select every column of the model EXCEPT the given ones
+--- (e.g. to drop a `password` / large blob without listing all the others). The
+--- omitted columns are simply absent from the returned records.
+--- ```lua
+---     local u = User:omit("password"):find(1):await()
+--- ```
+---@param ... string|string[]
+---@return NormQueryBuilder self
+function NormQueryBuilder:omit(...)
+    local omitted = { ... };
+    if (#omitted == 1 and type(omitted[1]) == "table") then omitted = omitted[1]; end
+    local skip = {};
+    for i = 1, #omitted do skip[omitted[i]] = true; end
+    local cols = {};
+    for i = 1, #self.model.columns do
+        local name = self.model.columns[i].name;
+        if (not skip[name]) then cols[#cols + 1] = name; end
+    end
+    self._state.columns = cols;
     return self;
 end
 
