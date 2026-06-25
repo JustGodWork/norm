@@ -524,4 +524,118 @@ function NormOrm:sync()
     end);
 end
 
+--- Schema-change builder handed to a migration's `up(m)`. Each call appends a DDL
+--- statement (dialect-aware) to be run in order. Chainable.
+---@param d NormDialect
+---@return table
+local function make_migration_builder(d)
+    local b = { _statements = {} };
+    local function push(stmt) b._statements[#b._statements + 1] = stmt; end
+    --- Add a column. `descriptor` is a `Norm.types.*` value.
+    function b:add_column(table_name, name, descriptor)
+        local col = utils.copy(descriptor); col.name = name;
+        push(sqlmod.add_column(table_name, col, d)); return self;
+    end
+    function b:drop_column(table_name, name) push(sqlmod.drop_column(table_name, name, d)); return self; end
+    function b:rename_column(table_name, from, to) push(sqlmod.rename_column(table_name, from, to, d)); return self; end
+    --- `opts.unique` for a UNIQUE index.
+    function b:add_index(table_name, index_name, columns, opts)
+        opts = opts or {};
+        push(sqlmod.add_index(table_name, index_name, columns, opts.unique == true, d)); return self;
+    end
+    function b:drop_index(index_name, table_name) push(sqlmod.drop_index(index_name, table_name, d)); return self; end
+    function b:drop_table(table_name) push(sqlmod.drop_table(table_name, d)); return self; end
+    --- Raw DDL escape hatch (run verbatim).
+    function b:raw(statement) push(statement); return self; end
+    return b;
+end
+
+---@class NormMigration
+---@field id string Unique, stable identifier (applied once). Order them by sorting-friendly ids.
+---@field up fun(m: table) Receives the schema builder; record changes via m:add_column(...) etc.
+
+--- Run pending schema migrations in order, recording applied ones in a
+--- `norm_migrations` table so each runs exactly once. Idempotent: re-running
+--- applies only what's new. Resolves with the list of ids applied this run.
+--- ```lua
+---     db:migrate({
+---         { id = "2026_06_25_add_last_seen", up = function(m)
+---             m:add_column("players", "last_seen", Norm.types.datetime())
+---             m:add_index("players", "idx_players_account", { "account_id" }, { unique = true })
+---         end },
+---     }):await()
+--- ```
+---@param migrations NormMigration[]
+---@return NormPromise promise resolving to string[] (applied ids)
+function NormOrm:migrate(migrations)
+    utils.assert(type(migrations) == "table", "Norm: migrate() needs a list of migrations");
+    for i = 1, #migrations do
+        utils.assert(type(migrations[i].id) == "string", "Norm: each migration needs a string `id`");
+        utils.assert(type(migrations[i].up) == "function", "Norm: each migration needs an `up` function");
+    end
+
+    local d = self.adapter:get_dialect();
+    local create = sqlmod.create_table("norm_migrations", {
+        { name = "id", kind = "string", length = 191, primary = true, nullable = false },
+        { name = "applied_at", kind = "datetime", nullable = true },
+    }, d);
+    local now;
+    if (type(os) == "table" and type(os.date) == "function") then
+        local ok, s = pcall(os.date, "!%Y-%m-%d %H:%M:%S");
+        if (ok) then now = s; end
+    end
+
+    return self.provider.new(function(resolve, reject)
+        self:_trace(create, {});
+        self.adapter:raw_execute(create, {}, function(cerr)
+            if (cerr ~= nil) then return reject(cerr); end
+            local list_sql = ("SELECT %s FROM %s"):format(d.quote("id"), d.quote("norm_migrations"));
+            self:_trace(list_sql, {});
+            self.adapter:raw_query(list_sql, {}, function(qerr, rows)
+                if (qerr ~= nil) then return reject(qerr); end
+                rows = rows or {};
+                local done = {};
+                for i = 1, #rows do done[rows[i].id] = true; end
+
+                local applied, index = {}, 0;
+                local function next_migration()
+                    index = index + 1;
+                    local mig = migrations[index];
+                    if (not mig) then return resolve(applied); end
+                    if (done[mig.id]) then return next_migration(); end
+
+                    local builder = make_migration_builder(d);
+                    local ok, err = pcall(mig.up, builder);
+                    if (not ok) then return reject(err); end
+                    local statements = builder._statements;
+
+                    local si = 0;
+                    local function run_next()
+                        si = si + 1;
+                        if (si > #statements) then
+                            -- record this migration as applied.
+                            local ins, iparams = sqlmod.insert("norm_migrations",
+                                { id = mig.id, applied_at = now }, d);
+                            self:_trace(ins, iparams);
+                            self.adapter:raw_execute(ins, iparams, function(ierr)
+                                if (ierr ~= nil) then return reject(ierr); end
+                                applied[#applied + 1] = mig.id;
+                                next_migration();
+                            end);
+                            return;
+                        end
+                        self:_trace(statements[si], {});
+                        self.adapter:raw_execute(statements[si], {}, function(serr)
+                            if (serr ~= nil) then return reject(serr); end
+                            run_next();
+                        end);
+                    end
+                    run_next();
+                end
+                next_migration();
+            end);
+        end);
+    end);
+end
+
 return NormOrm;
