@@ -159,12 +159,18 @@ local function compile_where(wheres, d, params)
             local negated = (op == "!=" or op == "<>" or op == "NOT");
             frag = col .. (negated and " IS NOT NULL" or " IS NULL");
         elseif (op == "IN" or op == "NOT IN") then
-            local marks = {};
-            for j = 1, #cond.value do
-                params[#params + 1] = normalize(cond.value[j]);
-                marks[#marks + 1] = d.placeholder(#params);
+            if (#cond.value == 0) then
+                -- `IN ()` / `NOT IN ()` is invalid SQL. Emit a constant predicate
+                -- instead: IN nothing is always false, NOT IN nothing always true.
+                frag = (op == "IN") and "1 = 0" or "1 = 1";
+            else
+                local marks = {};
+                for j = 1, #cond.value do
+                    params[#params + 1] = normalize(cond.value[j]);
+                    marks[#marks + 1] = d.placeholder(#params);
+                end
+                frag = ("%s %s (%s)"):format(col, op, table.concat(marks, ", "));
             end
-            frag = ("%s %s (%s)"):format(col, op, table.concat(marks, ", "));
         else
             params[#params + 1] = normalize(cond.value);
             frag = ("%s %s %s"):format(col, op, d.placeholder(#params));
