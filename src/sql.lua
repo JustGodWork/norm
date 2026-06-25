@@ -140,6 +140,61 @@ function sql.insert(table_name, data, d, returning)
     return statement, params;
 end
 
+--- INSERT with an atomic "on conflict, update" clause (upsert). Dialect-aware:
+--- MySQL/MariaDB emit `ON DUPLICATE KEY UPDATE col = VALUES(col)`; SQLite/Postgres
+--- emit `ON CONFLICT (target) DO UPDATE SET col = excluded.col`. `conflict_cols`
+--- (the unique/PK columns) define the SQLite/Postgres target. With no `update_cols`
+--- the conflict is a no-op (`DO NOTHING`).
+---@param table_name string
+---@param data table<string, any>
+---@param conflict_cols string[] Unique/PK columns identifying a conflict.
+---@param update_cols string[] Columns to overwrite on conflict (may be empty).
+---@param d NormDialect
+---@return string statement, any[] params
+function sql.upsert(table_name, data, conflict_cols, update_cols, d)
+    local cols, marks, params = {}, {}, {};
+    for _, key in ipairs(utils.sorted_keys(data)) do
+        local value = data[key];
+        cols[#cols + 1] = d.quote(key);
+        if (value == nil) then
+            marks[#marks + 1] = "NULL";
+        else
+            params[#params + 1] = normalize(value);
+            marks[#marks + 1] = d.placeholder(#params);
+        end
+    end
+    local head = ("INSERT INTO %s (%s) VALUES (%s)"):format(
+        d.quote(table_name), table.concat(cols, ", "), table.concat(marks, ", "));
+
+    if (d.name == "mysql") then
+        if (#update_cols == 0) then
+            -- keep the statement valid: a no-op assignment on the first conflict col.
+            local c = d.quote(conflict_cols[1]);
+            return head .. " ON DUPLICATE KEY UPDATE " .. c .. " = " .. c, params;
+        end
+        local sets = {};
+        for i = 1, #update_cols do
+            local c = d.quote(update_cols[i]);
+            sets[#sets + 1] = ("%s = VALUES(%s)"):format(c, c);
+        end
+        return head .. " ON DUPLICATE KEY UPDATE " .. table.concat(sets, ", "), params;
+    end
+
+    -- sqlite / postgres
+    local targets = {};
+    for i = 1, #conflict_cols do targets[#targets + 1] = d.quote(conflict_cols[i]); end
+    local target_clause = table.concat(targets, ", ");
+    if (#update_cols == 0) then
+        return head .. (" ON CONFLICT (%s) DO NOTHING"):format(target_clause), params;
+    end
+    local sets = {};
+    for i = 1, #update_cols do
+        local c = d.quote(update_cols[i]);
+        sets[#sets + 1] = ("%s = excluded.%s"):format(c, c);
+    end
+    return head .. (" ON CONFLICT (%s) DO UPDATE SET %s"):format(target_clause, table.concat(sets, ", ")), params;
+end
+
 --- Compile WHERE conditions into a fragment, appending bound params.
 --- op "IN"/"NOT IN" expects an array value; nil value -> IS [NOT] NULL.
 ---@param wheres NormWhere[]
