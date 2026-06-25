@@ -354,15 +354,19 @@ function NormModel:find_by(filter)
 end
 
 --- Create this model's table (CREATE TABLE IF NOT EXISTS). Prefer `orm:sync()`
---- to create every model at once. Resolves with true.
+--- to create every model at once (it also orders tables by their foreign-key
+--- dependencies). Emits this model's `belongsTo` foreign keys when enabled.
+--- Resolves with true.
 --- ```lua
 ---     User:sync():await()
 --- ```
 ---@return NormBooleanPromise promise resolving to true
 function NormModel:sync()
-    local d = self.orm.adapter:get_dialect();
-    local statement = sqlmod.create_table(self.table, self.columns, d);
-    return self.orm:_execute_map(statement, {}, function() return true; end);
+    local orm = self.orm;
+    local d = orm.adapter:get_dialect();
+    local fks = orm:_should_emit_fk(d) and orm:_collect_foreign_keys(self) or nil;
+    local statement = sqlmod.create_table(self.table, self.columns, d, fks);
+    return orm:_execute_map(statement, {}, function() return true; end);
 end
 
 module.Model = NormModel;

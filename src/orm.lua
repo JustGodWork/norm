@@ -11,7 +11,9 @@ local model_module = require("model");
 ---@field provider NormPromiseProvider
 ---@field models table<string, NormModel>
 ---@field log boolean
+---@field foreign_keys boolean|"auto" Whether `sync()` emits SQL FOREIGN KEY constraints.
 ---@field private _logger fun(level: string, message: string)
+---@field private _warned_sqlite_fk boolean
 ---@overload fun(options: NormOptions): NormOrm
 local NormOrm = class.new("NormOrm");
 
@@ -20,6 +22,7 @@ local NormOrm = class.new("NormOrm");
 ---@field promise? NormPromiseProvider Promise provider. Defaults to the adapter's, else built-in.
 ---@field log? boolean Log every executed statement.
 ---@field logger? fun(level: string, message: string)
+---@field foreignKeys? boolean|"auto" Emit SQL FOREIGN KEY constraints from `belongsTo` relations. `"auto"` (default) emits on MySQL, skips on SQLite (with a one-time warning); `true` always emits; `false` never emits (no warning).
 
 ---@param options NormOptions
 function NormOrm:__init(options)
@@ -44,6 +47,8 @@ function NormOrm:__init(options)
     self.models = {};
     self.log = options.log == true;
     self._logger = options.logger or utils.logger;
+    self.foreign_keys = (options.foreignKeys == nil) and "auto" or options.foreignKeys;
+    self._warned_sqlite_fk = false;
 end
 
 ---@private
@@ -255,17 +260,140 @@ function NormOrm:model(table_name)
     return self.models[table_name];
 end
 
+--- Internal: the FOREIGN KEY constraints to emit for a model, derived from its
+--- `belongs_to` relations (the side that physically holds the FK column). The
+--- referenced column defaults to the target's primary key, resolved here because
+--- the target may have been defined after this model.
+---@private
+---@param model NormModel
+---@return NormForeignKey[]
+function NormOrm:_collect_foreign_keys(model)
+    local fks = {};
+    for _, rel in pairs(model.relations) do
+        if (rel.kind == "belongs_to" and rel.key) then
+            local target = self.models[rel.target];
+            -- Skip relations whose target table isn't registered: we can't emit a
+            -- REFERENCES clause to a table Norm doesn't know how to create.
+            if (target) then
+                fks[#fks + 1] = {
+                    column = rel.key,
+                    ref_table = rel.target,
+                    ref_column = rel.otherKey or target.primary_key or "id",
+                    on_delete = rel.onDelete,
+                    on_update = rel.onUpdate,
+                };
+            end
+        end
+    end
+    table.sort(fks, function(a, b) return a.column < b.column; end); -- stable output
+    return fks;
+end
+
+---@private
+---@return boolean
+function NormOrm:_has_any_foreign_key()
+    for _, m in pairs(self.models) do
+        if (#self:_collect_foreign_keys(m) > 0) then return true; end
+    end
+    return false;
+end
+
+--- Internal: decide whether `sync()` should emit FOREIGN KEY constraints for the
+--- given dialect, honouring the `foreignKeys` option and warning once on SQLite.
+---@private
+---@param d NormDialect
+---@return boolean
+function NormOrm:_should_emit_fk(d)
+    local mode = self.foreign_keys;
+    if (mode == false) then return false; end
+
+    if (mode == true) then
+        if (d.name == "sqlite" and not self._warned_sqlite_fk) then
+            self._warned_sqlite_fk = true;
+            self._logger("WARN", "[norm] foreignKeys=true on sqlite: constraints are emitted, but enforcement "
+                .. "needs `PRAGMA foreign_keys = ON` per connection, which Norm cannot guarantee.");
+        end
+        return true;
+    end
+
+    -- "auto": emit on engines that enforce FKs out of the box (MySQL), skip on
+    -- SQLite (per-connection PRAGMA can't be guaranteed). Warn only if relations
+    -- actually declare FKs, so FK-less SQLite schemas stay silent.
+    if (d.name == "sqlite") then
+        if (not self._warned_sqlite_fk and self:_has_any_foreign_key()) then
+            self._warned_sqlite_fk = true;
+            self._logger("WARN", "[norm] foreign keys are not emitted on sqlite (set foreignKeys=true to force "
+                .. "them, or foreignKeys=false to silence this warning).");
+        end
+        return false;
+    end
+    return true;
+end
+
+--- Internal: order models so a table is created after the tables it references
+--- via `belongs_to` (required for inline FKs on MySQL/InnoDB). Returns the table
+--- names in creation order plus whether a dependency cycle was detected.
+---@private
+---@return string[] order, boolean has_cycle
+function NormOrm:_sync_order()
+    local names = {};
+    for name in pairs(self.models) do names[#names + 1] = name; end
+    table.sort(names); -- deterministic starting point
+
+    -- deps[name] = sorted list of referenced tables that are also registered models.
+    local deps = {};
+    for _, name in ipairs(names) do
+        local set = {};
+        for _, rel in pairs(self.models[name].relations) do
+            if (rel.kind == "belongs_to" and rel.target ~= name and self.models[rel.target]) then
+                set[rel.target] = true;
+            end
+        end
+        local list = {};
+        for t in pairs(set) do list[#list + 1] = t; end
+        table.sort(list);
+        deps[name] = list;
+    end
+
+    local order, visited, on_stack, has_cycle = {}, {}, {}, false;
+    local function visit(name)
+        if (visited[name]) then return; end
+        if (on_stack[name]) then has_cycle = true; return; end
+        on_stack[name] = true;
+        for _, dep in ipairs(deps[name]) do visit(dep); end
+        on_stack[name] = nil;
+        visited[name] = true;
+        order[#order + 1] = name;
+    end
+    for _, name in ipairs(names) do visit(name); end
+    return order, has_cycle;
+end
+
 --- Create the table of every registered model (CREATE TABLE IF NOT EXISTS),
---- sequentially so foreign-key dependencies resolve in order. Resolves true.
+--- in dependency order so foreign keys resolve. When foreign keys are enabled
+--- (see the `foreignKeys` option), `belongsTo` relations emit `FOREIGN KEY`
+--- constraints. Resolves true.
 --- ```lua
 ---     db:sync():await() -- run once at startup, after defining your models
 --- ```
 ---@return NormBooleanPromise promise resolving to true
 function NormOrm:sync()
     local d = self.adapter:get_dialect();
+    local emit_fk = self:_should_emit_fk(d);
+    local order, has_cycle = self:_sync_order();
+
+    -- Inline FKs need referenced tables first; a cycle can't satisfy that on
+    -- engines that check at CREATE time (MySQL). SQLite allows forward refs.
+    if (emit_fk and has_cycle and d.name ~= "sqlite") then
+        self._logger("WARN", "[norm] cyclic foreign-key dependency detected; CREATE TABLE order cannot satisfy "
+            .. "every reference on '" .. d.name .. "'. Consider foreignKeys=false or breaking the cycle.");
+    end
+
     local statements = {};
-    for _, m in pairs(self.models) do
-        statements[#statements + 1] = sqlmod.create_table(m.table, m.columns, d);
+    for _, name in ipairs(order) do
+        local m = self.models[name];
+        local fks = emit_fk and self:_collect_foreign_keys(m) or nil;
+        statements[#statements + 1] = sqlmod.create_table(m.table, m.columns, d, fks);
     end
 
     return self.provider.new(function(resolve, reject)

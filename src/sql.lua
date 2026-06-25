@@ -74,14 +74,41 @@ local function column_def(column, d)
     return def;
 end
 
---- CREATE TABLE IF NOT EXISTS.
+--- A foreign-key constraint to emit inside CREATE TABLE.
+---@class NormForeignKey
+---@field column string FK column on this table.
+---@field ref_table string Referenced table.
+---@field ref_column string Referenced column.
+---@field on_delete? string Referential action (e.g. "CASCADE").
+---@field on_update? string Referential action (e.g. "CASCADE").
+
+--- Build a `FOREIGN KEY (...) REFERENCES ...` table constraint fragment. Works
+--- for both MySQL (inline) and SQLite (inline, forward references allowed).
+---@param fk NormForeignKey
+---@param d NormDialect
+---@return string
+local function foreign_key_def(fk, d)
+    local frag = ("FOREIGN KEY (%s) REFERENCES %s (%s)"):format(
+        d.quote(fk.column), d.quote(fk.ref_table), d.quote(fk.ref_column));
+    if (fk.on_delete) then frag = frag .. " ON DELETE " .. tostring(fk.on_delete):upper(); end
+    if (fk.on_update) then frag = frag .. " ON UPDATE " .. tostring(fk.on_update):upper(); end
+    return frag;
+end
+sql.foreign_key_def = foreign_key_def;
+
+--- CREATE TABLE IF NOT EXISTS. Pass `foreign_keys` to append `FOREIGN KEY`
+--- constraints (the caller decides whether to emit them per dialect/options).
 ---@param table_name string
 ---@param columns NormColumn[] Ordered list (each has a `.name`).
 ---@param d NormDialect
+---@param foreign_keys? NormForeignKey[] Optional FK constraints to append.
 ---@return string statement
-function sql.create_table(table_name, columns, d)
+function sql.create_table(table_name, columns, d, foreign_keys)
     local parts = {};
     for i = 1, #columns do parts[#parts + 1] = column_def(columns[i], d); end
+    if (foreign_keys) then
+        for i = 1, #foreign_keys do parts[#parts + 1] = foreign_key_def(foreign_keys[i], d); end
+    end
     return ("CREATE TABLE IF NOT EXISTS %s (%s)%s"):format(
         d.quote(table_name), table.concat(parts, ", "), d.table_suffix);
 end

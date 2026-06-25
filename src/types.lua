@@ -168,11 +168,20 @@ function types.json(options) return make("json", options); end
 ---@field target string The related table name.
 ---@field key? string FK column (on this model for belongs_to, on the target otherwise).
 ---@field otherKey? string Referenced column (defaults to the relevant primary key).
+---@field onDelete? string Referential action emitted on the FK (belongs_to only).
+---@field onUpdate? string Referential action emitted on the FK (belongs_to only).
 ---@field name? string Set by define() from the schema key.
 
+--- A referential action for a foreign key: "CASCADE", "SET NULL", "RESTRICT",
+--- "NO ACTION" or "SET DEFAULT" (case-insensitive).
+---@alias NormReferentialAction
+---| "CASCADE" | "SET NULL" | "RESTRICT" | "NO ACTION" | "SET DEFAULT"
+
 ---@class NormRelationOptions
----@field key? string
----@field otherKey? string
+---@field key? string FK column name. See each relation for its default.
+---@field otherKey? string Referenced column (defaults to the relevant primary key).
+---@field onDelete? NormReferentialAction Emitted as `ON DELETE …` on the FK (belongs_to only).
+---@field onUpdate? NormReferentialAction Emitted as `ON UPDATE …` on the FK (belongs_to only).
 
 ---@param kind string
 ---@param target string
@@ -186,16 +195,23 @@ local function relation(kind, target, options)
         target = target,
         key = options.key,
         otherKey = options.otherKey,
+        onDelete = options.onDelete,
+        onUpdate = options.onUpdate,
     };
 end
 
---- This record holds a foreign key pointing to one `target` row.
---- `key` defaults to `<relationName>_id`, `otherKey` to the target's primary key.
+--- This record holds a foreign key pointing to one `target` row (the "many" side
+--- of a one-to-many, or either side of a one-to-one). `key` defaults to
+--- `<relationName>_id`, `otherKey` to the target's primary key.
+---
+--- This is the ONLY relation that can emit a real SQL `FOREIGN KEY` constraint
+--- (its `key` lives on this table). Add `onDelete`/`onUpdate` to control the
+--- referential action — emitted by `sync()` when foreign keys are enabled.
 --- ```lua
 ---     db:define("posts", {
 ---         id      = Norm.types.id(),
----         user_id = Norm.types.integer(),
----         author  = Norm.types.belongsTo("users", { key = "user_id" }),
+---         user_id = Norm.types.integer({ nullable = false }), -- the FK column
+---         author  = Norm.types.belongsTo("users", { key = "user_id", onDelete = "CASCADE" }),
 ---     })
 ---     -- post:load("author"):await()  /  Post:query():include("author"):all():await()
 --- ```
@@ -204,15 +220,26 @@ end
 ---@return NormRelation
 function types.belongsTo(target, options) return relation("belongs_to", target, options); end
 
---- The `target` holds a foreign key pointing back to one of this model's rows.
---- `key` defaults to `<thisTableSingular>_id`, `otherKey` to this primary key.
+--- One-to-one inverse: the `target` table holds a foreign key pointing back to a
+--- single row of this model. `key` defaults to `<thisTableSingular>_id`,
+--- `otherKey` to this primary key. Declare the matching `belongsTo` on the target
+--- if you want the FK constraint (the FK column lives there, not here).
+--- ```lua
+---     db:define("users", {
+---         id      = Norm.types.id(),
+---         profile = Norm.types.hasOne("profiles", { key = "user_id" }),
+---     })
+---     -- user:load("profile"):await()  /  User:query():include("profile"):all():await()
+--- ```
 ---@param target string
 ---@param options? NormRelationOptions
 ---@return NormRelation
 function types.hasOne(target, options) return relation("has_one", target, options); end
 
---- The `target` holds a foreign key pointing back to this model's rows (one-to-many).
---- `key` defaults to `<thisTableSingular>_id`, `otherKey` to this primary key.
+--- One-to-many inverse: the `target` table holds a foreign key pointing back to
+--- this model's rows. `key` defaults to `<thisTableSingular>_id`, `otherKey` to
+--- this primary key. As with `hasOne`, the FK column lives on the target, so put
+--- the `belongsTo` (and any `onDelete`) there.
 --- ```lua
 ---     db:define("users", {
 ---         id    = Norm.types.id(),
