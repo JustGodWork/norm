@@ -97,8 +97,10 @@ local User = db:define("users", {
 ```
 
 **Types** (`Norm.types`): `id, integer, bigint, string, text, float, double, boolean,
-datetime, date, json`, plus `raw(sql)` for raw SQL defaults. Common options:
-`{ length, nullable, unique, index, primary, autoincrement, default }`.
+datetime, date, json, enum`, plus `raw(sql)` for raw SQL defaults. Common options:
+`{ length, nullable, unique, index, primary, autoincrement, default }` (plus `values`
+for `enum`). `enum({ values = { "a", "b" } })` is native `ENUM` on MySQL and
+`TEXT CHECK (… IN …)` on SQLite.
 
 **Define options**: `timestamps`, `soft_deletes`, `hooks`, `scopes`, `indexes`
 (see the matching sections below).
