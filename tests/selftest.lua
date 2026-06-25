@@ -1500,6 +1500,36 @@ local U2 = orm.new({ adapter = dm, promise = orm.promise.builtin() })
 dm.query_result = {};
 U2:vips():all();
 check("define-time scope works", last_sql(dm):find("WHERE `vip` = ?", 1, true) ~= nil, last_sql(dm));
+end do
+print("== Test group 33: schema indexes ==");
+local xm = Mock({ dialect = "sqlite" });
+local xdb = orm.new({ adapter = xm, promise = orm.promise.builtin() });
+xdb:define("accounts", {
+    id         = orm.types.id(),
+    account_id = orm.types.string({ length = 32, index = true }),   -- single-column index
+    name       = orm.types.string({ length = 32 }),
+    level      = orm.types.integer(),
+}, { indexes = { { columns = { "name", "level" }, unique = true } } });
+
+xdb:sync();
+local stmts = {};
+for _, c in ipairs(xm.calls) do stmts[#stmts + 1] = c.sql; end
+local function has(needle)
+    for _, s in ipairs(stmts) do if (s:find(needle, 1, true)) then return true; end end
+    return false;
+end
+check("column index emitted",
+    has("CREATE INDEX IF NOT EXISTS `idx_accounts_account_id` ON `accounts` (`account_id`)"), table.concat(stmts, " | "));
+check("composite unique index emitted",
+    has("CREATE UNIQUE INDEX IF NOT EXISTS `idx_accounts_name_level` ON `accounts` (`name`, `level`)"));
+check("indexes created after the table", (function()
+    local ti, ii;
+    for i, s in ipairs(stmts) do
+        if (s:find("CREATE TABLE", 1, true)) then ti = i; end
+        if (s:find("idx_accounts_account_id", 1, true)) then ii = i; end
+    end
+    return ti and ii and ti < ii;
+end)());
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
