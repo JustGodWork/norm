@@ -21,6 +21,7 @@ function NormQueryBuilder:__init(model)
         table = model.table,
         columns = nil,
         raw_columns = nil,
+        joins = nil,
         wheres = {},
         groups = nil,
         havings = nil,
@@ -29,6 +30,21 @@ function NormQueryBuilder:__init(model)
         offset = nil,
         includes = nil,
     };
+end
+
+---@param self NormQueryBuilder
+---@param jtype "INNER"|"LEFT"
+---@param table_name string
+---@param first string
+---@param op string
+---@param second? string
+---@return NormQueryBuilder self
+local function add_join(self, jtype, table_name, first, op, second)
+    if (second == nil) then second = op; op = "="; end
+    self._state.joins = self._state.joins or {};
+    self._state.joins[#self._state.joins + 1] =
+        { type = jtype, table = table_name, first = first, op = op, second = second };
+    return self;
 end
 
 --- Eager-load the given relations with the result (one batched query per
@@ -69,6 +85,36 @@ function NormQueryBuilder:select_raw(expr)
     self._state.raw_columns = self._state.raw_columns or {};
     self._state.raw_columns[#self._state.raw_columns + 1] = expr;
     return self;
+end
+
+--- INNER JOIN another table. Use qualified `table.column` refs. Forms:
+--- `join(table, first, second)` (defaults `=`) or `join(table, first, op, second)`.
+--- Joins are for FILTERING/SORTING by a related table — combine with qualified
+--- `where`/`order`. Since joined rows mix columns from both tables, restrict the
+--- projection with `:select_raw("main.*")` if you still want `:all()` to wrap the
+--- main model, or read the flattened rows with `:rows()`.
+--- ```lua
+---     Post:join("users", "users.id", "posts.user_id")
+---         :where("users.admin", true):select_raw("`posts`.*"):all():await()
+--- ```
+---@param table_name string
+---@param first string
+---@param op string Operator, or the right column when called with 3 args.
+---@param second? string
+---@return NormQueryBuilder self
+function NormQueryBuilder:join(table_name, first, op, second)
+    return add_join(self, "INNER", table_name, first, op, second);
+end
+
+--- LEFT JOIN another table (same argument forms as `:join`). Keeps main rows even
+--- when there is no match on the joined side.
+---@param table_name string
+---@param first string
+---@param op string
+---@param second? string
+---@return NormQueryBuilder self
+function NormQueryBuilder:left_join(table_name, first, op, second)
+    return add_join(self, "LEFT", table_name, first, op, second);
 end
 
 ---@param self NormQueryBuilder
