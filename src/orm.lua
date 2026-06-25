@@ -156,6 +156,7 @@ function NormOrm:_load_include_batch(model, mains, name, cb)
         self:_trace(statement, params);
         self.adapter:raw_query(statement, params, function(err, rows)
             if (err ~= nil) then return cb(err); end
+            rows = rows or {};
             local by_key = {};
             for i = 1, #rows do by_key[rows[i][other_key]] = target:wrap(rows[i]); end
             for i = 1, #mains do mains[i][name] = by_key[mains[i][rel.key]]; end
@@ -170,6 +171,7 @@ function NormOrm:_load_include_batch(model, mains, name, cb)
     self:_trace(statement, params);
     self.adapter:raw_query(statement, params, function(err, rows)
         if (err ~= nil) then return cb(err); end
+        rows = rows or {};
         local groups = {};
         for i = 1, #rows do
             local k = rows[i][rel.key];
@@ -200,6 +202,7 @@ function NormOrm:_query_with_includes(model, state, includes, single)
     return self.provider.new(function(resolve, reject)
         self.adapter:raw_query(statement, params or {}, function(err, rows)
             if (err ~= nil) then return reject(err); end
+            rows = rows or {};
             local records = {};
             for i = 1, #rows do records[i] = model:wrap(rows[i]); end
             if (#records == 0) then
