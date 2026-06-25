@@ -50,6 +50,13 @@ function NormAdapter:default_provider()
     return nil;
 end
 
+--- Optional: the JSON provider native to this adapter's framework, used to
+--- (de)serialise `json` columns. Returning nil lets the ORM auto-detect one.
+---@return NormJsonProvider|nil
+function NormAdapter:default_json_provider()
+    return nil;
+end
+
 --- Run a SELECT. Must be overridden.
 ---@param query string
 ---@param params any[]

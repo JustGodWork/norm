@@ -219,7 +219,7 @@ end
 function NormQueryBuilder:update(data)
     local model = self.model;
     local d = model.orm.adapter:get_dialect();
-    local statement, params = sqlmod.update(self._state, data, d);
+    local statement, params = sqlmod.update(self._state, model:_encode_write(data), d);
     return model.orm:_execute_map(statement, params, function(res)
         return res and res.affectedRows or 0;
     end);

@@ -148,10 +148,13 @@ function types.datetime(options) return make("datetime", options); end
 ---@return NormColumn
 function types.date(options) return make("date", options); end
 
---- JSON column (`JSON` on MySQL / `TEXT` on SQLite). Norm stores/returns the raw
---- string; encode and decode it yourself. A raw default must be a valid literal.
+--- JSON column (`JSON` on MySQL / `TEXT` on SQLite). When a JSON provider is
+--- active (auto-detected, or set via the `json` option), Norm (de)serialises it
+--- automatically: assign a Lua table and read a Lua table back. With `json =
+--- false` it stays a raw string. A `default` must be a valid JSON literal string.
 --- ```lua
 ---     coordinates = Norm.types.json({ default = '{"x":0,"y":0,"z":0}' }),
+---     -- char.coordinates = { x = 1, y = 2, z = 3 }; char:save():await()
 --- ```
 ---@param options? NormColumnOptions
 ---@return NormColumn

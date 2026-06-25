@@ -29,11 +29,14 @@ function NormRecord:__init(model, row, persisted)
     self.__model = model;
     self.__persisted = persisted == true;
     if (type(row) == "table") then
+        -- `parse` decodes DB representations (boolean 1/0, json strings). It only
+        -- applies to rows loaded from the database; a user-built record already
+        -- holds Lua values, so they are stored verbatim.
         for i = 1, #model.columns do
             local col = model.columns[i];
             local value = row[col.name];
             if (value ~= nil) then
-                self[col.name] = model:parse(col, value);
+                self[col.name] = self.__persisted and model:parse(col, value) or value;
             end
         end
     end
@@ -85,12 +88,12 @@ function NormRecord:save()
         local pk = model.primary_key;
         data[pk] = nil;
         local state = { table = model.table, wheres = { { column = pk, op = "=", value = self[pk] } } };
-        local statement, params = sqlmod.update(state, data, d);
+        local statement, params = sqlmod.update(state, model:_encode_write(data), d);
         return orm:_execute_map(statement, params, function() return self; end);
     end
 
     if (model.autoincrement_pk) then data[model.primary_key] = nil; end
-    local statement, params = sqlmod.insert(model.table, data, d);
+    local statement, params = sqlmod.insert(model.table, model:_encode_write(data), d);
     return orm:_execute_map(statement, params, function(res)
         self.__persisted = true;
         if (model.autoincrement_pk and res and res.insertId ~= nil) then
@@ -244,7 +247,7 @@ function NormModel:__init(orm, table_name, columns, record_class)
     end
 end
 
---- Convert a raw driver value into a Lua value for the given column.
+--- Convert a raw driver value into a Lua value for the given column (decode).
 ---@param column NormColumn
 ---@param value any
 ---@return any
@@ -255,7 +258,42 @@ function NormModel:parse(column, value)
         if (type(value) == "boolean") then return value; end
         return value == "1" or value == "true";
     end
+    if (column.kind == "json") then
+        -- Some drivers (e.g. mysql2 for JSON columns) already return a table; only
+        -- decode raw strings. On failure keep the raw value rather than throwing.
+        if (type(value) == "string") then
+            local ok, decoded = pcall(self.orm.json.decode, value);
+            if (ok) then return decoded; end
+        end
+        return value;
+    end
     return value;
+end
+
+--- Convert a Lua value into something storable for the given column (encode).
+--- Only `json` tables are transformed; a value already a string is passed
+--- through (so a pre-encoded string is never double-encoded).
+---@param column NormColumn
+---@param value any
+---@return any
+function NormModel:serialize(column, value)
+    if (column.kind == "json" and type(value) == "table") then
+        return self.orm.json.encode(value);
+    end
+    return value;
+end
+
+--- Encode a `{ column = value }` write payload (INSERT/UPDATE) column by column.
+---@private
+---@param data table<string, any>
+---@return table<string, any>
+function NormModel:_encode_write(data)
+    local out = {};
+    for k, v in pairs(data) do
+        local col = self.columns_by_name[k];
+        out[k] = col and self:serialize(col, v) or v;
+    end
+    return out;
 end
 
 --- Wrap a DB row into a persisted record.

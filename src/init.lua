@@ -13,6 +13,7 @@ local NormOrm = require("orm");
 ---@field Adapter NormAdapter Base adapter class — extend (or duck-type) for custom adapters.
 ---@field types NormTypes Column type factories.
 ---@field promise NormPromiseLib Promise providers + builders.
+---@field json NormJsonLib JSON providers for `json` columns.
 ---@field dialect NormDialects Built-in SQL dialects.
 ---@field adapters NormAdapters Built-in adapters.
 local Norm = {};
@@ -22,6 +23,7 @@ Norm.Orm      = NormOrm;
 Norm.Adapter  = require("adapter");
 Norm.types    = require("types");
 Norm.promise  = require("promise");
+Norm.json     = require("json");
 Norm.dialect  = require("dialect");
 
 Norm.adapters = {

@@ -4,6 +4,7 @@ local class = class;
 local utils = require("utils");
 local sqlmod = require("sql");
 local promise = require("promise");
+local jsonmod = require("json");
 local model_module = require("model");
 
 ---@class NormOrm: LightClass
@@ -12,6 +13,7 @@ local model_module = require("model");
 ---@field models table<string, NormModel>
 ---@field log boolean
 ---@field foreign_keys boolean|"auto" Whether `sync()` emits SQL FOREIGN KEY constraints.
+---@field json NormJsonProvider Provider used to (de)serialise `json` columns.
 ---@field private _logger fun(level: string, message: string)
 ---@field private _warned_sqlite_fk boolean
 ---@overload fun(options: NormOptions): NormOrm
@@ -23,6 +25,7 @@ local NormOrm = class.new("NormOrm");
 ---@field log? boolean Log every executed statement.
 ---@field logger? fun(level: string, message: string)
 ---@field foreignKeys? boolean|"auto" Emit SQL FOREIGN KEY constraints from `belongsTo` relations. `"auto"` (default) emits on MySQL, skips on SQLite (with a one-time warning); `true` always emits; `false` never emits (no warning).
+---@field json? NormJsonProvider|"auto"|false JSON provider for `json` columns. `"auto"` (default) uses the adapter's, else auto-detects (Nanos `JSON` / Lua `json`), else raw passthrough; `false` disables (de)serialisation.
 
 ---@param options NormOptions
 function NormOrm:__init(options)
@@ -49,6 +52,21 @@ function NormOrm:__init(options)
     self._logger = options.logger or utils.logger;
     self.foreign_keys = (options.foreignKeys == nil) and "auto" or options.foreignKeys;
     self._warned_sqlite_fk = false;
+
+    -- JSON provider for `json` columns: explicit > adapter default > auto-detect.
+    -- `false` disables it (raw string passthrough).
+    local json_opt = options.json;
+    if (json_opt == false) then
+        self.json = jsonmod.raw();
+    elseif (json_opt ~= nil and json_opt ~= "auto") then
+        self.json = jsonmod.define(json_opt);
+    else
+        local from_adapter;
+        if (type(self.adapter.default_json_provider) == "function") then
+            from_adapter = self.adapter:default_json_provider();
+        end
+        self.json = from_adapter or jsonmod.detect();
+    end
 end
 
 ---@private
