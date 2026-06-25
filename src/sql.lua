@@ -238,9 +238,25 @@ local function compile_where(wheres, d, params)
     local fragments = {};
     for i = 1, #wheres do
         local cond = wheres[i];
+        local frag;
+
+        if (cond.raw) then
+            -- verbatim fragment (e.g. a correlated `tbl.a = other.b`); no params.
+            frag = cond.raw;
+            fragments[#fragments + 1] = (i == 1) and frag or ((cond.bool or "AND") .. " " .. frag);
+            goto continue;
+        elseif (cond.exists) then
+            -- [NOT] EXISTS (correlated subquery); append the subquery's own params.
+            frag = (cond.negate and "NOT EXISTS " or "EXISTS ") .. cond.sql;
+            if (cond.params) then
+                for j = 1, #cond.params do params[#params + 1] = normalize(cond.params[j]); end
+            end
+            fragments[#fragments + 1] = (i == 1) and frag or ((cond.bool or "AND") .. " " .. frag);
+            goto continue;
+        end
+
         local col = quote_ref(d, cond.column);
         local op = (cond.op or "="):upper();
-        local frag;
 
         if (cond.value == nil) then
             local negated = (op == "!=" or op == "<>" or op == "NOT");
@@ -268,6 +284,7 @@ local function compile_where(wheres, d, params)
         else
             fragments[#fragments + 1] = (cond.bool or "AND") .. " " .. frag;
         end
+        ::continue::
     end
     return " WHERE " .. table.concat(fragments, " ");
 end
