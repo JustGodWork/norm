@@ -1462,6 +1462,44 @@ P:where("id", 1):or_where_between("level", 1, 3):all();
 check("or_where_between uses OR", last_sql(qm):find("`id` = ? OR `level` BETWEEN ? AND ?", 1, true) ~= nil, last_sql(qm));
 P:where("id", 1):or_where_null("name"):all();
 check("or_where_null uses OR + IS NULL", last_sql(qm):find("`id` = ? OR `name` IS NULL", 1, true) ~= nil, last_sql(qm));
+end do
+print("== Test group 32: scopes ==");
+local sm = Mock({ dialect = "mysql" });
+local sdb = orm.new({ adapter = sm, promise = orm.promise.builtin() });
+local U = sdb:define("users", { id = orm.types.id(), age = orm.types.integer(), active = orm.types.boolean() });
+U:scope("active", function(q) q:where("active", true); end);
+U:scope("older_than", function(q, age) q:where("age", ">", age); end);
+
+-- scope as a starter (Model:active)
+sm.query_result = {};
+U:active():all();
+check("scope as starter", last_sql(sm):find("WHERE `active` = ?", 1, true) ~= nil, last_sql(sm));
+
+-- scopes compose via :scope, and forward args
+U:active():scope("older_than", 18):all();
+check("scopes compose", last_sql(sm):find("`active` = ? AND `age` > ?", 1, true) ~= nil, last_sql(sm));
+check("scope forwards args", sm.calls[#sm.calls].params[2] == 18, sm.calls[#sm.calls].params[2]);
+
+-- scope mixes with normal conditions
+U:where("id", 1):scope("active"):all();
+check("scope chains after a where", last_sql(sm):find("`id` = ? AND `active` = ?", 1, true) ~= nil, last_sql(sm));
+
+-- collision with a built-in is rejected
+check("scope name collision throws",
+    select(1, pcall(function() U:scope("where", function() end) end)) == false);
+
+-- unknown scope throws
+check("unknown scope throws",
+    select(1, pcall(function() U:query():scope("nope") end)) == false);
+
+-- define-time scopes
+local dm = Mock({ dialect = "mysql" });
+local U2 = orm.new({ adapter = dm, promise = orm.promise.builtin() })
+    :define("u2", { id = orm.types.id(), vip = orm.types.boolean() },
+        { scopes = { vips = function(q) q:where("vip", true); end } });
+dm.query_result = {};
+U2:vips():all();
+check("define-time scope works", last_sql(dm):find("WHERE `vip` = ?", 1, true) ~= nil, last_sql(dm));
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
