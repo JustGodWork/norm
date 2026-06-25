@@ -892,6 +892,20 @@ function NormModel:select_raw(expr) return self:query():select_raw(expr); end
 ---@return NormQueryBuilder
 function NormModel:omit(...) return self:query():omit(...); end
 
+---@param name string
+---@param configure? fun(q: NormQueryBuilder)
+---@return NormQueryBuilder
+function NormModel:where_has(name, configure) return self:query():where_has(name, configure); end
+
+---@param name string
+---@param configure? fun(q: NormQueryBuilder)
+---@return NormQueryBuilder
+function NormModel:where_doesnt_have(name, configure) return self:query():where_doesnt_have(name, configure); end
+
+---@param ... string
+---@return NormQueryBuilder
+function NormModel:with_count(...) return self:query():with_count(...); end
+
 --- Start a query that INCLUDES soft-deleted rows (soft-delete models only).
 ---@return NormQueryBuilder
 function NormModel:with_trashed() return self:query():with_trashed(); end
