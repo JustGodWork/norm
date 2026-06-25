@@ -140,5 +140,30 @@ check("DEFAULT literal '?' preserved (not rewritten to ':n')",
         and create_call.q:find("'huh:", 1, true) == nil,
     create_call and create_call.q);
 
+-- ---- MariaDB vs real MySQL: RETURNING auto-detection (engine = MySQL) ----
+print("\n== MariaDB RETURNING auto-detection (engine = MySQL) ==");
+-- A fake MySQL/MariaDB Database whose sync Select answers the version probe.
+local function make_versioned(version)
+    local db = make_database(DatabaseEngine.MySQL, "v");
+    db.version = version;
+    function db:Select(q) -- sync path used by the adapter's version probe
+        if (q:find("VERSION()", 1, true)) then return { { v = self.version } }; end
+        return {};
+    end
+    return db;
+end
+
+local maria = Norm.adapters.nanos.new({ engine = DatabaseEngine.MySQL, database = make_versioned("11.6.2-MariaDB") });
+check("MariaDB 11.6 -> supports_returning true", maria:supports_returning() == true);
+
+local maria104 = Norm.adapters.nanos.new({ engine = DatabaseEngine.MySQL, database = make_versioned("10.4.30-MariaDB") });
+check("MariaDB 10.4 (< 10.5) -> supports_returning false", maria104:supports_returning() == false);
+
+local mysql8 = Norm.adapters.nanos.new({ engine = DatabaseEngine.MySQL, database = make_versioned("8.0.36") });
+check("real MySQL 8 -> supports_returning false", mysql8:supports_returning() == false);
+
+local forced = Norm.adapters.nanos.new({ engine = DatabaseEngine.MySQL, database = make_versioned("8.0.36"), returning = true });
+check("returning=true override forces support", forced:supports_returning() == true);
+
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
 if (failed > 0) then error("nanos sim failed"); end
