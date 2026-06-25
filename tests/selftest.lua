@@ -1293,6 +1293,49 @@ check("record increment targets the pk", last_sql(cm):find("WHERE `id` = ?", 1, 
 check("record increment updates memory", rec.coins == 125, rec.coins);
 rec:decrement("coins", 5);
 check("record decrement updates memory", rec.coins == 120, rec.coins);
+end do
+print("== Test group 28: where_has / where_doesnt_have / with_count ==");
+local wm = Mock({ dialect = "mysql" });
+local wdb = orm.new({ adapter = wm, promise = orm.promise.builtin() });
+local WUser = wdb:define("users", {
+    id = orm.types.id(), name = orm.types.string({ length = 32 }),
+    posts = orm.types.hasMany("posts", { key = "user_id" }),
+});
+wdb:define("posts", {
+    id = orm.types.id(), user_id = orm.types.integer(), published = orm.types.boolean(),
+});
+
+-- where_has -> EXISTS correlated subquery
+wm.query_result = {};
+WUser:where_has("posts"):all();
+local hsql = last_sql(wm);
+print("  HAS: " .. hsql);
+check("where_has emits EXISTS", hsql:find("EXISTS (SELECT 1 FROM `posts`", 1, true) ~= nil, hsql);
+check("where_has correlates target.fk to parent.pk",
+    hsql:find("`posts`.`user_id` = `users`.`id`", 1, true) ~= nil, hsql);
+
+-- where_has with a condition on the relation
+wm.query_result = {};
+WUser:where_has("posts", function(q) q:where("published", true) end):all();
+local hsql2 = last_sql(wm);
+check("where_has merges relation conditions", hsql2:find("`published` = ?", 1, true) ~= nil, hsql2);
+check("where_has binds the relation param", wm.calls[#wm.calls].params[1] == 1, wm.calls[#wm.calls].params[1]);
+
+-- where_doesnt_have -> NOT EXISTS
+wm.query_result = {};
+WUser:where_doesnt_have("posts"):all();
+check("where_doesnt_have emits NOT EXISTS", last_sql(wm):find("NOT EXISTS (SELECT 1 FROM `posts`", 1, true) ~= nil, last_sql(wm));
+
+-- with_count -> correlated COUNT(*) AS posts_count, attached to records
+wm.query_result = { { id = 1, name = "A", posts_count = 3 } };
+local wusers;
+WUser:with_count("posts"):all():next(function(r) wusers = r end);
+local csql = last_sql(wm);
+print("  COUNT: " .. csql);
+check("with_count selects COUNT(*) AS posts_count",
+    csql:find("(SELECT COUNT(*) FROM `posts`", 1, true) ~= nil and csql:find("AS `posts_count`", 1, true) ~= nil, csql);
+check("with_count keeps the main columns (*)", csql:find("SELECT *,", 1, true) ~= nil, csql);
+check("with_count attaches the count to the record", wusers and wusers[1].posts_count == 3, wusers and wusers[1] and wusers[1].posts_count);
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
