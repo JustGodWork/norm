@@ -834,5 +834,64 @@ mdbs:migrate({ { id = "di", up = function(m) m:drop_index("idx_acc", "players");
 check("sqlite drop_index omits ON table",
     find_sql(mms, "DROP INDEX `idx_acc`") ~= nil and find_sql(mms, "DROP INDEX `idx_acc` ON") == nil);
 
+-- ===============================================================
+print("== Test group 18: m2m attach / detach / sync_pivot ==");
+local pm = Routed({ dialect = "mysql" });
+pm.rows.role_user = { { user_id = 1, role_id = 100 }, { user_id = 1, role_id = 200 } };
+local pdb = orm.new({ adapter = pm, promise = orm.promise.builtin() });
+local PUser = pdb:define("users", {
+    id = orm.types.id(), name = orm.types.string({ length = 32 }),
+    roles = orm.types.belongsToMany("roles"),
+});
+pdb:define("roles", { id = orm.types.id(), name = orm.types.string({ length = 32 }) });
+local u = PUser:wrap({ id = 1, name = "Alice" });
+local function count_matching(mock, needle)
+    local n = 0;
+    for _, q in ipairs(mock.queries) do if (q:find(needle, 1, true)) then n = n + 1; end end
+    return n;
+end
+local function any_matching(mock, ...)
+    local needles = { ... };
+    for _, q in ipairs(mock.queries) do
+        local all = true;
+        for i = 1, #needles do if (q:find(needles[i], 1, true) == nil) then all = false; break; end end
+        if (all) then return true; end
+    end
+    return false;
+end
+
+-- attach two ids -> one pivot insert each
+pm.queries = {};
+local attached;
+u:attach("roles", { 300, 400 }):next(function(n) attached = n; end);
+check("attach inserts one pivot row per id", count_matching(pm, "INSERT INTO `role_user`") == 2, count_matching(pm, "INSERT INTO `role_user`"));
+check("attach returns the count", attached == 2, attached);
+check("attach pivot row carries both keys", any_matching(pm, "INSERT INTO `role_user`", "`role_id`", "`user_id`"));
+
+-- detach specific -> one DELETE with role_id IN
+pm.queries = {};
+u:detach("roles", { 100 });
+check("detach emits DELETE with user_id = ? AND role_id IN",
+    any_matching(pm, "DELETE FROM `role_user`", "`user_id` = ?", "`role_id` IN"));
+
+-- detach all -> DELETE by user_id only (no IN)
+pm.queries = {};
+u:detach("roles");
+check("detach-all emits DELETE by user_id only", (function()
+    for _, q in ipairs(pm.queries) do
+        if (q:find("DELETE FROM `role_user`", 1, true) and q:find("IN", 1, true) == nil) then return true; end
+    end
+    return false;
+end)());
+
+-- sync_pivot: current {100,200}, desired {200,300} -> attach 300, detach 100
+pm.queries = {};
+local synced;
+u:sync_pivot("roles", { 200, 300 }):next(function(r) synced = r; end);
+check("sync_pivot computes attach/detach counts", synced and synced.attached == 1 and synced.detached == 1,
+    synced and (synced.attached .. "/" .. synced.detached));
+check("sync_pivot deletes the removed id", count_matching(pm, "DELETE FROM `role_user`") == 1);
+check("sync_pivot inserts the new id", count_matching(pm, "INSERT INTO `role_user`") == 1);
+
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
 if (failed > 0) then error("self-test failed"); end
