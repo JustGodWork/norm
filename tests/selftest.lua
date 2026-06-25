@@ -1068,5 +1068,53 @@ check("nested configurator loads the deeper relation",
     iu2 and iu2[1].posts[1] and iu2[1].posts[1].comments ~= nil);
 check("nested configurator still batched (3 queries)", #im.queries == 3, #im.queries);
 
+-- ===============================================================
+print("== Test group 24: soft deletes ==");
+local sm = Mock({ dialect = "sqlite" });
+local sdb = orm.new({ adapter = sm, promise = orm.promise.builtin() });
+local SPost = sdb:define("posts", {
+    id = orm.types.id(), title = orm.types.string({ length = 64 }),
+}, { soft_deletes = true });
+
+check("soft_deletes adds the deleted_at column", SPost.columns_by_name.deleted_at ~= nil);
+check("model records the soft-delete column", SPost.soft_deletes == "deleted_at");
+
+-- default queries exclude trashed
+sm.query_result = {};
+SPost:all();
+check("default select excludes trashed", last_sql(sm):find("`deleted_at` IS NULL", 1, true) ~= nil, last_sql(sm));
+SPost:count();
+check("count excludes trashed", last_sql(sm):find("`deleted_at` IS NULL", 1, true) ~= nil, last_sql(sm));
+
+-- scopes
+SPost:with_trashed():all();
+check("with_trashed drops the filter", last_sql(sm):find("deleted_at", 1, true) == nil, last_sql(sm));
+SPost:only_trashed():all();
+check("only_trashed filters IS NOT NULL", last_sql(sm):find("`deleted_at` IS NOT NULL", 1, true) ~= nil, last_sql(sm));
+
+-- record:delete() soft-deletes (UPDATE, not DELETE); trashed() reflects it
+sm.query_result = { { id = 1, title = "Hi" } };
+local spost;
+SPost:find(1):next(function(r) spost = r; end);
+check("find excludes trashed too", last_sql(sm):find("`deleted_at` IS NULL", 1, true) ~= nil, last_sql(sm));
+spost:delete();
+check("record delete soft-deletes (UPDATE deleted_at)", last_sql(sm):find("UPDATE `posts` SET `deleted_at`", 1, true) ~= nil, last_sql(sm));
+check("record is now trashed", spost:trashed() == true);
+
+-- restore -> deleted_at = NULL
+spost:restore();
+check("restore clears deleted_at", last_sql(sm):find("SET `deleted_at` = NULL", 1, true) ~= nil, last_sql(sm));
+check("record no longer trashed", spost:trashed() == false);
+
+-- force_delete -> physical DELETE
+spost:force_delete();
+check("force_delete issues a real DELETE", last_sql(sm):find("DELETE FROM `posts`", 1, true) ~= nil, last_sql(sm));
+
+-- the column lands in CREATE TABLE
+sdb:sync();
+local screate;
+for _, c in ipairs(sm.calls) do if (c.sql:find("CREATE TABLE", 1, true)) then screate = c.sql; end end
+check("sync creates the deleted_at column", screate and screate:find("`deleted_at`", 1, true) ~= nil, screate);
+
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
 if (failed > 0) then error("self-test failed"); end
