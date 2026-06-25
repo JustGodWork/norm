@@ -47,24 +47,55 @@ local function add_join(self, jtype, table_name, first, op, second)
     return self;
 end
 
---- Eager-load the given relations with the result (one batched query per relation
---- level — no N+1), attaching them to each returned record. Nest with a dotted
---- path to load a relation of a relation (`"posts.comments"`); shared prefixes are
---- loaded once.
+--- Eager-load relations with the result (one batched query per relation level —
+--- no N+1), attaching them to each returned record. Three forms:
+---   * `include("posts", "profile")` — simple relation names.
+---   * `include("posts.comments")` — nested via a dotted path (shared prefixes load once).
+---   * `include("posts", function(q) ... end)` — with per-relation options: call
+---     `where` / `order` / `limit` / `offset` (and nested `include`) on `q`. The
+---     `limit` is applied PER PARENT (e.g. 5 latest posts for each user).
 --- ```lua
----     local users = User:query():include("posts", "profile"):all():await()
----     print(#users[1].posts)
----     -- nested: each user's posts, and each of those posts' comments
----     local u = User:query():include("posts.comments"):all():await()
----     print(#u[1].posts[1].comments)
+---     local users = User:query():include("posts.comments"):all():await()
+---     print(#users[1].posts[1].comments)
+---
+---     local u = User:query():include("posts", function(q)
+---         q:where("published", true):order("created_at", "DESC"):limit(5)
+---          :include("comments", function(c) c:order("created_at", "ASC") end)
+---     end):all():await()
 --- ```
----@param ... string relation names (or dotted nested paths) declared in the schema
+---@param ... string|fun(q: NormQueryBuilder) relation names/paths, or a single name + configurator
 ---@return NormQueryBuilder self
 function NormQueryBuilder:include(...)
+    local args = { ... };
     self._state.includes = self._state.includes or {};
-    local names = { ... };
-    for i = 1, #names do
-        self._state.includes[#self._state.includes + 1] = names[i];
+
+    -- configurator form: include(name, function(q) ... end)
+    if (#args == 2 and type(args[2]) == "function") then
+        local name, configure = args[1], args[2];
+        local rel = self.model.relations[name];
+        assert(rel, ("[norm] include: model '%s' has no relation '%s'"):format(self.model.table, name));
+        local target = self.model.orm:model(rel.target);
+        assert(target, ("[norm] include: relation '%s' target '%s' is not defined"):format(name, rel.target));
+        local sub = NormQueryBuilder(target); -- a builder for the related model; we harvest its state
+        configure(sub);
+        local spec = self._state.includes[name] or { wheres = {}, orders = {}, children = {} };
+        spec.wheres = sub._state.wheres;
+        spec.orders = sub._state.orders;
+        spec.limit = sub._state.limit;
+        spec.offset = sub._state.offset;
+        spec.children = sub._state.includes or {};
+        self._state.includes[name] = spec;
+        return self;
+    end
+
+    -- string form: one or more (possibly dotted) paths.
+    for i = 1, #args do
+        local node = self._state.includes;
+        for seg in tostring(args[i]):gmatch("[^.]+") do
+            local spec = node[seg];
+            if (not spec) then spec = { wheres = {}, orders = {}, children = {} }; node[seg] = spec; end
+            node = spec.children;
+        end
     end
     return self;
 end
@@ -282,7 +313,7 @@ end
 function NormQueryBuilder:all()
     local model = self.model;
     local includes = self._state.includes;
-    if (includes and #includes > 0) then
+    if (includes and next(includes) ~= nil) then
         return model.orm:_query_with_includes(model, self._state, includes, false);
     end
     local d = model.orm.adapter:get_dialect();
@@ -303,7 +334,7 @@ function NormQueryBuilder:first()
     self._state.limit = 1;
     local model = self.model;
     local includes = self._state.includes;
-    if (includes and #includes > 0) then
+    if (includes and next(includes) ~= nil) then
         return model.orm:_query_with_includes(model, self._state, includes, true);
     end
     local d = model.orm.adapter:get_dialect();
