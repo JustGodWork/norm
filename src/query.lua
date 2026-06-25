@@ -20,7 +20,10 @@ function NormQueryBuilder:__init(model)
     self._state = {
         table = model.table,
         columns = nil,
+        raw_columns = nil,
         wheres = {},
+        groups = nil,
+        havings = nil,
         orders = {},
         limit = nil,
         offset = nil,
@@ -52,6 +55,19 @@ function NormQueryBuilder:select(...)
     local args = { ... };
     if (#args == 1 and type(args[1]) == "table") then args = args[1]; end
     self._state.columns = args;
+    return self;
+end
+
+--- Add a RAW (unquoted) select expression — for aggregates/computed columns that
+--- the column-quoting `select` can't express. Pair with `:group_by` and `:rows()`.
+--- ```lua
+---     User:select_raw("faction, COUNT(*) AS n"):group_by("faction"):rows():await()
+--- ```
+---@param expr string
+---@return NormQueryBuilder self
+function NormQueryBuilder:select_raw(expr)
+    self._state.raw_columns = self._state.raw_columns or {};
+    self._state.raw_columns[#self._state.raw_columns + 1] = expr;
     return self;
 end
 
@@ -152,6 +168,37 @@ function NormQueryBuilder:limit(n) self._state.limit = n; return self; end
 ---@return NormQueryBuilder self
 function NormQueryBuilder:offset(n) self._state.offset = n; return self; end
 
+--- Add GROUP BY columns (call again, or pass several, to group by more).
+--- ```lua
+---     Player:select_raw("faction, COUNT(*) AS n"):group_by("faction"):rows():await()
+--- ```
+---@param ... string
+---@return NormQueryBuilder self
+function NormQueryBuilder:group_by(...)
+    self._state.groups = self._state.groups or {};
+    local args = { ... };
+    for i = 1, #args do self._state.groups[#self._state.groups + 1] = args[i]; end
+    return self;
+end
+
+--- Add a HAVING condition (ANDed) on a RAW aggregate expression. Forms:
+--- `having(expr, value)` or `having(expr, op, value)`. The expression is emitted
+--- verbatim (so you can reference `COUNT(*)`, `SUM(\`coins\`)`, …); the value is bound.
+--- ```lua
+---     Player:select_raw("faction, COUNT(*) AS n"):group_by("faction")
+---           :having("COUNT(*)", ">", 10):rows():await()
+--- ```
+---@param expr string Raw SQL expression (not quoted).
+---@param op? string Operator, or the value when called with 2 args.
+---@param value? any
+---@return NormQueryBuilder self
+function NormQueryBuilder:having(expr, op, value)
+    if (value == nil) then value = op; op = "="; end
+    self._state.havings = self._state.havings or {};
+    self._state.havings[#self._state.havings + 1] = { expr = expr, op = op, value = value };
+    return self;
+end
+
 -- ---------- terminal methods (return promises) ----------
 
 --- Execute the query and resolve with all matching records.
@@ -208,6 +255,63 @@ function NormQueryBuilder:count()
         return tonumber(row.count or row.COUNT or row["COUNT(*)"]) or 0;
     end);
 end
+
+--- Execute the query and resolve with the RAW rows (no record wrapping). Use this
+--- for grouped aggregates built with `:select_raw` / `:group_by` / `:having`.
+--- ```lua
+---     local stats = Player:select_raw("faction, COUNT(*) AS n, SUM(`coins`) AS total")
+---         :group_by("faction"):having("COUNT(*)", ">", 10):rows():await()
+--- ```
+---@return NormRowsPromise promise resolving to table[]
+function NormQueryBuilder:rows()
+    local model = self.model;
+    local d = model.orm.adapter:get_dialect();
+    local statement, params = sqlmod.select(self._state, d);
+    return model.orm:_query_map(statement, params, function(rows) return rows; end);
+end
+
+--- Run a scalar aggregate over the current WHERE filter, resolving the value.
+---@param self NormQueryBuilder
+---@param func string
+---@param column? string
+---@param numeric boolean Coerce the result with tonumber (SUM/AVG/COUNT).
+---@return NormNumberPromise
+local function aggregate(self, func, column, numeric)
+    local model = self.model;
+    local d = model.orm.adapter:get_dialect();
+    local statement, params = sqlmod.aggregate(self._state, func, column, d);
+    return model.orm:_query_map(statement, params, function(rows)
+        local value = (rows[1] or {}).aggregate;
+        if (numeric) then return tonumber(value) or 0; end
+        return value;
+    end);
+end
+
+--- SUM of a column over the current filter. Resolves with a number (0 if empty).
+--- ```lua
+---     local bank = User:where("admin", false):sum("coins"):await()
+--- ```
+---@param column string
+---@return NormNumberPromise promise resolving to number
+function NormQueryBuilder:sum(column) return aggregate(self, "SUM", column, true); end
+
+--- AVG of a column over the current filter. Resolves with a number.
+---@param column string
+---@return NormNumberPromise promise resolving to number
+function NormQueryBuilder:avg(column) return aggregate(self, "AVG", column, true); end
+
+--- MIN of a column over the current filter. Resolves with the raw value.
+---@param column string
+---@return NormNumberPromise promise resolving to the column's value type
+function NormQueryBuilder:min(column) return aggregate(self, "MIN", column, false); end
+
+--- MAX of a column over the current filter. Resolves with the raw value.
+--- ```lua
+---     local top = Player:max("score"):await()
+--- ```
+---@param column string
+---@return NormNumberPromise promise resolving to the column's value type
+function NormQueryBuilder:max(column) return aggregate(self, "MAX", column, false); end
 
 --- Bulk-update every matching row in one statement (no records loaded).
 --- Resolves with the affected row count.
