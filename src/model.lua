@@ -715,6 +715,7 @@ module.Record = NormRecord;
 ---@field record_class NormRecord
 ---@field timestamps? {created: string, updated: string} Auto-managed timestamp columns (nil if disabled).
 ---@field soft_deletes? string The soft-delete column name (nil if disabled).
+---@field indexes? {name: string, columns: string[], unique: boolean}[] Indexes emitted at sync().
 ---@overload fun(orm: NormOrm, table_name: string, columns: NormColumn[], record_class: NormRecord): NormModel
 local NormModel = class.new("NormModel");
 
@@ -1302,15 +1303,25 @@ function NormModel:sync()
     local orm = self.orm;
     local d = orm.adapter:get_dialect();
     local fks = orm:_should_emit_fk(d) and orm:_collect_foreign_keys(self) or nil;
-    local statement = sqlmod.create_table(self.table, self.columns, d, fks);
-    orm:_trace(statement, {});
+    local statements = { sqlmod.create_table(self.table, self.columns, d, fks) };
+    if (self.indexes) then
+        for _, ix in ipairs(self.indexes) do
+            statements[#statements + 1] = sqlmod.add_index(self.table, ix.name, ix.columns, ix.unique, d, true);
+        end
+    end
     -- Schema prep: bypass the readiness queue (like orm:sync) and flush on success.
     return orm.provider.new(function(resolve, reject)
-        orm.adapter:raw_execute(statement, {}, function(err)
-            if (err ~= nil) then return reject(err); end
-            orm:_flush_ready();
-            resolve(true);
-        end);
+        local i = 0;
+        local function step()
+            i = i + 1;
+            if (i > #statements) then orm:_flush_ready(); return resolve(true); end
+            orm:_trace(statements[i], {});
+            orm.adapter:raw_execute(statements[i], {}, function(err)
+                if (err ~= nil) then return reject(err); end
+                step();
+            end);
+        end
+        step();
     end);
 end
 
@@ -1340,6 +1351,7 @@ end
 ---@field soft_deletes? boolean|{column?: string} Mark rows deleted (set a `deleted_at`) instead of removing them; queries then exclude them by default. `true` uses `deleted_at`; pass a table to rename.
 ---@field hooks? table<string, fun(record: NormRecord)|fun(record: NormRecord)[]> Lifecycle hooks per event (see `NormModel:hook`), as a single handler or a list.
 ---@field scopes? table<string, fun(query: NormQueryBuilder, ...: any)> Named reusable query fragments (see `NormModel:scope`).
+---@field indexes? {columns?: string[], column?: string, unique?: boolean, name?: string}[] Table indexes emitted at `sync()` (composite via `columns`, single via `column`).
 
 --- Build a Model (+ dedicated Record subclass) from a schema definition.
 ---@param orm NormOrm
@@ -1410,6 +1422,23 @@ function module.define(orm, table_name, schema, options)
     local model = NormModel(orm, table_name, columns, record_class);
     model.timestamps = timestamps;
     model.soft_deletes = soft_deletes;
+
+    -- Collect indexes: per-column `index = true`, plus table-level `options.indexes`.
+    local indexes = {};
+    for i = 1, #columns do
+        local c = columns[i];
+        if (c.index and not c.unique and not c.primary) then
+            indexes[#indexes + 1] = { name = "idx_" .. table_name .. "_" .. c.name, columns = { c.name }, unique = false };
+        end
+    end
+    if (type(options.indexes) == "table") then
+        for _, ix in ipairs(options.indexes) do
+            local cols = ix.columns or { ix.column };
+            local name = ix.name or ("idx_" .. table_name .. "_" .. table.concat(cols, "_"));
+            indexes[#indexes + 1] = { name = name, columns = cols, unique = ix.unique == true };
+        end
+    end
+    model.indexes = indexes;
 
     -- Register lifecycle hooks passed at define time.
     if (type(options.hooks) == "table") then
