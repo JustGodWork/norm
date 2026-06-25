@@ -1183,6 +1183,83 @@ local pdbx = orm.new({ adapter = plain, promise = orm.promise.builtin() });
 check("supports_transactions reflects the adapter", pdbx:supports_transactions() == false);
 check("transaction throws on an unsupported adapter",
     select(1, pcall(function() pdbx:transaction(function() end) end)) == false);
+end do
+print("== Test group 26: lifecycle hooks ==");
+local hm = Mock({ dialect = "sqlite" });
+local hdb = orm.new({ adapter = hm, promise = orm.promise.builtin() });
+local events = {};
+local function rec(name) return function() events[#events + 1] = name; end end
+local Player = hdb:define("players", {
+    id = orm.types.id(), name = orm.types.string({ length = 32 }), slug = orm.types.string({ length = 32 }),
+});
+Player:before_save(function(p) events[#events + 1] = "before_save"; if (not p.slug) then p.slug = "auto-" .. tostring(p.name); end end);
+Player:before_create(rec("before_create"));
+Player:after_create(rec("after_create"));
+Player:before_update(rec("before_update"));
+Player:after_update(rec("after_update"));
+Player:after_save(rec("after_save"));
+Player:before_delete(rec("before_delete"));
+Player:after_delete(rec("after_delete"));
+Player:after_find(rec("after_find"));
+
+-- create fires save+create hooks in order; before_save mutation is persisted
+events = {};
+local created;
+Player:create({ name = "Zoe" }):next(function(r) created = r; end);
+check("create fires hooks in order",
+    table.concat(events, ",") == "before_save,before_create,after_create,after_save", table.concat(events, ","));
+check("before_save mutation persisted on the record", created and created.slug == "auto-Zoe", created and created.slug);
+check("before_save mutation reached the INSERT", (function()
+    for _, c in ipairs(hm.calls) do
+        if (c.sql:find("INSERT", 1, true)) then
+            for _, v in ipairs(c.params) do if (v == "auto-Zoe") then return true; end end
+        end
+    end
+    return false;
+end)());
+
+-- find fires after_find (one wrapped row)
+events = {};
+hm.query_result = { { id = 1, name = "Max", slug = "s" } };
+local found;
+Player:find(1):next(function(r) found = r; end);
+check("find fires after_find", table.concat(events, ",") == "after_find", table.concat(events, ","));
+
+-- update fires save+update hooks
+events = {};
+found.name = "Max2";
+found:save();
+check("update fires save+update hooks",
+    table.concat(events, ",") == "before_save,before_update,after_update,after_save", table.concat(events, ","));
+
+-- delete fires delete hooks
+events = {};
+found:delete();
+check("delete fires delete hooks", table.concat(events, ",") == "before_delete,after_delete", table.concat(events, ","));
+
+-- a throwing before hook cancels the operation (promise rejects, no write)
+local gm = Mock({ dialect = "sqlite" });
+local gdb = orm.new({ adapter = gm, promise = orm.promise.builtin() });
+local Guarded = gdb:define("items", { id = orm.types.id(), qty = orm.types.integer() });
+Guarded:before_save(function(r) if (r.qty and r.qty < 0) then error("qty must be >= 0"); end end);
+local rejected = false;
+Guarded:create({ qty = -5 }):next(nil, function() rejected = true; end);
+check("before hook abort rejects the promise", rejected == true);
+check("aborted create issued no INSERT", (function()
+    for _, c in ipairs(gm.calls) do if (c.sql:find("INSERT", 1, true)) then return false; end end
+    return true;
+end)());
+
+-- define-time hooks register
+local ddb = orm.new({ adapter = Mock({ dialect = "sqlite" }), promise = orm.promise.builtin() });
+local dhits = 0;
+local D = ddb:define("d", { id = orm.types.id() }, { hooks = { after_create = function() dhits = dhits + 1; end } });
+D:create({}):next(function() end);
+check("define-time hook fires", dhits == 1, dhits);
+
+-- hook-less models stay flagged off
+local Plain = orm.new({ adapter = Mock({ dialect = "sqlite" }), promise = orm.promise.builtin() }):define("plain", { id = orm.types.id() });
+check("hook-less model has _has_hooks false", Plain._has_hooks == false);
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
