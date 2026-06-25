@@ -114,6 +114,14 @@ function NormNanosAdapter:get_dialect_name()
     return self._resolved_dialect or "sqlite";
 end
 
+--- Nanos' `Database` exposes no transaction API (no Begin/Commit, no connection
+--- pinning across the pool), so transactions are unavailable: `db:transaction(...)`
+--- throws rather than silently running non-atomically.
+---@return boolean
+function NormNanosAdapter:supports_transactions()
+    return false;
+end
+
 --- SQLite, PostgreSQL and MariaDB (>= 10.5, auto-detected at init) support
 --- `INSERT ... RETURNING`, letting the ORM fetch a new id atomically (pool-safe).
 --- Real MySQL does not, and falls back to a best-effort `LAST_INSERT_ID()` query

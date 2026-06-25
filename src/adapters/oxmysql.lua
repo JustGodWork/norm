@@ -49,6 +49,12 @@ function NormOxMySQLAdapter:get_dialect_name()
     return "mysql";
 end
 
+--- oxmysql supports interactive transactions via the `startTransaction` export.
+---@return boolean
+function NormOxMySQLAdapter:supports_transactions()
+    return true;
+end
+
 --- FiveM resources have a native `promise` library; use it by default.
 ---@return NormPromiseProvider|nil
 function NormOxMySQLAdapter:default_provider()
@@ -97,6 +103,23 @@ function NormOxMySQLAdapter:raw_execute(query, params, callback)
     self.ox:execute(query, params, function(result)
         callback(nil, normalize(result));
     end);
+end
+
+--- Run an interactive transaction through the `startTransaction` export (the same
+--- one `MySQL.startTransaction` forwards to: `oxmysql:startTransaction(handler)`). The handler's `query(sql, params)` is SYNCHRONOUS (oxmysql awaits
+--- internally), so the ORM's callbacks resolve immediately; the handler returning
+--- `false` (or erroring) rolls back, anything else commits. The export returns the
+--- commit boolean. `body` already returns true=commit / false=rollback.
+---@param body fun(tx_query: fun(q:string,p:any[],cb:function), tx_execute: fun(q:string,p:any[],cb:function)): boolean
+---@param finish fun(err: any)
+function NormOxMySQLAdapter:transaction(body, finish)
+    local committed = self.ox:startTransaction(function(query)
+        return body(
+            function(q, p, cb) cb(nil, query(q, p) or {}); end,     -- tx_query (SELECT)
+            function(q, p, cb) cb(nil, normalize(query(q, p))); end  -- tx_execute (writes)
+        );
+    end);
+    finish(committed and nil or "[norm] transaction rolled back");
 end
 
 ---@class NormOxMySQLAdapterModule
