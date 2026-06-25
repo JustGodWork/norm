@@ -187,6 +187,21 @@ function NormQueryBuilder:include(...)
     return self;
 end
 
+--- Apply a named scope (a reusable query fragment registered on the model with
+--- `Model:scope(name, fn)`), passing it any extra args. Chainable.
+--- ```lua
+---     User:active():scope("older_than", 18):all():await()
+--- ```
+---@param name string
+---@param ... any args forwarded to the scope function
+---@return NormQueryBuilder self
+function NormQueryBuilder:scope(name, ...)
+    local fn = self.model.scopes and self.model.scopes[name];
+    assert(fn, ("[norm] no scope '%s' on model '%s'"):format(tostring(name), self.model.table));
+    fn(self, ...);
+    return self;
+end
+
 --- Restrict selected columns. select("id","name") or select({"id","name"}).
 ---@param ... string|string[]
 ---@return NormQueryBuilder self
