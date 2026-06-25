@@ -57,6 +57,16 @@ function NormAdapter:default_json_provider()
     return nil;
 end
 
+--- Optional: whether this adapter's engine supports `INSERT ... RETURNING <col>`
+--- (SQLite >= 3.35, PostgreSQL). When true, the ORM reads a new row's
+--- auto-increment id atomically from the INSERT itself, instead of a separate
+--- `LAST_INSERT_ID()` / `last_insert_rowid()` query — which is connection-scoped
+--- and therefore unreliable across a connection pool. Defaults to false.
+---@return boolean
+function NormAdapter:supports_returning()
+    return false;
+end
+
 --- Run a SELECT. Must be overridden.
 ---@param query string
 ---@param params any[]
