@@ -691,6 +691,10 @@ function NormModel:select(...) return self:query():select(...); end
 ---@return NormQueryBuilder
 function NormModel:select_raw(expr) return self:query():select_raw(expr); end
 
+---@param ... string|string[]
+---@return NormQueryBuilder
+function NormModel:omit(...) return self:query():omit(...); end
+
 ---@param table_name string
 ---@param first string
 ---@param op string
