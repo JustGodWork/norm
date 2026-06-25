@@ -174,13 +174,15 @@ end
 
 --- Multi-row INSERT: `INSERT INTO t (cols) VALUES (…), (…)`. `columns` is the
 --- ordered column union; each `data_rows[i]` is an (already-encoded) `{col=value}`
---- map — a column absent from a row is written as `NULL`.
+--- map — a column absent from a row is written as `NULL`. Pass `returning` (a raw
+--- list like "*", on RETURNING-capable engines) to get the inserted rows back.
 ---@param table_name string
 ---@param columns string[]
 ---@param data_rows table<string, any>[]
 ---@param d NormDialect
+---@param returning? string Raw RETURNING list (e.g. "*").
 ---@return string statement, any[] params
-function sql.insert_many(table_name, columns, data_rows, d)
+function sql.insert_many(table_name, columns, data_rows, d, returning)
     local params, tuples = {}, {};
     local quoted = {};
     for i = 1, #columns do quoted[i] = d.quote(columns[i]); end
@@ -197,8 +199,10 @@ function sql.insert_many(table_name, columns, data_rows, d)
         end
         tuples[r] = "(" .. table.concat(marks, ", ") .. ")";
     end
-    return ("INSERT INTO %s (%s) VALUES %s"):format(
-        d.quote(table_name), table.concat(quoted, ", "), table.concat(tuples, ", ")), params;
+    local statement = ("INSERT INTO %s (%s) VALUES %s"):format(
+        d.quote(table_name), table.concat(quoted, ", "), table.concat(tuples, ", "));
+    if (returning) then statement = statement .. " RETURNING " .. returning; end
+    return statement, params;
 end
 
 --- INSERT with an atomic "on conflict, update" clause (upsert). Dialect-aware:
