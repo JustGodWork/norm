@@ -37,6 +37,7 @@ local promise = {};
 ---@overload fun(executor?: fun(resolve: fun(value: any), reject: fun(reason: any))): NormPromise
 local NormPromise = class.new("NormPromise");
 
+---@private
 ---@param executor? fun(resolve: fun(value: any), reject: fun(reason: any))
 function NormPromise:__init(executor)
     self._state = "pending";
@@ -51,6 +52,7 @@ function NormPromise:__init(executor)
     end
 end
 
+---@private
 function NormPromise:_settle(state, value)
     if (self._state ~= "pending") then return; end
     self._state = state;
@@ -112,6 +114,11 @@ end
 
 --- Block the current coroutine until the promise settles, then return its value
 --- (or raise its rejection reason). Must be called from inside a coroutine.
+--- ```lua
+---     coroutine.wrap(function()
+---         local user = User:find(1):await()
+---     end)()
+--- ```
 ---@return any value
 function NormPromise:await()
     if (self._state == "pending") then

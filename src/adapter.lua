@@ -26,6 +26,7 @@ local dialect = require("dialect");
 ---@overload fun(options?: NormAdapterOptions): NormAdapter
 local NormAdapter = class.new("NormAdapter");
 
+---@private
 ---@param options? NormAdapterOptions
 function NormAdapter:__init(options)
     self.options = options or {};

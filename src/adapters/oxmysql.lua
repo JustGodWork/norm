@@ -13,6 +13,7 @@ local jsonlib = require("json");
 ---@overload fun(options?: NormOxMySQLAdapterOptions): NormOxMySQLAdapter
 local NormOxMySQLAdapter = class.extend("NormOxMySQLAdapter", NormAdapter);
 
+---@private
 ---@param options? NormOxMySQLAdapterOptions
 function NormOxMySQLAdapter:__init(options)
     options = options or {};

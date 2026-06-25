@@ -74,6 +74,7 @@ local module = {};
 ---@field [string] any Column values.
 local NormRecord = class.new("NormRecord");
 
+---@private
 ---@param model NormModel
 ---@param row? table<string, any>
 ---@param persisted? boolean
@@ -719,6 +720,7 @@ module.Record = NormRecord;
 ---@overload fun(orm: NormOrm, table_name: string, columns: NormColumn[], record_class: NormRecord): NormModel
 local NormModel = class.new("NormModel");
 
+---@private
 ---@param orm NormOrm
 ---@param table_name string
 ---@param columns NormColumn[]
@@ -826,6 +828,7 @@ function NormModel:hook(event, fn)
 end
 
 --- Run every handler registered for `event`, in registration order.
+---@private
 ---@param event string
 ---@param record NormRecord
 function NormModel:_fire(event, record)
@@ -1415,6 +1418,7 @@ function module.define(orm, table_name, schema, options)
     -- walk), so a Record subclass must define its own __init forwarding to the base.
     -- This also lets users attach custom methods to a model's records.
     local record_class = class.extend(unique_record_name(table_name), NormRecord);
+    ---@private
     function record_class:__init(model, row, persisted)
         NormRecord.__init(self, model, row, persisted);
     end

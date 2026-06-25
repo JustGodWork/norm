@@ -65,6 +65,7 @@ local NormOrm = class.new("NormOrm");
 ---@field json? NormJsonProvider|"auto"|false JSON provider for `json` columns. `"auto"` (default) uses the adapter's, else auto-detects (Nanos `JSON` / Lua `json`), else raw passthrough; `false` disables (de)serialisation.
 ---@field queue_until_ready? boolean Hold data operations in a queue until the first successful `sync()`/`migrate()`, then flush them (default false: run immediately).
 
+---@private
 ---@param options NormOptions
 function NormOrm:__init(options)
     utils.assert(type(options) == "table", "Norm: options table is required");
@@ -231,6 +232,7 @@ function NormOrm:transaction(fn)
 end
 
 --- Run a SELECT and transform the rows inside the promise.
+---@private
 ---@param query string
 ---@param params? any[]
 ---@param transform fun(rows: table[]): any
@@ -248,6 +250,7 @@ function NormOrm:_query_map(query, params, transform)
 end
 
 --- Run a write statement and transform the result inside the promise.
+---@private
 ---@param query string
 ---@param params? any[]
 ---@param transform fun(result: NormExecResult): any
@@ -552,6 +555,9 @@ function NormOrm:define(table_name, schema, options)
 end
 
 --- Get a previously defined model.
+--- ```lua
+---     local User = db:model("users")
+--- ```
 ---@param table_name string
 ---@return NormModel|nil
 function NormOrm:model(table_name)

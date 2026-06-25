@@ -15,6 +15,7 @@ local utils = require("utils");
 ---@overload fun(model: NormModel): NormQueryBuilder
 local NormQueryBuilder = class.new("NormQueryBuilder");
 
+---@private
 ---@param model NormModel
 function NormQueryBuilder:__init(model)
     self.model = model;
@@ -202,7 +203,10 @@ function NormQueryBuilder:scope(name, ...)
     return self;
 end
 
---- Restrict selected columns. select("id","name") or select({"id","name"}).
+--- Restrict selected columns (the inverse is `:omit`).
+--- ```lua
+---     User:query():select("id", "name"):all():await()
+--- ```
 ---@param ... string|string[]
 ---@return NormQueryBuilder self
 function NormQueryBuilder:select(...)
@@ -311,6 +315,9 @@ function NormQueryBuilder:where(column, op, value)
 end
 
 --- OR variant of `where`.
+--- ```lua
+---     User:query():where("admin", true):or_where("coins", ">", 1000):all():await()
+--- ```
 ---@param column string|table<string, any>
 ---@param op? string
 ---@param value? any

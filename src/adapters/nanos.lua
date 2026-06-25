@@ -61,6 +61,7 @@ local function detect_mariadb_returning(db)
     return (major > 10) or (major == 10 and minor >= 5);
 end
 
+---@private
 ---@param options? NormNanosAdapterOptions
 function NormNanosAdapter:__init(options)
     options = options or {};
