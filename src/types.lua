@@ -167,10 +167,13 @@ function types.json(options) return make("json", options); end
 
 ---@class NormRelation
 ---@field __relation true
----@field kind "belongs_to"|"has_one"|"has_many"
+---@field kind "belongs_to"|"has_one"|"has_many"|"belongs_to_many"
 ---@field target string The related table name.
----@field key? string FK column (on this model for belongs_to, on the target otherwise).
----@field otherKey? string Referenced column (defaults to the relevant primary key).
+---@field key? string FK column (on this model for belongs_to; on the target / pivot otherwise).
+---@field otherKey? string Referenced column / target-side pivot FK (defaults to the relevant primary key).
+---@field localKey? string Local column for has_*/belongs_to_many (defaults to this model's primary key).
+---@field otherLocalKey? string Target's local column for belongs_to_many (defaults to the target's primary key).
+---@field through? string Pivot (join) table for belongs_to_many.
 ---@field onDelete? string Referential action emitted on the FK (belongs_to only).
 ---@field onUpdate? string Referential action emitted on the FK (belongs_to only).
 ---@field name? string Set by define() from the schema key.
@@ -182,7 +185,10 @@ function types.json(options) return make("json", options); end
 
 ---@class NormRelationOptions
 ---@field key? string FK column name. See each relation for its default.
----@field otherKey? string Referenced column (defaults to the relevant primary key).
+---@field otherKey? string Referenced column / target-side pivot FK (defaults to the relevant primary key).
+---@field localKey? string Local column for has_*/belongs_to_many (defaults to this model's primary key).
+---@field otherLocalKey? string Target's local column for belongs_to_many (defaults to the target's primary key).
+---@field through? string Pivot (join) table for belongs_to_many (defaults to the two singulars joined alphabetically).
 ---@field onDelete? NormReferentialAction Emitted as `ON DELETE …` on the FK (belongs_to only).
 ---@field onUpdate? NormReferentialAction Emitted as `ON UPDATE …` on the FK (belongs_to only).
 
@@ -198,6 +204,9 @@ local function relation(kind, target, options)
         target = target,
         key = options.key,
         otherKey = options.otherKey,
+        localKey = options.localKey,
+        otherLocalKey = options.otherLocalKey,
+        through = options.through,
         onDelete = options.onDelete,
         onUpdate = options.onUpdate,
     };
@@ -254,5 +263,26 @@ function types.hasOne(target, options) return relation("has_one", target, option
 ---@param options? NormRelationOptions
 ---@return NormRelation
 function types.hasMany(target, options) return relation("has_many", target, options); end
+
+--- Many-to-many: this model and `target` are linked through a **pivot** (join)
+--- table that holds a foreign key to each side. `record:load(name)` and
+--- `query:include(name)` resolve to an **array** of target records (batched in two
+--- queries — pivot then targets — so no N+1). Defaults, all overridable:
+--- `through` = the two table singulars joined alphabetically (`users`+`roles` ->
+--- `role_user`); `key` = `<thisSingular>_id` (pivot FK to this model); `otherKey`
+--- = `<targetSingular>_id` (pivot FK to the target); `localKey`/`otherLocalKey` =
+--- the respective primary keys. The pivot table is yours to manage — define it as
+--- a normal model if you want `sync()` to create it.
+--- ```lua
+---     db:define("users", {
+---         id    = Norm.types.id(),
+---         roles = Norm.types.belongsToMany("roles"), -- through `role_user`
+---     })
+---     -- user:load("roles"):await()  /  User:query():include("roles"):all():await()
+--- ```
+---@param target string
+---@param options? NormRelationOptions
+---@return NormRelation
+function types.belongsToMany(target, options) return relation("belongs_to_many", target, options); end
 
 return types;
