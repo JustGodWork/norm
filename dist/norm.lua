@@ -569,10 +569,13 @@ function types.datetime(options) return make("datetime", options); end
 ---@return NormColumn
 function types.date(options) return make("date", options); end
 
---- JSON column (`JSON` on MySQL / `TEXT` on SQLite). Norm stores/returns the raw
---- string; encode and decode it yourself. A raw default must be a valid literal.
+--- JSON column (`JSON` on MySQL / `TEXT` on SQLite). When a JSON provider is
+--- active (auto-detected, or set via the `json` option), Norm (de)serialises it
+--- automatically: assign a Lua table and read a Lua table back. With `json =
+--- false` it stays a raw string. A `default` must be a valid JSON literal string.
 --- ```lua
 ---     coordinates = Norm.types.json({ default = '{"x":0,"y":0,"z":0}' }),
+---     -- char.coordinates = { x = 1, y = 2, z = 3 }; char:save():await()
 --- ```
 ---@param options? NormColumnOptions
 ---@return NormColumn
@@ -1229,6 +1232,111 @@ end
 return promise;
 end
 
+__modules["json"] = function()
+local require = __require
+--- JSON providers: the seam that lets Norm (de)serialise `json` columns with the
+--- host's JSON library. A `json` field is then a Lua table in memory and a string
+--- in the database, transparently. A provider is a table exposing two functions:
+---   encode(value) -> string   -- Lua value  -> stored string
+---   decode(text)  -> value    -- stored text -> Lua value
+---
+--- Built-in builders: `Norm.json.nanos|lua|raw`. The provider is auto-detected
+--- per platform (Nanos `JSON`, then a Lua/FiveM `json`), or set via the `json`
+--- option on `Norm.new`. Validate a custom one with `Norm.json.define`.
+
+--- A JSON provider plugs a host's JSON library into Norm.
+---@class NormJsonProvider
+---@field name string
+---@field encode fun(value: any): string
+---@field decode fun(text: string): any
+
+---@class NormJsonLib
+local json = {};
+
+--- Validate a custom provider (a table with `encode`/`decode`) and return it.
+--- ```lua
+---     local provider = Norm.json.define({
+---         name = "dkjson",
+---         encode = function(v) return dkjson.encode(v) end,
+---         decode = function(s) return dkjson.decode(s) end,
+---     })
+--- ```
+---@param spec NormJsonProvider
+---@return NormJsonProvider
+function json.define(spec)
+    assert(type(spec) == "table", "[norm] json provider must be a table");
+    assert(type(spec.encode) == "function", "[norm] json provider requires an 'encode' function");
+    assert(type(spec.decode) == "function", "[norm] json provider requires a 'decode' function");
+    return spec;
+end
+
+--- Wrap a Lua/FiveM-style library exposing `encode` / `decode` (e.g. FiveM's
+--- global `json`, or a dkjson-like table). Defaults to the global `json`.
+--- ```lua
+---     local db = Norm.new({ adapter = a, json = Norm.json.lua() }) -- uses _ENV.json
+--- ```
+---@param lib? table The JSON library (defaults to `_ENV.json`).
+---@return NormJsonProvider
+function json.rapidjson(lib)
+    lib = lib or _ENV.json;
+    assert(type(lib) == "table" and type(lib.encode) == "function" and type(lib.decode) == "function",
+        "[norm] json.lua requires a library with encode/decode (e.g. FiveM's `json`)");
+    return {
+        name = "rapidjson",
+        encode = function(value) return lib.encode(value); end,
+        decode = function(text) return lib.decode(text); end,
+    };
+end
+
+--- Wrap the Nanos World `JSON` class (`stringify` / `parse`). Defaults to the
+--- global `JSON`. On nanos this is auto-detected, so you rarely pass it.
+--- ```lua
+---     local db = Norm.new({ adapter = a, json = Norm.json.nanos(JSON) })
+--- ```
+---@param JSON? table The Nanos `JSON` class (defaults to `_ENV.JSON`).
+---@return NormJsonProvider
+function json.nanos(JSON)
+    JSON = JSON or _ENV.JSON;
+    assert(type(JSON) == "table" and type(JSON.stringify) == "function" and type(JSON.parse) == "function",
+        "[norm] json.nanos requires the Nanos `JSON` class (stringify/parse)");
+    return {
+        name = "nanos",
+        encode = function(value) return JSON.stringify(value); end,
+        decode = function(text) return JSON.parse(text); end,
+    };
+end
+
+--- No-op provider: `json` columns are stored and returned as raw strings (Norm's
+--- behaviour before JSON providers existed). Use it to opt out of automatic
+--- (de)serialisation: `Norm.new({ ..., json = false })` resolves to this.
+---@return NormJsonProvider
+function json.raw()
+    return {
+        name = "raw",
+        encode = function(value) return value; end,
+        decode = function(text) return text; end,
+    };
+end
+
+--- Auto-detect the host's JSON library: Nanos `JSON`, then a Lua/FiveM `json`,
+--- else the no-op `raw` provider. Used when no `json` option is configured and
+--- the adapter offers no default.
+---@return NormJsonProvider
+function json.detect()
+    local J = _ENV.JSON;
+    if (type(J) == "table" and type(J.stringify) == "function" and type(J.parse) == "function") then
+        return json.nanos(J);
+    end
+    local l = _ENV.json;
+    if (type(l) == "table" and type(l.encode) == "function" and type(l.decode) == "function") then
+        return json.rapidjson(l);
+    end
+    return json.raw();
+end
+
+return json;
+end
+
 __modules["adapter"] = function()
 local require = __require
 --- Base Adapter class. An adapter is *how the ORM talks to a database*.
@@ -1280,6 +1388,13 @@ end
 --- Optional: the promise provider native to this adapter's framework.
 ---@return NormPromiseProvider|nil
 function NormAdapter:default_provider()
+    return nil;
+end
+
+--- Optional: the JSON provider native to this adapter's framework, used to
+--- (de)serialise `json` columns. Returning nil lets the ORM auto-detect one.
+---@return NormJsonProvider|nil
+function NormAdapter:default_json_provider()
     return nil;
 end
 
@@ -1525,7 +1640,7 @@ end
 function NormQueryBuilder:update(data)
     local model = self.model;
     local d = model.orm.adapter:get_dialect();
-    local statement, params = sqlmod.update(self._state, data, d);
+    local statement, params = sqlmod.update(self._state, model:_encode_write(data), d);
     return model.orm:_execute_map(statement, params, function(res)
         return res and res.affectedRows or 0;
     end);
@@ -1582,11 +1697,14 @@ function NormRecord:__init(model, row, persisted)
     self.__model = model;
     self.__persisted = persisted == true;
     if (type(row) == "table") then
+        -- `parse` decodes DB representations (boolean 1/0, json strings). It only
+        -- applies to rows loaded from the database; a user-built record already
+        -- holds Lua values, so they are stored verbatim.
         for i = 1, #model.columns do
             local col = model.columns[i];
             local value = row[col.name];
             if (value ~= nil) then
-                self[col.name] = model:parse(col, value);
+                self[col.name] = self.__persisted and model:parse(col, value) or value;
             end
         end
     end
@@ -1638,12 +1756,12 @@ function NormRecord:save()
         local pk = model.primary_key;
         data[pk] = nil;
         local state = { table = model.table, wheres = { { column = pk, op = "=", value = self[pk] } } };
-        local statement, params = sqlmod.update(state, data, d);
+        local statement, params = sqlmod.update(state, model:_encode_write(data), d);
         return orm:_execute_map(statement, params, function() return self; end);
     end
 
     if (model.autoincrement_pk) then data[model.primary_key] = nil; end
-    local statement, params = sqlmod.insert(model.table, data, d);
+    local statement, params = sqlmod.insert(model.table, model:_encode_write(data), d);
     return orm:_execute_map(statement, params, function(res)
         self.__persisted = true;
         if (model.autoincrement_pk and res and res.insertId ~= nil) then
@@ -1797,7 +1915,7 @@ function NormModel:__init(orm, table_name, columns, record_class)
     end
 end
 
---- Convert a raw driver value into a Lua value for the given column.
+--- Convert a raw driver value into a Lua value for the given column (decode).
 ---@param column NormColumn
 ---@param value any
 ---@return any
@@ -1808,7 +1926,42 @@ function NormModel:parse(column, value)
         if (type(value) == "boolean") then return value; end
         return value == "1" or value == "true";
     end
+    if (column.kind == "json") then
+        -- Some drivers (e.g. mysql2 for JSON columns) already return a table; only
+        -- decode raw strings. On failure keep the raw value rather than throwing.
+        if (type(value) == "string") then
+            local ok, decoded = pcall(self.orm.json.decode, value);
+            if (ok) then return decoded; end
+        end
+        return value;
+    end
     return value;
+end
+
+--- Convert a Lua value into something storable for the given column (encode).
+--- Only `json` tables are transformed; a value already a string is passed
+--- through (so a pre-encoded string is never double-encoded).
+---@param column NormColumn
+---@param value any
+---@return any
+function NormModel:serialize(column, value)
+    if (column.kind == "json" and type(value) == "table") then
+        return self.orm.json.encode(value);
+    end
+    return value;
+end
+
+--- Encode a `{ column = value }` write payload (INSERT/UPDATE) column by column.
+---@private
+---@param data table<string, any>
+---@return table<string, any>
+function NormModel:_encode_write(data)
+    local out = {};
+    for k, v in pairs(data) do
+        local col = self.columns_by_name[k];
+        out[k] = col and self:serialize(col, v) or v;
+    end
+    return out;
 end
 
 --- Wrap a DB row into a persisted record.
@@ -2005,6 +2158,7 @@ local class = class;
 local utils = require("utils");
 local sqlmod = require("sql");
 local promise = require("promise");
+local jsonmod = require("json");
 local model_module = require("model");
 
 ---@class NormOrm: LightClass
@@ -2013,6 +2167,7 @@ local model_module = require("model");
 ---@field models table<string, NormModel>
 ---@field log boolean
 ---@field foreign_keys boolean|"auto" Whether `sync()` emits SQL FOREIGN KEY constraints.
+---@field json NormJsonProvider Provider used to (de)serialise `json` columns.
 ---@field private _logger fun(level: string, message: string)
 ---@field private _warned_sqlite_fk boolean
 ---@overload fun(options: NormOptions): NormOrm
@@ -2024,6 +2179,7 @@ local NormOrm = class.new("NormOrm");
 ---@field log? boolean Log every executed statement.
 ---@field logger? fun(level: string, message: string)
 ---@field foreignKeys? boolean|"auto" Emit SQL FOREIGN KEY constraints from `belongsTo` relations. `"auto"` (default) emits on MySQL, skips on SQLite (with a one-time warning); `true` always emits; `false` never emits (no warning).
+---@field json? NormJsonProvider|"auto"|false JSON provider for `json` columns. `"auto"` (default) uses the adapter's, else auto-detects (Nanos `JSON` / Lua `json`), else raw passthrough; `false` disables (de)serialisation.
 
 ---@param options NormOptions
 function NormOrm:__init(options)
@@ -2050,6 +2206,21 @@ function NormOrm:__init(options)
     self._logger = options.logger or utils.logger;
     self.foreign_keys = (options.foreignKeys == nil) and "auto" or options.foreignKeys;
     self._warned_sqlite_fk = false;
+
+    -- JSON provider for `json` columns: explicit > adapter default > auto-detect.
+    -- `false` disables it (raw string passthrough).
+    local json_opt = options.json;
+    if (json_opt == false) then
+        self.json = jsonmod.raw();
+    elseif (json_opt ~= nil and json_opt ~= "auto") then
+        self.json = jsonmod.define(json_opt);
+    else
+        local from_adapter;
+        if (type(self.adapter.default_json_provider) == "function") then
+            from_adapter = self.adapter:default_json_provider();
+        end
+        self.json = from_adapter or jsonmod.detect();
+    end
 end
 
 ---@private
@@ -2423,6 +2594,7 @@ local class = class;
 local utils = require("utils");
 local NormAdapter = require("adapter");
 local promise = require("promise");
+local jsonlib = require("json");
 
 ---@class NormNanosAdapterOptions: NormAdapterOptions
 ---@field engine? integer A `DatabaseEngine` enum value (required unless `database` is given).
@@ -2492,6 +2664,17 @@ function NormNanosAdapter:default_provider()
         if (ok) then return provider; end
     end
     return nil; -- fall back to the built-in provider
+end
+
+--- Nanos exposes a global `JSON` class (`stringify`/`parse`); use it to
+--- (de)serialise `json` columns automatically.
+---@return NormJsonProvider|nil
+function NormNanosAdapter:default_json_provider()
+    if (type(_ENV.JSON) == "table") then
+        local ok, provider = pcall(jsonlib.nanos, _ENV.JSON);
+        if (ok) then return provider; end
+    end
+    return nil; -- fall back to auto-detection / raw passthrough
 end
 
 --- Nanos binds parameters with NUMBERED placeholders (`:0`, `:1`, ... 0-indexed),
@@ -2597,6 +2780,7 @@ local class = class;
 local utils = require("utils");
 local NormAdapter = require("adapter");
 local promise = require("promise");
+local jsonlib = require("json");
 
 ---@class NormOxMySQLAdapterOptions: NormAdapterOptions
 ---@field oxmysql? table Inject the oxmysql export (defaults to `exports.oxmysql`).
@@ -2649,6 +2833,17 @@ function NormOxMySQLAdapter:default_provider()
         return promise.cfx(_ENV.promise);
     end
     return nil;
+end
+
+--- FiveM exposes a global `json` (`encode`/`decode`); use it to (de)serialise
+--- `json` columns automatically.
+---@return NormJsonProvider|nil
+function NormOxMySQLAdapter:default_json_provider()
+    if (type(_ENV.json) == "table") then
+        local ok, provider = pcall(jsonlib.lua, _ENV.json);
+        if (ok) then return provider; end
+    end
+    return nil; -- fall back to auto-detection / raw passthrough
 end
 
 ---@param result number|table
@@ -2716,6 +2911,7 @@ local NormOrm = require("orm");
 ---@field Adapter NormAdapter Base adapter class — extend (or duck-type) for custom adapters.
 ---@field types NormTypes Column type factories.
 ---@field promise NormPromiseLib Promise providers + builders.
+---@field json NormJsonLib JSON providers for `json` columns.
 ---@field dialect NormDialects Built-in SQL dialects.
 ---@field adapters NormAdapters Built-in adapters.
 local Norm = {};
@@ -2725,6 +2921,7 @@ Norm.Orm      = NormOrm;
 Norm.Adapter  = require("adapter");
 Norm.types    = require("types");
 Norm.promise  = require("promise");
+Norm.json     = require("json");
 Norm.dialect  = require("dialect");
 
 Norm.adapters = {
