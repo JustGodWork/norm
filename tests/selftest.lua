@@ -682,5 +682,61 @@ Player:update_or_create({ account_id = "DDD" }, { name = "Dave" }):next(function
 check("update_or_create inserts when missing", p5 and p5.__persisted == true and p5.name == "Dave");
 check("update_or_create missing emitted an INSERT", emitted(fc, "INSERT"));
 
+-- ===============================================================
+print("== Test group 15: atomic upsert (ON CONFLICT / ON DUPLICATE KEY) ==");
+local function upsert_sql_of(mock)
+    for _, c in ipairs(mock.calls) do
+        if (c.sql:find("ON DUPLICATE KEY UPDATE", 1, true) or c.sql:find("ON CONFLICT", 1, true)) then
+            return c.sql;
+        end
+    end
+end
+
+-- MySQL: ON DUPLICATE KEY UPDATE col = VALUES(col)
+local um = Mock({ dialect = "mysql" });
+um.query_result = { { id = 1, account_id = "X", coins = 5 } };
+local Acc = orm.new({ adapter = um, promise = orm.promise.builtin() }):define("accounts", {
+    id = orm.types.id(),
+    account_id = orm.types.string({ length = 32, unique = true }),
+    coins = orm.types.integer({ default = 0 }),
+});
+local up;
+Acc:upsert({ account_id = "X", coins = 5 }, { conflict = { "account_id" } }):next(function(r) up = r; end);
+local usql = upsert_sql_of(um);
+check("mysql upsert uses ON DUPLICATE KEY UPDATE", usql ~= nil, usql);
+check("mysql upsert updates coins via VALUES()", usql and usql:find("`coins` = VALUES(`coins`)", 1, true) ~= nil, usql);
+check("mysql upsert does not update the conflict column", usql and usql:find("`account_id` = VALUES", 1, true) == nil, usql);
+check("upsert returns the read-back record", up and up.account_id == "X", up and up.account_id);
+
+-- SQLite: ON CONFLICT (target) DO UPDATE SET col = excluded.col
+local us = Mock({ dialect = "sqlite" });
+us.query_result = { { id = 1, account_id = "X", coins = 5 } };
+local Acc2 = orm.new({ adapter = us, promise = orm.promise.builtin() }):define("accounts", {
+    id = orm.types.id(),
+    account_id = orm.types.string({ length = 32, unique = true }),
+    coins = orm.types.integer({ default = 0 }),
+});
+Acc2:upsert({ account_id = "X", coins = 5 }, { conflict = { "account_id" } });
+local ssql = upsert_sql_of(us);
+check("sqlite upsert uses ON CONFLICT (...) DO UPDATE",
+    ssql and ssql:find("ON CONFLICT (`account_id`) DO UPDATE SET", 1, true) ~= nil, ssql);
+check("sqlite upsert sets coins = excluded.coins",
+    ssql and ssql:find("`coins` = excluded.`coins`", 1, true) ~= nil, ssql);
+
+-- timestamps: insert stamps both; conflict-update bumps updated_at, preserves created_at
+local ut = Mock({ dialect = "sqlite" });
+ut.query_result = { { id = 1, account_id = "X" } };
+local Acc3 = orm.new({ adapter = ut, promise = orm.promise.builtin() }):define("accounts", {
+    id = orm.types.id(),
+    account_id = orm.types.string({ length = 32, unique = true }),
+}, { timestamps = true });
+Acc3:upsert({ account_id = "X" }, { conflict = { "account_id" } });
+local tsql = upsert_sql_of(ut);
+check("upsert inserts created_at + updated_at",
+    tsql and tsql:find("`created_at`", 1, true) ~= nil and tsql:find("`updated_at`", 1, true) ~= nil, tsql);
+check("upsert update bumps updated_at, preserves created_at",
+    tsql and tsql:find("`updated_at` = excluded.`updated_at`", 1, true) ~= nil
+        and tsql:find("`created_at` = excluded.`created_at`", 1, true) == nil, tsql);
+
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
 if (failed > 0) then error("self-test failed"); end
