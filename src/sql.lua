@@ -385,6 +385,25 @@ function sql.update(state, data, d)
     return statement, params;
 end
 
+--- Atomic in-place column arithmetic: `UPDATE t SET col = col + ?[, ...] WHERE ...`.
+--- Each entry is `{ column = ..., amount = ... }` (a negative amount decrements).
+---@param state NormQueryState
+---@param columns {column: string, amount: number}[]
+---@param d NormDialect
+---@return string statement, any[] params
+function sql.increment(state, columns, d)
+    local params, sets = {}, {};
+    for i = 1, #columns do
+        local c = columns[i];
+        params[#params + 1] = normalize(c.amount);
+        local q = d.quote(c.column);
+        sets[#sets + 1] = ("%s = %s + %s"):format(q, q, d.placeholder(#params));
+    end
+    local statement = ("UPDATE %s SET %s"):format(d.quote(state.table), table.concat(sets, ", "));
+    statement = statement .. compile_where(state.wheres, d, params);
+    return statement, params;
+end
+
 --- DELETE from state.
 ---@param state NormQueryState
 ---@param d NormDialect
