@@ -178,7 +178,7 @@ function NormRecord:_do_insert(cb)
     if (can_return) then
         local statement, params = sqlmod.insert(model.table, model:_encode_write(data), d, model.primary_key);
         orm:_trace(statement, params);
-        orm.adapter:raw_query(statement, params, function(err, rows)
+        orm:_raw_query(statement, params, function(err, rows)
             if (err ~= nil) then return cb(err); end
             rows = rows or {};
             self.__persisted = true;
@@ -194,7 +194,7 @@ function NormRecord:_do_insert(cb)
 
     local statement, params = sqlmod.insert(model.table, model:_encode_write(data), d);
     orm:_trace(statement, params);
-    orm.adapter:raw_execute(statement, params, function(err, res)
+    orm:_raw_execute(statement, params, function(err, res)
         if (err ~= nil) then return cb(err); end
         self.__persisted = true;
         if (model.autoincrement_pk and res and res.insertId ~= nil) then
@@ -229,7 +229,7 @@ function NormRecord:_do_update(cb)
     local state = { table = model.table, wheres = { { column = pk, op = "=", value = self[pk] } } };
     local statement, params = sqlmod.update(state, model:_encode_write(changed), d);
     orm:_trace(statement, params);
-    orm.adapter:raw_execute(statement, params, function(err)
+    orm:_raw_execute(statement, params, function(err)
         if (err ~= nil) then return cb(err); end
         self:_snapshot();
         cb(nil);
@@ -334,7 +334,7 @@ function NormRecord:attach(name, ids, pivot)
             if (pivot) then for k, v in pairs(pivot) do row[k] = v; end end
             local statement, params = sqlmod.insert(info.through, row, info.d);
             orm:_trace(statement, params);
-            orm.adapter:raw_execute(statement, params, function(err)
+            orm:_raw_execute(statement, params, function(err)
                 if (err ~= nil) then return reject(err); end
                 step();
             end);
@@ -364,7 +364,7 @@ function NormRecord:detach(name, ids)
         if (list) then wheres[#wheres + 1] = { column = info.other, op = "IN", value = list }; end
         local statement, params = sqlmod.delete({ table = info.through, wheres = wheres }, info.d);
         orm:_trace(statement, params);
-        orm.adapter:raw_execute(statement, params, function(err, res)
+        orm:_raw_execute(statement, params, function(err, res)
             if (err ~= nil) then return reject(err); end
             resolve((res and res.affectedRows) or 0);
         end);
@@ -393,7 +393,7 @@ function NormRecord:sync_pivot(name, ids)
             wheres = { { column = info.main, op = "=", value = info.local_value } },
         }, info.d);
         orm:_trace(sel, sparams);
-        orm.adapter:raw_query(sel, sparams, function(err, rows)
+        orm:_raw_query(sel, sparams, function(err, rows)
             if (err ~= nil) then return reject(err); end
             rows = rows or {};
             local current, desired_set = {}, {};
@@ -411,7 +411,7 @@ function NormRecord:sync_pivot(name, ids)
                     local statement, params = sqlmod.insert(info.through,
                         { [info.main] = info.local_value, [info.other] = to_attach[i] }, info.d);
                     orm:_trace(statement, params);
-                    orm.adapter:raw_execute(statement, params, function(ierr)
+                    orm:_raw_execute(statement, params, function(ierr)
                         if (ierr ~= nil) then return reject(ierr); end
                         step();
                     end);
@@ -428,7 +428,7 @@ function NormRecord:sync_pivot(name, ids)
                 },
             }, info.d);
             orm:_trace(statement, params);
-            orm.adapter:raw_execute(statement, params, function(derr)
+            orm:_raw_execute(statement, params, function(derr)
                 if (derr ~= nil) then return reject(derr); end
                 do_attach();
             end);
@@ -789,7 +789,7 @@ function NormModel:_find_by_attrs(attributes, cb)
     end
     local statement, params = sqlmod.select(state, d);
     orm:_trace(statement, params);
-    orm.adapter:raw_query(statement, params, function(err, rows)
+    orm:_raw_query(statement, params, function(err, rows)
         if (err ~= nil) then return cb(err); end
         rows = rows or {};
         cb(nil, rows[1] and self:wrap(rows[1]) or nil);
@@ -932,7 +932,7 @@ function NormModel:upsert(data, opts)
 
     return orm.provider.new(function(resolve, reject)
         orm:_trace(statement, params);
-        orm.adapter:raw_execute(statement, params, function(err)
+        orm:_raw_execute(statement, params, function(err)
             if (err ~= nil) then return reject(err); end
             -- the write is atomic; read the canonical row back by the conflict key.
             local state = { table = model.table, limit = 1, wheres = {} };
@@ -941,7 +941,7 @@ function NormModel:upsert(data, opts)
             end
             local sel, sparams = sqlmod.select(state, d);
             orm:_trace(sel, sparams);
-            orm.adapter:raw_query(sel, sparams, function(serr, rows)
+            orm:_raw_query(sel, sparams, function(serr, rows)
                 if (serr ~= nil) then return reject(serr); end
                 rows = rows or {};
                 resolve(rows[1] and model:wrap(rows[1]) or nil);
@@ -963,7 +963,15 @@ function NormModel:sync()
     local d = orm.adapter:get_dialect();
     local fks = orm:_should_emit_fk(d) and orm:_collect_foreign_keys(self) or nil;
     local statement = sqlmod.create_table(self.table, self.columns, d, fks);
-    return orm:_execute_map(statement, {}, function() return true; end);
+    orm:_trace(statement, {});
+    -- Schema prep: bypass the readiness queue (like orm:sync) and flush on success.
+    return orm.provider.new(function(resolve, reject)
+        orm.adapter:raw_execute(statement, {}, function(err)
+            if (err ~= nil) then return reject(err); end
+            orm:_flush_ready();
+            resolve(true);
+        end);
+    end);
 end
 
 module.Model = NormModel;
