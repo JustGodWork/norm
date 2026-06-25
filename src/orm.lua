@@ -255,6 +255,7 @@ function NormOrm:_m2m_fetch(model, rel, keys, spec, cb)
             wheres = { { column = other_local, op = "IN", value = related_ids } } };
         if (spec and spec.wheres) then for i = 1, #spec.wheres do tstate.wheres[#tstate.wheres + 1] = spec.wheres[i]; end end
         if (spec and spec.orders and #spec.orders > 0) then tstate.orders = spec.orders; end
+        utils.soft_scope(tstate, target); -- exclude soft-deleted related rows
         local tstmt, tparams = sqlmod.select(tstate, d);
         self:_trace(tstmt, tparams);
         -- invert pivot mapping: related key -> the parent keys linked to it.
@@ -374,6 +375,7 @@ function NormOrm:_load_include_batch(model, mains, name, spec, cb)
         local other_key = rel.otherKey or target.primary_key;
         local state = { table = target.table, wheres = { { column = other_key, op = "IN", value = keys } } };
         if (spec and spec.wheres) then for i = 1, #spec.wheres do state.wheres[#state.wheres + 1] = spec.wheres[i]; end end
+        utils.soft_scope(state, target); -- exclude soft-deleted related rows
         local statement, params = sqlmod.select(state, d);
         self:_trace(statement, params);
         self:_raw_query(statement, params, function(err, rows)
@@ -391,6 +393,7 @@ function NormOrm:_load_include_batch(model, mains, name, spec, cb)
     local state = { table = target.table, wheres = { { column = rel.key, op = "IN", value = keys } } };
     if (spec and spec.wheres) then for i = 1, #spec.wheres do state.wheres[#state.wheres + 1] = spec.wheres[i]; end end
     if (spec and spec.orders and #spec.orders > 0) then state.orders = spec.orders; end
+    utils.soft_scope(state, target); -- exclude soft-deleted related rows
     local statement, params = sqlmod.select(state, d);
     self:_trace(statement, params);
     self:_raw_query(statement, params, function(err, rows)
