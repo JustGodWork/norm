@@ -14,6 +14,17 @@ local function now_utc()
     return ok and s or nil;
 end
 
+--- Merge two attribute tables (`b` overrides `a`), both optional.
+---@param a? table<string, any>
+---@param b? table<string, any>
+---@return table<string, any>
+local function merge_attrs(a, b)
+    local out = {};
+    if (a) then for k, v in pairs(a) do out[k] = v; end end
+    if (b) then for k, v in pairs(b) do out[k] = v; end end
+    return out;
+end
+
 ---@class NormModelModule
 ---@field Record NormRecord
 ---@field Model NormModel
@@ -117,45 +128,18 @@ function NormRecord:_persistable()
     return out;
 end
 
---- Persist the record: INSERT if new, UPDATE if it was loaded from the database.
---- Resolves with the record itself.
---- ```lua
----     local user = User:find(1):await()
----     user.coins = user.coins + 50
----     user:save():await()
---- ```
----@return NormRecordPromise promise resolving to NormRecord (self)
-function NormRecord:save()
+--- Callback-based INSERT primitive (stamps timestamps, encodes, reads the new id
+--- via RETURNING when supported, snapshots). Shared by `:save()` and the
+--- `*OrCreate` helpers so they compose without relying on promise chaining.
+---@private
+---@param cb fun(err: any)
+function NormRecord:_do_insert(cb)
     local model = self.__model;
     local orm = model.orm;
     local d = orm.adapter:get_dialect();
     local ts = model.timestamps;
 
-    if (self.__persisted) then
-        utils.assert(model.primary_key, ("model '%s' has no primary key; cannot update"):format(model.table));
-        local pk = model.primary_key;
-
-        -- Dirty tracking: only write columns that actually changed since load.
-        local changed = self:_changed_columns();
-        changed[pk] = nil; -- never update the primary key
-        if (next(changed) == nil) then
-            -- Nothing changed: skip the query entirely (and don't bump updated_at).
-            return orm.provider.resolve(self);
-        end
-        if (ts and ts.updated) then
-            local nowv = now_utc();
-            if (nowv ~= nil) then self[ts.updated] = nowv; changed[ts.updated] = nowv; end
-        end
-
-        local state = { table = model.table, wheres = { { column = pk, op = "=", value = self[pk] } } };
-        local statement, params = sqlmod.update(state, model:_encode_write(changed), d);
-        return orm:_execute_map(statement, params, function()
-            self:_snapshot();
-            return self;
-        end);
-    end
-
-    -- INSERT: stamp created_at / updated_at (unless the caller set them explicitly).
+    -- stamp created_at / updated_at unless the caller set them explicitly.
     if (ts) then
         local nowv = now_utc();
         if (nowv ~= nil) then
@@ -167,34 +151,97 @@ function NormRecord:save()
     local data = self:_persistable();
     if (model.autoincrement_pk) then data[model.primary_key] = nil; end
 
-    -- If the engine supports `INSERT ... RETURNING` (SQLite >= 3.35 / PostgreSQL),
-    -- read the new id atomically from the INSERT itself (routed as a query, since
-    -- it returns a row). This is pool-safe, unlike a separate LAST_INSERT_ID query.
+    -- INSERT ... RETURNING (SQLite >= 3.35 / PostgreSQL / MariaDB) reads the new id
+    -- atomically (pool-safe) — routed as a query, since it returns a row.
     local can_return = model.autoincrement_pk
         and type(orm.adapter.supports_returning) == "function"
         and orm.adapter:supports_returning();
 
     if (can_return) then
         local statement, params = sqlmod.insert(model.table, model:_encode_write(data), d, model.primary_key);
-        return orm:_query_map(statement, params, function(rows)
+        orm:_trace(statement, params);
+        orm.adapter:raw_query(statement, params, function(err, rows)
+            if (err ~= nil) then return cb(err); end
+            rows = rows or {};
             self.__persisted = true;
             local row = rows[1];
             if (row and row[model.primary_key] ~= nil) then
                 self[model.primary_key] = row[model.primary_key];
             end
             self:_snapshot();
-            return self;
+            cb(nil);
         end);
+        return;
     end
 
     local statement, params = sqlmod.insert(model.table, model:_encode_write(data), d);
-    return orm:_execute_map(statement, params, function(res)
+    orm:_trace(statement, params);
+    orm.adapter:raw_execute(statement, params, function(err, res)
+        if (err ~= nil) then return cb(err); end
         self.__persisted = true;
         if (model.autoincrement_pk and res and res.insertId ~= nil) then
             self[model.primary_key] = res.insertId;
         end
         self:_snapshot();
-        return self;
+        cb(nil);
+    end);
+end
+
+--- Callback-based UPDATE primitive (dirty tracking + updated_at bump). Calls
+--- `cb(nil)` with NO query when nothing changed. Shared by `:save()` /
+--- `updateOrCreate`.
+---@private
+---@param cb fun(err: any)
+function NormRecord:_do_update(cb)
+    local model = self.__model;
+    local orm = model.orm;
+    local d = orm.adapter:get_dialect();
+    local ts = model.timestamps;
+    local pk = model.primary_key;
+    utils.assert(pk, ("model '%s' has no primary key; cannot update"):format(model.table));
+
+    local changed = self:_changed_columns();
+    changed[pk] = nil; -- never update the primary key
+    if (next(changed) == nil) then return cb(nil); end -- nothing changed: no query
+    if (ts and ts.updated) then
+        local nowv = now_utc();
+        if (nowv ~= nil) then self[ts.updated] = nowv; changed[ts.updated] = nowv; end
+    end
+
+    local state = { table = model.table, wheres = { { column = pk, op = "=", value = self[pk] } } };
+    local statement, params = sqlmod.update(state, model:_encode_write(changed), d);
+    orm:_trace(statement, params);
+    orm.adapter:raw_execute(statement, params, function(err)
+        if (err ~= nil) then return cb(err); end
+        self:_snapshot();
+        cb(nil);
+    end);
+end
+
+--- Persist the record: INSERT if new, UPDATE (only changed columns) if it was
+--- loaded from the database. Resolves with the record itself.
+--- ```lua
+---     local user = User:find(1):await()
+---     user.coins = user.coins + 50
+---     user:save():await()
+--- ```
+---@return NormRecordPromise promise resolving to NormRecord (self)
+function NormRecord:save()
+    local model = self.__model;
+    local orm = model.orm;
+    if (self.__persisted) then
+        return orm.provider.new(function(resolve, reject)
+            self:_do_update(function(err)
+                if (err ~= nil) then return reject(err); end
+                resolve(self);
+            end);
+        end);
+    end
+    return orm.provider.new(function(resolve, reject)
+        self:_do_insert(function(err)
+            if (err ~= nil) then return reject(err); end
+            resolve(self);
+        end);
     end);
 end
 
@@ -504,6 +551,103 @@ end
 ---@return NormRecordOrNilPromise promise resolving to NormRecord|nil
 function NormModel:find_by(filter)
     return self:query():where(filter):first();
+end
+
+--- Callback-based "first row matching an ANDed `{ col = value }` filter". Used by
+--- the `*OrCreate` helpers (which must compose without promise chaining).
+---@private
+---@param attributes table<string, any>
+---@param cb fun(err: any, record?: NormRecord|nil)
+function NormModel:_find_by_attrs(attributes, cb)
+    local orm = self.orm;
+    local d = orm.adapter:get_dialect();
+    local state = { table = self.table, limit = 1, wheres = {} };
+    for _, k in ipairs(utils.sorted_keys(attributes)) do
+        state.wheres[#state.wheres + 1] = { column = k, op = "=", value = attributes[k] };
+    end
+    local statement, params = sqlmod.select(state, d);
+    orm:_trace(statement, params);
+    orm.adapter:raw_query(statement, params, function(err, rows)
+        if (err ~= nil) then return cb(err); end
+        rows = rows or {};
+        cb(nil, rows[1] and self:wrap(rows[1]) or nil);
+    end);
+end
+
+--- Find the first record matching `attributes`; if none exists, return an
+--- **unsaved** record built from `attributes` merged with `values` (nothing is
+--- written until you `:save()` it). Resolves with the record.
+--- ```lua
+---     local u = User:find_or_new({ email = "a@b.c" }, { name = "Anon" }):await()
+---     if (not u.__persisted) then u:save():await() end
+--- ```
+---@param attributes table<string, any> Columns to match on.
+---@param values? table<string, any> Extra columns for a freshly built record.
+---@return NormRecordOrNilPromise promise resolving to NormRecord
+function NormModel:find_or_new(attributes, values)
+    local model = self;
+    return self.orm.provider.new(function(resolve, reject)
+        model:_find_by_attrs(attributes, function(err, record)
+            if (err ~= nil) then return reject(err); end
+            resolve(record or model:build(merge_attrs(attributes, values)));
+        end);
+    end);
+end
+
+--- Find the first record matching `attributes`; if none exists, INSERT one built
+--- from `attributes` merged with `values`. Resolves with the (existing or newly
+--- created) record. Not atomic: a unique constraint is the only true guard
+--- against a concurrent double-insert.
+--- ```lua
+---     local player = Player:find_or_create({ account_id = id }, { name = "Guest" }):await()
+--- ```
+---@param attributes table<string, any> Columns to match on (and seed a new record).
+---@param values? table<string, any> Extra columns applied only when creating.
+---@return NormRecordPromise promise resolving to NormRecord
+function NormModel:find_or_create(attributes, values)
+    local model = self;
+    return self.orm.provider.new(function(resolve, reject)
+        model:_find_by_attrs(attributes, function(err, record)
+            if (err ~= nil) then return reject(err); end
+            if (record) then return resolve(record); end
+            local fresh = model:build(merge_attrs(attributes, values));
+            fresh:_do_insert(function(ierr)
+                if (ierr ~= nil) then return reject(ierr); end
+                resolve(fresh);
+            end);
+        end);
+    end);
+end
+
+--- Find the first record matching `attributes` and UPDATE it with `values`; if
+--- none exists, INSERT one from `attributes` merged with `values`. Resolves with
+--- the record. (Application-level upsert; not atomic.)
+--- ```lua
+---     local p = Player:update_or_create({ account_id = id }, { last_seen = now, name = nick }):await()
+--- ```
+---@param attributes table<string, any> Columns to match on (and seed a new record).
+---@param values? table<string, any> Columns to write (on both update and create).
+---@return NormRecordPromise promise resolving to NormRecord
+function NormModel:update_or_create(attributes, values)
+    local model = self;
+    return self.orm.provider.new(function(resolve, reject)
+        model:_find_by_attrs(attributes, function(err, record)
+            if (err ~= nil) then return reject(err); end
+            if (record) then
+                if (values) then for k, v in pairs(values) do record[k] = v; end end
+                record:_do_update(function(uerr)
+                    if (uerr ~= nil) then return reject(uerr); end
+                    resolve(record);
+                end);
+                return;
+            end
+            local fresh = model:build(merge_attrs(attributes, values));
+            fresh:_do_insert(function(ierr)
+                if (ierr ~= nil) then return reject(ierr); end
+                resolve(fresh);
+            end);
+        end);
+    end);
 end
 
 --- Create this model's table (CREATE TABLE IF NOT EXISTS). Prefer `orm:sync()`
