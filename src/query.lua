@@ -304,34 +304,104 @@ function NormQueryBuilder:or_where(column, op, value)
     return push_where(self, column, op, value, "OR");
 end
 
---- Add a `column IN (...)` condition.
+-- Append a where condition with an explicit conjunction.
+---@param self NormQueryBuilder
+local function push(self, cond, bool)
+    cond.bool = bool;
+    self._state.wheres[#self._state.wheres + 1] = cond;
+    return self;
+end
+
+--- `column IN (...)` (and its OR / negated variants).
 --- ```lua
 ---     User:query():where_in("id", { 1, 2, 3 }):all():await()
 --- ```
 ---@param column string
 ---@param list any[]
 ---@return NormQueryBuilder self
-function NormQueryBuilder:where_in(column, list)
-    self._state.wheres[#self._state.wheres + 1] =
-        { column = column, op = "IN", value = list, bool = "AND" };
-    return self;
-end
+function NormQueryBuilder:where_in(column, list) return push(self, { column = column, op = "IN", value = list }, "AND"); end
+---@param column string
+---@param list any[]
+---@return NormQueryBuilder self
+function NormQueryBuilder:or_where_in(column, list) return push(self, { column = column, op = "IN", value = list }, "OR"); end
+---@param column string
+---@param list any[]
+---@return NormQueryBuilder self
+function NormQueryBuilder:where_not_in(column, list) return push(self, { column = column, op = "NOT IN", value = list }, "AND"); end
+---@param column string
+---@param list any[]
+---@return NormQueryBuilder self
+function NormQueryBuilder:or_where_not_in(column, list) return push(self, { column = column, op = "NOT IN", value = list }, "OR"); end
 
+--- `column IS [NOT] NULL` (and OR variants).
 ---@param column string
 ---@return NormQueryBuilder self
-function NormQueryBuilder:where_null(column)
-    self._state.wheres[#self._state.wheres + 1] =
-        { column = column, op = "=", value = nil, bool = "AND" };
-    return self;
-end
-
+function NormQueryBuilder:where_null(column) return push(self, { column = column, op = "=" }, "AND"); end
 ---@param column string
 ---@return NormQueryBuilder self
-function NormQueryBuilder:where_not_null(column)
-    self._state.wheres[#self._state.wheres + 1] =
-        { column = column, op = "!=", value = nil, bool = "AND" };
-    return self;
-end
+function NormQueryBuilder:or_where_null(column) return push(self, { column = column, op = "=" }, "OR"); end
+---@param column string
+---@return NormQueryBuilder self
+function NormQueryBuilder:where_not_null(column) return push(self, { column = column, op = "!=" }, "AND"); end
+---@param column string
+---@return NormQueryBuilder self
+function NormQueryBuilder:or_where_not_null(column) return push(self, { column = column, op = "!=" }, "OR"); end
+
+--- `column != value` (and OR variant).
+---@param column string
+---@param value any
+---@return NormQueryBuilder self
+function NormQueryBuilder:where_not(column, value) return push(self, { column = column, op = "!=", value = value }, "AND"); end
+---@param column string
+---@param value any
+---@return NormQueryBuilder self
+function NormQueryBuilder:or_where_not(column, value) return push(self, { column = column, op = "!=", value = value }, "OR"); end
+
+--- `column [NOT] LIKE pattern` (use `%` / `_` wildcards). With OR / negated variants.
+--- ```lua
+---     User:query():where_like("name", "John%"):all():await()
+--- ```
+---@param column string
+---@param pattern string
+---@return NormQueryBuilder self
+function NormQueryBuilder:where_like(column, pattern) return push(self, { column = column, op = "LIKE", value = pattern }, "AND"); end
+---@param column string
+---@param pattern string
+---@return NormQueryBuilder self
+function NormQueryBuilder:or_where_like(column, pattern) return push(self, { column = column, op = "LIKE", value = pattern }, "OR"); end
+---@param column string
+---@param pattern string
+---@return NormQueryBuilder self
+function NormQueryBuilder:where_not_like(column, pattern) return push(self, { column = column, op = "NOT LIKE", value = pattern }, "AND"); end
+---@param column string
+---@param pattern string
+---@return NormQueryBuilder self
+function NormQueryBuilder:or_where_not_like(column, pattern) return push(self, { column = column, op = "NOT LIKE", value = pattern }, "OR"); end
+
+--- `column [NOT] BETWEEN min AND max` (inclusive). With OR / negated variants.
+--- ```lua
+---     Player:query():where_between("level", 10, 20):all():await()
+--- ```
+---@param column string
+---@param min any
+---@param max any
+---@return NormQueryBuilder self
+function NormQueryBuilder:where_between(column, min, max) return push(self, { column = column, op = "BETWEEN", value = { min, max } }, "AND"); end
+---@param column string
+---@param min any
+---@param max any
+---@return NormQueryBuilder self
+function NormQueryBuilder:or_where_between(column, min, max) return push(self, { column = column, op = "BETWEEN", value = { min, max } }, "OR"); end
+---@param column string
+---@param min any
+---@param max any
+---@return NormQueryBuilder self
+function NormQueryBuilder:where_not_between(column, min, max) return push(self, { column = column, op = "NOT BETWEEN", value = { min, max } }, "AND"); end
+---@param column string
+---@param min any
+---@param max any
+---@return NormQueryBuilder self
+function NormQueryBuilder:or_where_not_between(column, min, max) return push(self, { column = column, op = "NOT BETWEEN", value = { min, max } }, "OR"); end
 
 --- Keep only rows that HAVE at least one related row for `name` (optionally
 --- matching the `configure` conditions). Compiles to `EXISTS (correlated subquery)`.
