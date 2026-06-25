@@ -57,6 +57,18 @@ function NormAdapter:default_json_provider()
     return nil;
 end
 
+--- Optional: whether this adapter can run an interactive transaction on a pinned
+--- connection. Defaults to false → `db:transaction(...)` throws on this adapter.
+--- An adapter that returns true MUST implement `transaction(body, finish)`:
+---   * the adapter opens the transaction, then calls `body(tx_query, tx_execute)`
+---     where `tx_query(q, p, cb)` / `tx_execute(q, p, cb)` run on the transaction;
+---   * `body` returns `true` to COMMIT, `false` to ROLL BACK;
+---   * the adapter commits/rolls back, then calls `finish(err)` (err nil on commit).
+---@return boolean
+function NormAdapter:supports_transactions()
+    return false;
+end
+
 --- Optional: whether this adapter's engine supports `INSERT ... RETURNING <col>`
 --- (SQLite >= 3.35, PostgreSQL). When true, the ORM reads a new row's
 --- auto-increment id atomically from the INSERT itself, instead of a separate
