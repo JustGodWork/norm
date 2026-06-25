@@ -516,6 +516,20 @@ function NormModel:limit(...) return self:query():limit(...); end
 ---@return NormQueryBuilder
 function NormModel:select(...) return self:query():select(...); end
 
+---@param expr string
+---@return NormQueryBuilder
+function NormModel:select_raw(expr) return self:query():select_raw(expr); end
+
+---@param ... string
+---@return NormQueryBuilder
+function NormModel:group_by(...) return self:query():group_by(...); end
+
+---@param expr string
+---@param op? string
+---@param value? any
+---@return NormQueryBuilder
+function NormModel:having(...) return self:query():having(...); end
+
 --- Resolves with every record in the table.
 --- ```lua
 ---     local users = User:all():await()
@@ -530,6 +544,29 @@ function NormModel:all() return self:query():all(); end
 --- ```
 ---@return NormNumberPromise promise resolving to number
 function NormModel:count() return self:query():count(); end
+
+--- SUM of a column across the whole table.
+--- ```lua
+---     local total = User:sum("coins"):await()
+--- ```
+---@param column string
+---@return NormNumberPromise promise resolving to number
+function NormModel:sum(column) return self:query():sum(column); end
+
+--- AVG of a column across the whole table.
+---@param column string
+---@return NormNumberPromise promise resolving to number
+function NormModel:avg(column) return self:query():avg(column); end
+
+--- MIN of a column across the whole table.
+---@param column string
+---@return NormNumberPromise promise resolving to the column's value type
+function NormModel:min(column) return self:query():min(column); end
+
+--- MAX of a column across the whole table.
+---@param column string
+---@return NormNumberPromise promise resolving to the column's value type
+function NormModel:max(column) return self:query():max(column); end
 
 --- Find a single record by its primary key. Resolves with the record or nil.
 --- ```lua
