@@ -45,11 +45,11 @@ sql.normalize = normalize;
 ---@param d NormDialect
 ---@return string
 local function column_def(column, d)
-    -- SQLite needs the exact "INTEGER PRIMARY KEY AUTOINCREMENT" spelling.
-    if (column.primary and d.name == "sqlite") then
-        local def = d.quote(column.name) .. " INTEGER PRIMARY KEY";
-        if (column.autoincrement) then def = def .. " AUTOINCREMENT"; end
-        return def;
+    -- SQLite needs the exact "INTEGER PRIMARY KEY AUTOINCREMENT" spelling for an
+    -- auto-increment PK. A non-autoincrement PK (e.g. a string/UUID key) must keep
+    -- its real type, so only the autoincrement case takes this early path.
+    if (column.primary and d.name == "sqlite" and column.autoincrement) then
+        return d.quote(column.name) .. " INTEGER PRIMARY KEY AUTOINCREMENT";
     end
 
     local type_sql = d.types[column.kind] or "TEXT";
@@ -361,6 +361,73 @@ function sql.delete(state, d)
     local statement = ("DELETE FROM %s"):format(d.quote(state.table));
     statement = statement .. compile_where(state.wheres, d, params);
     return statement, params;
+end
+
+-- ==========================================================================
+-- DDL for migrations (ALTER TABLE / indexes). Statement-only, no params.
+-- ==========================================================================
+
+--- `ALTER TABLE t ADD COLUMN <def>`. `column` is a Norm column descriptor (`.name` set).
+---@param table_name string
+---@param column NormColumn
+---@param d NormDialect
+---@return string
+function sql.add_column(table_name, column, d)
+    return ("ALTER TABLE %s ADD COLUMN %s"):format(d.quote(table_name), column_def(column, d));
+end
+
+--- `ALTER TABLE t DROP COLUMN c` (MySQL, MariaDB, SQLite >= 3.35, Postgres).
+---@param table_name string
+---@param name string
+---@param d NormDialect
+---@return string
+function sql.drop_column(table_name, name, d)
+    return ("ALTER TABLE %s DROP COLUMN %s"):format(d.quote(table_name), d.quote(name));
+end
+
+--- `ALTER TABLE t RENAME COLUMN a TO b` (MySQL 8 / MariaDB 10.5.2+ / SQLite 3.25+ / Postgres).
+---@param table_name string
+---@param from string
+---@param to string
+---@param d NormDialect
+---@return string
+function sql.rename_column(table_name, from, to, d)
+    return ("ALTER TABLE %s RENAME COLUMN %s TO %s"):format(
+        d.quote(table_name), d.quote(from), d.quote(to));
+end
+
+--- `CREATE [UNIQUE] INDEX name ON table (cols...)`.
+---@param table_name string
+---@param index_name string
+---@param columns string[]
+---@param unique boolean
+---@param d NormDialect
+---@return string
+function sql.add_index(table_name, index_name, columns, unique, d)
+    local cols = {};
+    for i = 1, #columns do cols[i] = d.quote(columns[i]); end
+    return ("CREATE %sINDEX %s ON %s (%s)"):format(
+        unique and "UNIQUE " or "", d.quote(index_name), d.quote(table_name), table.concat(cols, ", "));
+end
+
+--- `DROP INDEX`. MySQL needs the table (`DROP INDEX i ON t`); SQLite/Postgres don't.
+---@param index_name string
+---@param table_name string
+---@param d NormDialect
+---@return string
+function sql.drop_index(index_name, table_name, d)
+    if (d.name == "mysql") then
+        return ("DROP INDEX %s ON %s"):format(d.quote(index_name), d.quote(table_name));
+    end
+    return ("DROP INDEX %s"):format(d.quote(index_name));
+end
+
+--- `DROP TABLE IF EXISTS t`.
+---@param table_name string
+---@param d NormDialect
+---@return string
+function sql.drop_table(table_name, d)
+    return ("DROP TABLE IF EXISTS %s"):format(d.quote(table_name));
 end
 
 return sql;
