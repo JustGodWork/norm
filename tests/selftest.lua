@@ -1687,6 +1687,52 @@ q2:first();
 check("first does not clobber an explicit limit", last_sql(lm):find("LIMIT 1", 1, true) ~= nil, last_sql(lm));
 q2:all();
 check("the explicit limit survives first()", last_sql(lm):find("LIMIT 5", 1, true) ~= nil, last_sql(lm));
+print("== Test group 40: MySQL-valid DDL ==");
+local dm = Mock({ dialect = "mysql" });
+local ddb = orm.new({ adapter = dm, promise = orm.promise.builtin() });
+ddb:define("things", {
+    id    = orm.types.id(),
+    label = orm.types.string(),                                  -- no length
+    code  = orm.types.string({ length = 10, index = true }),
+    notes = orm.types.text({ default = "none" }),
+    blob  = orm.types.json({ default = '{"x":0}' }),
+});
+ddb:sync();
+local dstmts = {};
+for _, c in ipairs(dm.calls) do dstmts[#dstmts + 1] = c.sql; end
+local create = dstmts[1];
+check("string without length gets an explicit VARCHAR width",
+    create:find("`label` VARCHAR(255)", 1, true) ~= nil, create);
+check("string with length keeps it", create:find("`code` VARCHAR(10)", 1, true) ~= nil, create);
+check("no literal DEFAULT on a TEXT column", create:find("`notes` TEXT DEFAULT", 1, true) == nil, create);
+check("no literal DEFAULT on a JSON column", create:find("`blob` JSON DEFAULT", 1, true) == nil, create);
+check("mysql index omits IF NOT EXISTS",
+    dstmts[2] == "CREATE INDEX `idx_things_code` ON `things` (`code`)", tostring(dstmts[2]));
+
+local sm2 = Mock({ dialect = "sqlite" });
+local sdb2 = orm.new({ adapter = sm2, promise = orm.promise.builtin() });
+sdb2:define("things", { id = orm.types.id(), code = orm.types.string({ length = 10, index = true }),
+    notes = orm.types.text({ default = "none" }) });
+sdb2:sync();
+check("sqlite index keeps IF NOT EXISTS",
+    sm2.calls[2].sql:find("CREATE INDEX IF NOT EXISTS", 1, true) ~= nil, sm2.calls[2].sql);
+check("sqlite keeps a literal DEFAULT on TEXT",
+    sm2.calls[1].sql:find("`notes` TEXT DEFAULT 'none'", 1, true) ~= nil, sm2.calls[1].sql);
+
+-- a failing index statement must not fail sync() where IF NOT EXISTS is unavailable
+local FailIdx = class.extend("FailIdx", orm.Adapter);
+function FailIdx:__init(o) orm.Adapter.__init(self, o); end
+function FailIdx:raw_query(q, p, cb) cb(nil, {}); end
+function FailIdx:raw_execute(q, p, cb)
+    if (q:find("CREATE INDEX", 1, true)) then return cb("Duplicate key name 'idx_t_code'"); end
+    cb(nil, { affectedRows = 0 });
+end
+local fdb = orm.new({ adapter = FailIdx({ dialect = "mysql" }), promise = orm.promise.builtin(),
+    logger = function() end });
+fdb:define("t", { id = orm.types.id(), code = orm.types.string({ length = 8, index = true }) });
+local synced, sync_err = nil, nil;
+fdb:sync():next(function(v) synced = v; end, function(e) sync_err = e; end);
+check("a duplicate index does not fail sync on mysql", synced == true and sync_err == nil, tostring(sync_err));
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));

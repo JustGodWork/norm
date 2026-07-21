@@ -18,6 +18,8 @@ end
 ---@field autoincrement string
 ---@field table_suffix string
 ---@field types table<string, string>
+---@field index_if_not_exists boolean Whether `CREATE INDEX IF NOT EXISTS` is valid syntax.
+---@field defaults_on_text boolean Whether TEXT/BLOB/JSON columns accept a literal DEFAULT.
 
 ---@type NormDialect
 dialect.mysql = {
@@ -26,8 +28,12 @@ dialect.mysql = {
     placeholder = function() return "?"; end,
     autoincrement = "AUTO_INCREMENT",
     table_suffix = " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+    -- Stock MySQL 8 supports neither; MariaDB does support the index form, but the
+    -- adapter cannot tell them apart at DDL time, so assume the stricter engine.
+    index_if_not_exists = false,
+    defaults_on_text = false,
     types = {
-        id = "INT", integer = "INT", bigint = "BIGINT", string = "VARCHAR",
+        id = "INT", integer = "INT", bigint = "BIGINT", string = "VARCHAR(255)",
         text = "TEXT", float = "FLOAT", double = "DOUBLE", boolean = "TINYINT(1)",
         datetime = "DATETIME", date = "DATE", json = "JSON",
     },
@@ -40,6 +46,8 @@ dialect.sqlite = {
     placeholder = function() return "?"; end,
     autoincrement = "AUTOINCREMENT",
     table_suffix = "",
+    index_if_not_exists = true,
+    defaults_on_text = true,
     types = {
         id = "INTEGER", integer = "INTEGER", bigint = "INTEGER", string = "TEXT",
         text = "TEXT", float = "REAL", double = "REAL", boolean = "INTEGER",

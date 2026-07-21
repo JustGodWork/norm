@@ -1309,7 +1309,10 @@ function NormModel:sync()
     local statements = { sqlmod.create_table(self.table, self.columns, d, fks) };
     if (self.indexes) then
         for _, ix in ipairs(self.indexes) do
-            statements[#statements + 1] = sqlmod.add_index(self.table, ix.name, ix.columns, ix.unique, d, true);
+            statements[#statements + 1] = {
+                sql = sqlmod.add_index(self.table, ix.name, ix.columns, ix.unique, d, true),
+                optional = (d.index_if_not_exists == false),
+            };
         end
     end
     -- Schema prep: bypass the readiness queue (like orm:sync) and flush on success.
@@ -1318,9 +1321,15 @@ function NormModel:sync()
         local function step()
             i = i + 1;
             if (i > #statements) then orm:_flush_ready(); return resolve(true); end
-            orm:_trace(statements[i], {});
-            orm.adapter:raw_execute(statements[i], {}, function(err)
-                if (err ~= nil) then return reject(err); end
+            local entry = statements[i];
+            local statement = (type(entry) == "table") and entry.sql or entry;
+            local optional = (type(entry) == "table") and entry.optional;
+            orm:_trace(statement, {});
+            orm.adapter:raw_execute(statement, {}, function(err)
+                if (err ~= nil) then
+                    if (not optional) then return reject(err); end
+                    orm._logger("DB", ("index statement skipped: %s"):format(tostring(err)));
+                end
                 step();
             end);
         end
