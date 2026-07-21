@@ -698,10 +698,13 @@ function NormOrm:sync()
         local m = self.models[name];
         local fks = emit_fk and self:_collect_foreign_keys(m) or nil;
         statements[#statements + 1] = sqlmod.create_table(m.table, m.columns, d, fks);
-        -- each table's indexes, right after it's created (idempotent via IF NOT EXISTS).
+        -- each table's indexes, right after it's created.
         if (m.indexes) then
             for _, ix in ipairs(m.indexes) do
-                statements[#statements + 1] = sqlmod.add_index(m.table, ix.name, ix.columns, ix.unique, d, true);
+                statements[#statements + 1] = {
+                    sql = sqlmod.add_index(m.table, ix.name, ix.columns, ix.unique, d, true),
+                    optional = (d.index_if_not_exists == false),
+                };
             end
         end
     end
@@ -714,9 +717,17 @@ function NormOrm:sync()
                 self:_flush_ready(); -- schema prepared: release any queued data ops
                 return resolve(true);
             end
-            self:_trace(statements[index], {});
-            self.adapter:raw_execute(statements[index], {}, function(err)
-                if (err ~= nil) then return reject(err); end
+            local entry = statements[index];
+            local statement = (type(entry) == "table") and entry.sql or entry;
+            local optional = (type(entry) == "table") and entry.optional;
+            self:_trace(statement, {});
+            self.adapter:raw_execute(statement, {}, function(err)
+                if (err ~= nil) then
+                    -- Without IF NOT EXISTS support, re-creating an existing index is
+                    -- the expected outcome of a second sync(), not a schema failure.
+                    if (not optional) then return reject(err); end
+                    self._logger("DB", ("index statement skipped: %s"):format(tostring(err)));
+                end
                 step();
             end);
         end

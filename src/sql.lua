@@ -154,9 +154,17 @@ local function column_def(column, d)
         if (column.unique) then def = def .. " UNIQUE"; end
     end
 
+    -- MySQL rejects a literal DEFAULT on TEXT/BLOB/JSON (error 1101); only a
+    -- parenthesised expression is allowed there, which `raw()` still provides.
+    local literal_default_ok = d.defaults_on_text ~= false
+        or not (column.kind == "text" or column.kind == "json");
+
     if (column.default ~= nil) then
         if (type(column.default) == "table" and column.default.__raw) then
             def = def .. " DEFAULT " .. column.default.__raw;
+        elseif (not literal_default_ok) then
+            utils.log("WARN", ("[norm] column '%s': %s does not accept a literal DEFAULT on a %s column; skipped"):format(
+                tostring(column.name), d.name, column.kind));
         elseif (type(column.default) == "string") then
             def = def .. " DEFAULT '" .. column.default:gsub("'", "''") .. "'";
         elseif (type(column.default) == "boolean") then
@@ -632,8 +640,9 @@ function sql.rename_column(table_name, from, to, d)
 end
 
 --- `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (cols...)`. `if_not_exists`
---- (used by `sync()` for idempotency) is supported by SQLite/MariaDB/Postgres but
---- NOT by stock MySQL 8 — manage those indexes via migrations instead.
+--- (used by `sync()` for idempotency) is only emitted on dialects that accept it:
+--- stock MySQL 8 rejects the clause outright, so it is dropped there and `sync()`
+--- tolerates the resulting "duplicate index" error instead.
 ---@param table_name string
 ---@param index_name string
 ---@param columns string[]
@@ -644,8 +653,9 @@ end
 function sql.add_index(table_name, index_name, columns, unique, d, if_not_exists)
     local cols = {};
     for i = 1, #columns do cols[i] = d.quote(columns[i]); end
+    local guard = (if_not_exists and d.index_if_not_exists ~= false) and "IF NOT EXISTS " or "";
     return ("CREATE %sINDEX %s%s ON %s (%s)"):format(
-        unique and "UNIQUE " or "", if_not_exists and "IF NOT EXISTS " or "",
+        unique and "UNIQUE " or "", guard,
         d.quote(index_name), d.quote(table_name), table.concat(cols, ", "));
 end
 
