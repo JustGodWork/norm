@@ -466,7 +466,7 @@ function sql.select(state, d)
     local params = {};
     local cols = {};
     if (state.columns) then
-        for i = 1, #state.columns do cols[#cols + 1] = d.quote(state.columns[i]); end
+        for i = 1, #state.columns do cols[#cols + 1] = quote_ref(d, state.columns[i]); end
     end
     if (state.raw_columns) then
         for i = 1, #state.raw_columns do cols[#cols + 1] = state.raw_columns[i]; end
@@ -481,7 +481,7 @@ function sql.select(state, d)
 
     if (state.groups and #state.groups > 0) then
         local g = {};
-        for i = 1, #state.groups do g[i] = d.quote(state.groups[i]); end
+        for i = 1, #state.groups do g[i] = quote_ref(d, state.groups[i]); end
         statement = statement .. " GROUP BY " .. table.concat(g, ", ");
     end
 
@@ -538,7 +538,7 @@ end
 ---@return string statement, any[] params
 function sql.aggregate(state, func, column, d)
     local params = {};
-    local target = column and d.quote(column) or "*";
+    local target = column and quote_ref(d, column) or "*";
     local statement = ("SELECT %s(%s) AS %s FROM %s"):format(
         func, target, d.quote("aggregate"), d.quote(state.table));
     statement = statement .. compile_joins(state, d);
