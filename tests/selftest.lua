@@ -1598,6 +1598,30 @@ S:query():order("qty"):all();
 check("default direction is ASC", last_sql(sm):find("ORDER BY `qty` ASC", 1, true) ~= nil, last_sql(sm));
 S:query():where("qty", ">=", 3):all();
 check("allowed operator still works", last_sql(sm):find("`qty` >= ?", 1, true) ~= nil, last_sql(sm));
+print("== Test group 36: nil values never desync the bindings ==");
+local nm = Mock({ dialect = "mysql" });
+local ndb = orm.new({ adapter = nm, promise = orm.promise.builtin() });
+local N = ndb:define("rows", { id = orm.types.id(), name = orm.types.string({ length = 20 }), views = orm.types.integer() });
+
+check("where with an explicit nil value raises",
+    select(1, pcall(function() N:query():where("views", ">", nil):all(); end)) == false);
+check("where_between with a nil bound raises",
+    select(1, pcall(function() N:query():where_between("views", 10, nil):all(); end)) == false);
+check("where_in with a hole raises",
+    select(1, pcall(function() N:query():where_in("id", { 1, nil, 3 }):all(); end)) == false);
+check("having with an explicit nil value raises",
+    select(1, pcall(function() N:query():select_raw("COUNT(*) AS n"):having("COUNT(*)", ">", nil):rows(); end)) == false);
+
+N:query():where("name", "bob"):all();
+check("two-arg where still binds the value",
+    last_sql(nm):find("`name` = ?", 1, true) ~= nil and nm.calls[#nm.calls].params[1] == "bob", last_sql(nm));
+N:query():where("views", ">", 5):where("name", "bob"):all();
+local p = nm.calls[#nm.calls].params;
+check("three-arg where keeps params aligned", #p == 2 and p[1] == 5 and p[2] == "bob", tostring(#p));
+N:query():where_between("views", 1, 9):where("name", "z"):all();
+local p2 = nm.calls[#nm.calls].params;
+check("between binds both bounds then the next value",
+    #p2 == 3 and p2[1] == 1 and p2[2] == 9 and p2[3] == "z", tostring(#p2));
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));

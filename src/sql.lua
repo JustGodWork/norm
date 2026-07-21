@@ -358,6 +358,10 @@ local function compile_condition(cond, d, params)
         end
         local marks = {};
         for j = 1, #cond.value do
+            -- `params[#params + 1] = nil` is a no-op while the placeholder is
+            -- still emitted, which shifts every later binding by one.
+            utils.assert(cond.value[j] ~= nil,
+                ("%s list for column '%s' has a nil at index %d"):format(op, tostring(cond.column), j));
             params[#params + 1] = normalize(cond.value[j]);
             marks[#marks + 1] = d.placeholder(#params);
         end
@@ -365,6 +369,8 @@ local function compile_condition(cond, d, params)
     end
 
     if (op == "BETWEEN" or op == "NOT BETWEEN") then
+        utils.assert(cond.value[1] ~= nil and cond.value[2] ~= nil,
+            ("%s on column '%s' needs both bounds"):format(op, tostring(cond.column)));
         params[#params + 1] = normalize(cond.value[1]);
         local lo = d.placeholder(#params);
         params[#params + 1] = normalize(cond.value[2]);

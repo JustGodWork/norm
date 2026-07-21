@@ -287,7 +287,7 @@ end
 ---@param value? any
 ---@param bool "AND"|"OR"
 ---@return NormQueryBuilder self
-local function push_where(self, column, op, value, bool)
+local function push_where(self, argc, column, op, value, bool)
     if (type(column) == "table") then
         for k, v in pairs(column) do
             self._state.wheres[#self._state.wheres + 1] =
@@ -295,7 +295,17 @@ local function push_where(self, column, op, value, bool)
         end
         return self;
     end
-    if (value == nil) then value = op; op = "="; end
+    -- Two-arg form: the operator slot actually holds the value. Decided on the
+    -- argument count, not on `value == nil`, so `where(col, ">", nil)` raises
+    -- instead of silently comparing the column to the string ">".
+    if (argc < 3) then
+        value = op;
+        op = "=";
+    else
+        utils.assert(value ~= nil,
+            ("where('%s', '%s', nil): a nil value has no operator form; use where_null/where_not_null")
+            :format(tostring(column), tostring(op)));
+    end
     self._state.wheres[#self._state.wheres + 1] =
         { column = column, op = op, value = value, bool = bool };
     return self;
@@ -308,10 +318,10 @@ end
 --- ```
 ---@param column string|table<string, any>
 ---@param op? string Operator, or the value when called with 2 args.
----@param value? any
+---@param ... any The value, when called with 3 args.
 ---@return NormQueryBuilder self
-function NormQueryBuilder:where(column, op, value)
-    return push_where(self, column, op, value, "AND");
+function NormQueryBuilder:where(column, op, ...)
+    return push_where(self, select("#", ...) + 2, column, op, (...), "AND");
 end
 
 --- OR variant of `where`.
@@ -320,10 +330,10 @@ end
 --- ```
 ---@param column string|table<string, any>
 ---@param op? string
----@param value? any
+---@param ... any The value, when called with 3 args.
 ---@return NormQueryBuilder self
-function NormQueryBuilder:or_where(column, op, value)
-    return push_where(self, column, op, value, "OR");
+function NormQueryBuilder:or_where(column, op, ...)
+    return push_where(self, select("#", ...) + 2, column, op, (...), "OR");
 end
 
 -- Append a where condition with an explicit conjunction.
@@ -542,10 +552,17 @@ end
 --- ```
 ---@param expr string Raw SQL expression (not quoted).
 ---@param op? string Operator, or the value when called with 2 args.
----@param value? any
+---@param ... any The value, when called with 3 args.
 ---@return NormQueryBuilder self
-function NormQueryBuilder:having(expr, op, value)
-    if (value == nil) then value = op; op = "="; end
+function NormQueryBuilder:having(expr, op, ...)
+    local value = (...);
+    if (select("#", ...) == 0) then
+        value = op;
+        op = "=";
+    else
+        utils.assert(value ~= nil,
+            ("having('%s', '%s', nil): a nil value cannot be bound"):format(tostring(expr), tostring(op)));
+    end
     self._state.havings = self._state.havings or {};
     self._state.havings[#self._state.havings + 1] = { expr = expr, op = op, value = value };
     return self;
