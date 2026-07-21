@@ -33,7 +33,7 @@ local promise = {};
 ---@field private _state "pending"|"fulfilled"|"rejected"
 ---@field private _value any
 ---@field private _queue fun(state: string, value: any)[]
----@field private _await_co thread?
+---@field private _awaiting thread[]
 ---@overload fun(executor?: fun(resolve: fun(value: any), reject: fun(reason: any))): NormPromise
 local NormPromise = class.new("NormPromise");
 
@@ -43,6 +43,7 @@ function NormPromise:__init(executor)
     self._state = "pending";
     self._value = nil;
     self._queue = {};
+    self._awaiting = {};
     if (type(executor) == "function") then
         local ok, err = pcall(executor,
             function(v) self:_settle("fulfilled", v); end,
@@ -60,19 +61,22 @@ function NormPromise:_settle(state, value)
     local queue = self._queue;
     self._queue = {};
     for i = 1, #queue do queue[i](state, value); end
-    -- Wake up a coroutine blocked in :await().
-    if (self._await_co) then
-        local co = self._await_co;
-        self._await_co = nil;
-        local ok, err = coroutine.resume(co);
-        if (not ok) then
-            -- The awaited continuation raised AFTER being resumed here. resume()
-            -- captured the error and there's no caller to propagate it to, so
-            -- surface it — otherwise it vanishes and the coroutine looks like it
-            -- silently hung. A traceback of the (dead) coroutine pinpoints the line.
-            local tb = (type(debug) == "table" and debug.traceback)
-                and debug.traceback(co, tostring(err)) or tostring(err);
-            utils.logger("ERROR", "uncaught error after await: " .. tb);
+    -- Wake up every coroutine blocked in :await().
+    local waiting = self._awaiting;
+    self._awaiting = {};
+    for i = 1, #waiting do
+        local co = waiting[i];
+        if (coroutine.status(co) == "suspended") then
+            local ok, err = coroutine.resume(co);
+            if (not ok) then
+                -- The awaited continuation raised AFTER being resumed here. resume()
+                -- captured the error and there's no caller to propagate it to, so
+                -- surface it — otherwise it vanishes and the coroutine looks like it
+                -- silently hung. A traceback of the (dead) coroutine pinpoints the line.
+                local tb = (type(debug) == "table" and debug.traceback)
+                    and debug.traceback(co, tostring(err)) or tostring(err);
+                utils.logger("ERROR", "uncaught error after await: " .. tb);
+            end
         end
     end
 end
@@ -124,8 +128,12 @@ function NormPromise:await()
     if (self._state == "pending") then
         local co, is_main = coroutine.running();
         assert(not is_main, "[norm] NormPromise:await() must be called from a coroutine");
-        self._await_co = co;
-        coroutine.yield();
+        self._awaiting[#self._awaiting + 1] = co;
+        -- Loop: a host scheduler (FiveM, nanos) may resume this coroutine for its
+        -- own reasons. A single yield would then return the still-unset value.
+        repeat
+            coroutine.yield();
+        until (self._state ~= "pending");
     end
     if (self._state == "rejected") then
         error(self._value);
