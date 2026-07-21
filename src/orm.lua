@@ -416,9 +416,13 @@ function NormOrm:_load_include_batch(model, mains, name, spec, cb)
         if (v ~= nil and not seen[v]) then seen[v] = true; keys[#keys + 1] = v; end
     end
 
-    local empty = (rel.kind == "has_many" or rel.kind == "belongs_to_many") and {} or nil;
+    local wants_list = (rel.kind == "has_many" or rel.kind == "belongs_to_many");
     if (#keys == 0) then
-        for i = 1, #mains do mains[i][name] = empty; end
+        -- A fresh table per parent: one shared table would make a mutation on any
+        -- parent's collection visible on all the others.
+        for i = 1, #mains do
+            if (wants_list) then mains[i][name] = {}; else mains[i][name] = nil; end
+        end
         return cb();
     end
 
@@ -469,7 +473,11 @@ function NormOrm:_load_include_batch(model, mains, name, spec, cb)
         for i = 1, #mains do
             local g = groups[mains[i][source_key]] or {};
             if (spec and spec.limit and rel.kind == "has_many") then g = slice(g, spec.offset, spec.limit); end
-            mains[i][name] = (rel.kind == "has_one") and (g[1] or nil) or g;
+            if (rel.kind == "has_one") then
+                mains[i][name] = g[1];
+            else
+                mains[i][name] = g;
+            end
         end
         cb();
     end);
@@ -494,12 +502,14 @@ function NormOrm:_query_with_includes(model, state, includes, single)
             local records = {};
             for i = 1, #rows do records[i] = model:wrap(rows[i]); end
             if (#records == 0) then
-                return resolve(single and nil or records);
+                if (single) then return resolve(nil); end
+                return resolve(records);
             end
             local ok, perr = pcall(function()
                 self:_load_includes(model, records, includes, function(e)
                     if (e ~= nil) then return reject(e); end
-                    resolve(single and records[1] or records);
+                    if (single) then return resolve(records[1]); end
+                    resolve(records);
                 end);
             end);
             if (not ok) then reject(perr); end

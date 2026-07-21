@@ -1751,6 +1751,34 @@ bm.query_result = { { id = 3, admin = 0 } };
 local rel = B:find(3):await();
 rel:reload();
 check("reload keeps boolean false", rel.admin == false, tostring(rel.admin));
+print("== Test group 35: eager loading with nothing to attach ==");
+local em = Routed({ dialect = "mysql" });
+local edb = orm.new({ adapter = em, promise = orm.promise.builtin() });
+local EU = edb:define("eusers", {
+    id      = orm.types.id(),
+    posts   = orm.types.hasMany("eposts", { key = "user_id" }),
+    profile = orm.types.hasOne("eprofiles", { key = "user_id" }),
+});
+edb:define("eposts", { id = orm.types.id(), user_id = orm.types.integer() });
+edb:define("eprofiles", { id = orm.types.id(), user_id = orm.types.integer() });
+
+em.rows.eusers = {};
+local none = EU:query():include("posts"):first():await();
+check("first with include resolves nil when nothing matched", none == nil, tostring(none));
+
+em.rows.eusers = { { id = 1 }, { id = 2 } };
+em.rows.eposts = { { id = 9, user_id = 1 } };
+em.rows.eprofiles = {};
+local list = EU:query():include("posts", "profile"):all():await();
+check("parent with related rows gets them", #list[1].posts == 1, tostring(#list[1].posts));
+check("parent without related rows gets an empty list", #list[2].posts == 0);
+check("empty has_one is nil, not an empty table", list[1].profile == nil, type(list[1].profile));
+
+em.rows.eusers = { { id = 3 }, { id = 4 } };
+em.rows.eposts = {};
+local orphans = EU:query():include("posts"):all():await();
+table.insert(orphans[1].posts, "x");
+check("empty collections are not shared between parents", #orphans[2].posts == 0, tostring(#orphans[2].posts));
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
