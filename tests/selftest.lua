@@ -1893,6 +1893,32 @@ local nb = orm.adapters.nanos.class({ database = ok_db, dialect = "sqlite" });
 local rows_seen;
 nb:raw_query("SELECT 1", {}, function(e, r) rows_seen = r; end);
 check("nanos success path is unchanged", rows_seen and #rows_seen == 1, tostring(rows_seen));
+print("== Test group 36: await against a host scheduler ==");
+local NP = orm.promise.NormPromise;
+
+local resolve;
+local p = NP(function(res) resolve = res; end);
+local got = "unset";
+local co = coroutine.create(function() got = p:await(); end);
+coroutine.resume(co);
+check("await suspends while pending", coroutine.status(co) == "suspended");
+coroutine.resume(co); -- a host scheduler resuming the coroutine on its own
+check("a foreign resume does not end the await",
+    coroutine.status(co) == "suspended" and got == "unset", tostring(got));
+resolve("value");
+check("await returns the settled value", got == "value", tostring(got));
+check("awaiting coroutine ran to completion", coroutine.status(co) == "dead");
+
+local resolve2;
+local p2 = NP(function(res) resolve2 = res; end);
+local a, b = "unset", "unset";
+local ca = coroutine.create(function() a = p2:await(); end);
+local cb = coroutine.create(function() b = p2:await(); end);
+coroutine.resume(ca);
+coroutine.resume(cb);
+resolve2("shared");
+check("first waiter is resumed", a == "shared", tostring(a));
+check("second waiter is resumed", b == "shared", tostring(b));
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
