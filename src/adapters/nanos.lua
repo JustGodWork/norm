@@ -198,7 +198,15 @@ local function do_select(db, query, params, callback)
     query = to_nanos_placeholders(query);
     if (type(db.SelectAsync) == "function") then
         -- Nanos signature: SelectAsync(query, callback?, parameters...) -- params are VARARGS.
-        db:SelectAsync(query, function(rows) callback(nil, rows or {}); end, table.unpack(params));
+        -- The callback may carry a driver error as a second argument; passing nil as
+        -- the error unconditionally would report a failed query as an empty result set.
+        local ok, err = pcall(function()
+            db:SelectAsync(query, function(rows, cb_err)
+                if (cb_err ~= nil) then return callback(cb_err); end
+                callback(nil, rows or {});
+            end, table.unpack(params));
+        end);
+        if (not ok) then callback(err); end
     else
         local ok, rows = pcall(function() return db:Select(query, table.unpack(params)); end);
         if (ok) then callback(nil, rows or {}); else callback(rows); end
@@ -215,7 +223,13 @@ local function do_execute(db, query, params, callback)
     query = to_nanos_placeholders(query);
     if (type(db.ExecuteAsync) == "function") then
         -- Nanos signature: ExecuteAsync(query, callback?, parameters...) -- params are VARARGS.
-        db:ExecuteAsync(query, function(affected) callback(nil, affected); end, table.unpack(params));
+        local ok, err = pcall(function()
+            db:ExecuteAsync(query, function(affected, cb_err)
+                if (cb_err ~= nil) then return callback(cb_err); end
+                callback(nil, affected);
+            end, table.unpack(params));
+        end);
+        if (not ok) then callback(err); end
     else
         local ok, affected = pcall(function() return db:Execute(query, table.unpack(params)); end);
         if (ok) then callback(nil, affected); else callback(affected); end

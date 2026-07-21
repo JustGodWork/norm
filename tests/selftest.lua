@@ -1845,6 +1845,54 @@ ox_adapter(false):transaction(function() return false; end, function(err) rolled
 check("rollback reports an error", type(rolled_err) == "string", tostring(rolled_err));
 
 _ENV.CreateThread = prev_thread;
+print("== Test group 35: adapters surface driver errors ==");
+local prev_thread = _ENV.CreateThread;
+_ENV.CreateThread = function() end;
+
+local raising = orm.adapters.oxmysql.class({
+    oxmysql = {
+        query = function() error("connection lost"); end,
+        execute = function() error("connection lost"); end,
+    },
+});
+local qerr, xerr = nil, nil;
+raising:raw_query("SELECT 1", {}, function(e) qerr = e; end);
+raising:raw_execute("DELETE FROM t", {}, function(e) xerr = e; end);
+check("oxmysql raw_query reports a raising driver", qerr ~= nil, tostring(qerr));
+check("oxmysql raw_execute reports a raising driver", xerr ~= nil, tostring(xerr));
+
+local failing_tx = orm.adapters.oxmysql.class({
+    oxmysql = {
+        startTransaction = function(_, handler) return handler(function() return nil; end); end,
+    },
+});
+local tx_err = nil;
+failing_tx:transaction(function(tq)
+    local seen;
+    tq("SELECT 1", {}, function(e) seen = e; end);
+    return seen == nil;
+end, function(e) tx_err = e; end);
+check("a failed statement inside a transaction rolls back", tx_err ~= nil, tostring(tx_err));
+
+_ENV.CreateThread = prev_thread;
+
+-- nanos: an async callback carrying an error must not read as an empty result set
+local nanos_db = {
+    SelectAsync = function(_, q, cb) cb(nil, "no such table: ghosts"); end,
+    ExecuteAsync = function(_, q, cb) cb(nil, "no such table: ghosts"); end,
+};
+local na = orm.adapters.nanos.class({ database = nanos_db, dialect = "sqlite" });
+local nq, nx = nil, nil;
+na:raw_query("SELECT * FROM ghosts", {}, function(e) nq = e; end);
+na:raw_execute("DELETE FROM ghosts", {}, function(e) nx = e; end);
+check("nanos raw_query surfaces a callback error", nq ~= nil, tostring(nq));
+check("nanos raw_execute surfaces a callback error", nx ~= nil, tostring(nx));
+
+local ok_db = { SelectAsync = function(_, q, cb) cb({ { id = 1 } }); end };
+local nb = orm.adapters.nanos.class({ database = ok_db, dialect = "sqlite" });
+local rows_seen;
+nb:raw_query("SELECT 1", {}, function(e, r) rows_seen = r; end);
+check("nanos success path is unchanged", rows_seen and #rows_seen == 1, tostring(rows_seen));
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
