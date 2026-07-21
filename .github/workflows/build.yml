@@ -60,7 +60,24 @@ jobs:
       - name: Run build.lua
         run: lua5.4 build.lua
 
-      # 4. Commit + push dist/ only if it actually changed
+      # 4. Run the test suites against the freshly built bundle. They run real
+      #    Lua 5.4 through lupa, so a regression stops the job before dist/ is
+      #    published rather than after.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install lupa
+        run: pip install lupa
+
+      - name: Run the self-test
+        run: python tests/run.py
+
+      - name: Run the nanos adapter test
+        run: python tests/run_nanos.py
+
+      # 5. Commit + push dist/ only if it actually changed
       - name: Commit dist/ if changed
         run: |
           git config user.name "github-actions[bot]"
