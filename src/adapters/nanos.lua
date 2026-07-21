@@ -20,14 +20,19 @@ local jsonlib = require("json");
 ---@overload fun(options?: NormNanosAdapterOptions): NormNanosAdapter
 local NormNanosAdapter = class.extend("NormNanosAdapter", NormAdapter);
 
---- Map a Nanos DatabaseEngine to a dialect name.
+--- Map a Nanos DatabaseEngine to a dialect name. PostgreSQL has no dialect of its
+--- own here, and the mysql one is not a usable stand-in: it quotes identifiers
+--- with backticks and appends `ENGINE=InnoDB ...`, both of which PostgreSQL
+--- rejects outright. It is refused rather than silently emitting broken DDL.
 ---@param engine integer
 ---@return "mysql"|"sqlite"
 local function engine_to_dialect(engine)
     local E = _ENV.DatabaseEngine;
     if (E) then
         if (engine == E.SQLite) then return "sqlite"; end
-        if (engine == E.PostgreSQL) then return "mysql"; end -- close enough for our SQL
+        utils.assert(engine ~= E.PostgreSQL,
+            "nanos adapter: PostgreSQL is not supported (no postgres dialect). "
+            .. "Use SQLite or MySQL, or pass an explicit `dialect` if your server speaks it.");
     end
     return "mysql";
 end

@@ -1977,6 +1977,27 @@ qdb2:sync():next(function() end, function(e) sync_err = e; end);
 check("sync rejects", sync_err ~= nil, tostring(sync_err));
 check("the queued operation is rejected too", find_err ~= nil, tostring(find_err));
 check("the ORM is still not ready", qdb2:is_ready() == false);
+print("== Test group 39: unsupported nanos engine ==");
+local prev_engines = _ENV.DatabaseEngine;
+local prev_database = _ENV.Database;
+_ENV.DatabaseEngine = { SQLite = 1, MySQL = 2, PostgreSQL = 3 };
+_ENV.Database = setmetatable({}, { __call = function() return { Select = function() return {}; end }; end });
+
+check("PostgreSQL is refused rather than emitting mysql DDL",
+    select(1, pcall(function()
+        orm.adapters.nanos.class({ engine = 3, connection = "x" });
+    end)) == false);
+check("SQLite is still accepted",
+    select(1, pcall(function()
+        orm.adapters.nanos.class({ engine = 1, connection = "x" });
+    end)) == true);
+check("an explicit dialect bypasses the engine mapping",
+    select(1, pcall(function()
+        orm.adapters.nanos.class({ engine = 3, connection = "x", dialect = "sqlite" });
+    end)) == true);
+
+_ENV.DatabaseEngine = prev_engines;
+_ENV.Database = prev_database;
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
