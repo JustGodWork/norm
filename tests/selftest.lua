@@ -1649,6 +1649,27 @@ check("paginate count keeps the JOIN",
 J:query():where("views", ">", 1):count();
 check("count without a join is unchanged",
     last_sql(jm) == "SELECT COUNT(*) AS `count` FROM `jposts` WHERE `views` > ?", last_sql(jm));
+print("== Test group 38: qualified column references ==");
+local qm = Mock({ dialect = "mysql" });
+local qdb = orm.new({ adapter = qm, promise = orm.promise.builtin() });
+local Q = qdb:define("qposts", { id = orm.types.id(), user_id = orm.types.integer(), views = orm.types.integer() });
+qdb:define("qusers", { id = orm.types.id(), name = orm.types.string({ length = 20 }) });
+
+Q:query():select("qposts.id", "qusers.name"):join("qusers", "qusers.id", "qposts.user_id"):all();
+check("select splits a qualified reference",
+    last_sql(qm):find("SELECT `qposts`.`id`, `qusers`.`name`", 1, true) ~= nil, last_sql(qm));
+
+Q:query():select_raw("COUNT(*) AS n"):group_by("qusers.name"):rows();
+check("group_by splits a qualified reference",
+    last_sql(qm):find("GROUP BY `qusers`.`name`", 1, true) ~= nil, last_sql(qm));
+
+Q:query():sum("qposts.views");
+check("aggregate splits a qualified reference",
+    last_sql(qm):find("SUM(`qposts`.`views`)", 1, true) ~= nil, last_sql(qm));
+
+Q:query():select("id", "views"):all();
+check("unqualified select is unchanged",
+    last_sql(qm):find("SELECT `id`, `views`", 1, true) ~= nil, last_sql(qm));
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
