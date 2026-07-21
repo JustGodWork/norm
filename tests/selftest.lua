@@ -1536,6 +1536,48 @@ check("indexes created after the table", (function()
     end
     return ti and ii and ti < ii;
 end)());
+end do
+print("== Test group 34: OR/AND precedence vs injected predicates ==");
+local pm = Mock({ dialect = "mysql" });
+local pdb = orm.new({ adapter = pm, promise = orm.promise.builtin() });
+local P = pdb:define("posts", {
+    id = orm.types.id(), title = orm.types.string({ length = 20 }),
+    views = orm.types.integer(), user_id = orm.types.integer(),
+    published = orm.types.boolean(),
+}, { soft_deletes = true });
+local PU = pdb:define("users", { id = orm.types.id(), posts = orm.types.hasMany("posts", { key = "user_id" }) });
+
+P:query():where("title", "a"):or_where("views", ">", 5):all();
+check("OR run is parenthesised against the soft-delete scope",
+    last_sql(pm) == "SELECT * FROM `posts` WHERE (`title` = ? OR `views` > ?) AND `deleted_at` IS NULL", last_sql(pm));
+
+P:query():where("title", "a"):where("views", 1):all();
+check("plain AND chain stays unparenthesised",
+    last_sql(pm) == "SELECT * FROM `posts` WHERE `title` = ? AND `views` = ? AND `deleted_at` IS NULL", last_sql(pm));
+
+P:query():where("title", "a"):or_where("views", ">", 5):delete();
+check("delete honours the soft-delete scope with an OR",
+    last_sql(pm):find("(`title` = ? OR `views` > ?) AND `deleted_at` IS NULL", 1, true) ~= nil, last_sql(pm));
+
+P:query():where("title", "a"):or_where("views", ">", 5):with_trashed():all();
+check("with_trashed needs no parentheses",
+    last_sql(pm) == "SELECT * FROM `posts` WHERE `title` = ? OR `views` > ?", last_sql(pm));
+
+PU:where_has("posts", function(q) q:where("published", true):or_where("id", 1); end):all();
+check("where_has keeps the correlation outside the OR group",
+    last_sql(pm):find("WHERE `posts`.`user_id` = `users`.`id` AND (`published` = ? OR `id` = ?) AND `posts`.`deleted_at` IS NULL", 1, true) ~= nil,
+    last_sql(pm));
+
+local im = Routed({ dialect = "mysql" });
+local idb = orm.new({ adapter = im, promise = orm.promise.builtin() });
+local IU = idb:define("iusers", { id = orm.types.id(), posts = orm.types.hasMany("iposts", { key = "user_id" }) });
+idb:define("iposts", { id = orm.types.id(), user_id = orm.types.integer(), views = orm.types.integer(), title = orm.types.string({ length = 20 }) });
+im.rows.iusers = { { id = 1 } };
+im.rows.iposts = { { id = 7, user_id = 1, views = 50, title = "a" } };
+IU:query():include("posts", function(q) q:where("title", "a"):or_where("views", ">", 9); end):all();
+check("include keeps the parent key set outside the OR group",
+    im.queries[#im.queries]:find("WHERE `user_id` IN (?) AND (`title` = ? OR `views` > ?)", 1, true) ~= nil,
+    im.queries[#im.queries]);
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));

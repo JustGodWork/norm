@@ -50,7 +50,7 @@ function NormQueryBuilder:_effective_state()
     local wheres = {};
     for i = 1, #self._state.wheres do wheres[i] = self._state.wheres[i]; end
     -- nil value -> compiled as IS NULL ("=") / IS NOT NULL ("!=").
-    wheres[#wheres + 1] = { column = model.soft_deletes, op = (trashed == "only") and "!=" or "=", bool = "AND" };
+    wheres[#wheres + 1] = { column = model.soft_deletes, op = (trashed == "only") and "!=" or "=", bool = "AND", system = true };
     s.wheres = wheres;
     return s;
 end
@@ -101,7 +101,7 @@ local function relation_subquery(self, rel, inner_select, configure)
         for i = 1, #sub._state.wheres do wheres[#wheres + 1] = sub._state.wheres[i]; end
     end
     if (target.soft_deletes) then
-        wheres[#wheres + 1] = { raw = sqlmod.quote_ref(d, target.table .. "." .. target.soft_deletes) .. " IS NULL" };
+        wheres[#wheres + 1] = { raw = sqlmod.quote_ref(d, target.table .. "." .. target.soft_deletes) .. " IS NULL", system = true };
     end
 
     if (rel.kind == "belongs_to_many") then
@@ -111,7 +111,7 @@ local function relation_subquery(self, rel, inner_select, configure)
         local other_local = rel.otherLocalKey or target.primary_key;
         local local_key = rel.localKey or model.primary_key;
         table.insert(wheres, 1, { raw = sqlmod.quote_ref(d, through .. "." .. pivot_main)
-            .. " = " .. sqlmod.quote_ref(d, model.table .. "." .. local_key) });
+            .. " = " .. sqlmod.quote_ref(d, model.table .. "." .. local_key), system = true });
         local clause = sqlmod.compile_where(wheres, d, params);
         local from = ("%s INNER JOIN %s ON %s = %s"):format(
             d.quote(through), d.quote(target.table),
@@ -130,7 +130,7 @@ local function relation_subquery(self, rel, inner_select, configure)
         corr = sqlmod.quote_ref(d, target.table .. "." .. rel.key)
             .. " = " .. sqlmod.quote_ref(d, model.table .. "." .. local_key);
     end
-    table.insert(wheres, 1, { raw = corr });
+    table.insert(wheres, 1, { raw = corr, system = true });
     local clause = sqlmod.compile_where(wheres, d, params);
     return ("(SELECT %s FROM %s%s)"):format(inner_select, d.quote(target.table), clause), params;
 end

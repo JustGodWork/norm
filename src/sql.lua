@@ -287,72 +287,117 @@ function sql.upsert(table_name, data, conflict_cols, update_cols, d)
     return head .. (" ON CONFLICT (%s) DO UPDATE SET %s"):format(target_clause, table.concat(sets, ", ")), params;
 end
 
+--- Compile one condition into its SQL fragment, appending bound params.
+---@param cond NormWhere
+---@param d NormDialect
+---@param params any[] Params array to append to (mutated).
+---@return string fragment
+local function compile_condition(cond, d, params)
+    if (cond.raw) then
+        -- verbatim fragment (e.g. a correlated `tbl.a = other.b`); no params.
+        return cond.raw;
+    end
+
+    if (cond.exists) then
+        -- [NOT] EXISTS (correlated subquery); append the subquery's own params.
+        if (cond.params) then
+            for j = 1, #cond.params do params[#params + 1] = normalize(cond.params[j]); end
+        end
+        return (cond.negate and "NOT EXISTS " or "EXISTS ") .. cond.sql;
+    end
+
+    local col = quote_ref(d, cond.column);
+    local op = (cond.op or "="):upper();
+
+    if (cond.value == nil) then
+        local negated = (op == "!=" or op == "<>" or op == "NOT");
+        return col .. (negated and " IS NOT NULL" or " IS NULL");
+    end
+
+    if (op == "IN" or op == "NOT IN") then
+        if (#cond.value == 0) then
+            -- `IN ()` / `NOT IN ()` is invalid SQL. Emit a constant predicate
+            -- instead: IN nothing is always false, NOT IN nothing always true.
+            return (op == "IN") and "1 = 0" or "1 = 1";
+        end
+        local marks = {};
+        for j = 1, #cond.value do
+            params[#params + 1] = normalize(cond.value[j]);
+            marks[#marks + 1] = d.placeholder(#params);
+        end
+        return ("%s %s (%s)"):format(col, op, table.concat(marks, ", "));
+    end
+
+    if (op == "BETWEEN" or op == "NOT BETWEEN") then
+        params[#params + 1] = normalize(cond.value[1]);
+        local lo = d.placeholder(#params);
+        params[#params + 1] = normalize(cond.value[2]);
+        local hi = d.placeholder(#params);
+        return ("%s %s %s AND %s"):format(col, op, lo, hi);
+    end
+
+    params[#params + 1] = normalize(cond.value);
+    return ("%s %s %s"):format(col, op, d.placeholder(#params));
+end
+
 --- Compile WHERE conditions into a fragment, appending bound params.
 --- op "IN"/"NOT IN" expects an array value; nil value -> IS [NOT] NULL.
+---
+--- Conditions flagged `system` are predicates Norm injects itself (soft-delete
+--- scope, eager-load key sets, relation correlation). They are invariants, so
+--- they are never allowed to fall on the wrong side of a user `OR`: a run of
+--- user conditions containing an OR is parenthesised, and system predicates are
+--- always joined with AND. Without this, `where(a):or_where(b)` on a soft-deleting
+--- model compiles to `a OR b AND deleted_at IS NULL` and returns trashed rows.
 ---@param wheres NormWhere[]
 ---@param d NormDialect
 ---@param params any[] Params array to append to (mutated).
 ---@return string clause
 local function compile_where(wheres, d, params)
     if (#wheres == 0) then return ""; end
-    local fragments = {};
+
+    -- Split into contiguous runs of same-origin conditions (order preserved).
+    local runs = {};
     for i = 1, #wheres do
         local cond = wheres[i];
-        local frag;
-
-        if (cond.raw) then
-            -- verbatim fragment (e.g. a correlated `tbl.a = other.b`); no params.
-            frag = cond.raw;
-            fragments[#fragments + 1] = (i == 1) and frag or ((cond.bool or "AND") .. " " .. frag);
-            goto continue;
-        elseif (cond.exists) then
-            -- [NOT] EXISTS (correlated subquery); append the subquery's own params.
-            frag = (cond.negate and "NOT EXISTS " or "EXISTS ") .. cond.sql;
-            if (cond.params) then
-                for j = 1, #cond.params do params[#params + 1] = normalize(cond.params[j]); end
-            end
-            fragments[#fragments + 1] = (i == 1) and frag or ((cond.bool or "AND") .. " " .. frag);
-            goto continue;
+        local is_system = (cond.system == true);
+        local run = runs[#runs];
+        if (not run or run.system ~= is_system) then
+            run = { system = is_system, items = {} };
+            runs[#runs + 1] = run;
         end
-
-        local col = quote_ref(d, cond.column);
-        local op = (cond.op or "="):upper();
-
-        if (cond.value == nil) then
-            local negated = (op == "!=" or op == "<>" or op == "NOT");
-            frag = col .. (negated and " IS NOT NULL" or " IS NULL");
-        elseif (op == "IN" or op == "NOT IN") then
-            if (#cond.value == 0) then
-                -- `IN ()` / `NOT IN ()` is invalid SQL. Emit a constant predicate
-                -- instead: IN nothing is always false, NOT IN nothing always true.
-                frag = (op == "IN") and "1 = 0" or "1 = 1";
-            else
-                local marks = {};
-                for j = 1, #cond.value do
-                    params[#params + 1] = normalize(cond.value[j]);
-                    marks[#marks + 1] = d.placeholder(#params);
-                end
-                frag = ("%s %s (%s)"):format(col, op, table.concat(marks, ", "));
-            end
-        elseif (op == "BETWEEN" or op == "NOT BETWEEN") then
-            params[#params + 1] = normalize(cond.value[1]);
-            local lo = d.placeholder(#params);
-            params[#params + 1] = normalize(cond.value[2]);
-            local hi = d.placeholder(#params);
-            frag = ("%s %s %s AND %s"):format(col, op, lo, hi);
-        else
-            params[#params + 1] = normalize(cond.value);
-            frag = ("%s %s %s"):format(col, op, d.placeholder(#params));
-        end
-
-        if (i == 1) then
-            fragments[#fragments + 1] = frag;
-        else
-            fragments[#fragments + 1] = (cond.bool or "AND") .. " " .. frag;
-        end
-        ::continue::
+        run.items[#run.items + 1] = cond;
     end
-    return " WHERE " .. table.concat(fragments, " ");
+
+    local out = {};
+    for r = 1, #runs do
+        local run = runs[r];
+        local fragments, has_or = {}, false;
+        for i = 1, #run.items do
+            local cond = run.items[i];
+            local frag = compile_condition(cond, d, params);
+            if (i == 1) then
+                fragments[#fragments + 1] = frag;
+            else
+                local bool = cond.bool or "AND";
+                if (bool == "OR") then has_or = true; end
+                fragments[#fragments + 1] = bool .. " " .. frag;
+            end
+        end
+
+        local clause = table.concat(fragments, " ");
+        if (has_or and #runs > 1) then clause = "(" .. clause .. ")"; end
+
+        if (r == 1) then
+            out[#out + 1] = clause;
+        elseif (run.system or runs[r - 1].system) then
+            out[#out + 1] = "AND " .. clause;
+        else
+            out[#out + 1] = (run.items[1].bool or "AND") .. " " .. clause;
+        end
+    end
+
+    return " WHERE " .. table.concat(out, " ");
 end
 sql.compile_where = compile_where;
 
