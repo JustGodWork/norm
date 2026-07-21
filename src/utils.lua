@@ -64,7 +64,7 @@ end
 function utils.soft_scope(state, model)
     if (model.soft_deletes) then
         state.wheres = state.wheres or {};
-        state.wheres[#state.wheres + 1] = { column = model.soft_deletes, op = "=", bool = "AND" };
+        state.wheres[#state.wheres + 1] = { column = model.soft_deletes, op = "=", bool = "AND", system = true };
     end
 end
 

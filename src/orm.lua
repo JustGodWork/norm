@@ -292,7 +292,7 @@ function NormOrm:_m2m_fetch(model, rel, keys, spec, cb)
 
     -- 1) pivot rows: parent key + related key.
     local pstate = { table = through, columns = { pivot_main, pivot_other },
-        wheres = { { column = pivot_main, op = "IN", value = keys } } };
+        wheres = { { column = pivot_main, op = "IN", value = keys, system = true } } };
     local pstmt, pparams = sqlmod.select(pstate, d);
     self:_trace(pstmt, pparams);
     self:_raw_query(pstmt, pparams, function(perr, prows)
@@ -312,7 +312,7 @@ function NormOrm:_m2m_fetch(model, rel, keys, spec, cb)
 
         -- 2) target rows, fetched once by their local key (+ any include filters/order).
         local tstate = { table = target.table,
-            wheres = { { column = other_local, op = "IN", value = related_ids } } };
+            wheres = { { column = other_local, op = "IN", value = related_ids, system = true } } };
         if (spec and spec.wheres) then for i = 1, #spec.wheres do tstate.wheres[#tstate.wheres + 1] = spec.wheres[i]; end end
         if (spec and spec.orders and #spec.orders > 0) then tstate.orders = spec.orders; end
         utils.soft_scope(tstate, target); -- exclude soft-deleted related rows
@@ -433,7 +433,7 @@ function NormOrm:_load_include_batch(model, mains, name, spec, cb)
 
     if (rel.kind == "belongs_to") then
         local other_key = rel.otherKey or target.primary_key;
-        local state = { table = target.table, wheres = { { column = other_key, op = "IN", value = keys } } };
+        local state = { table = target.table, wheres = { { column = other_key, op = "IN", value = keys, system = true } } };
         if (spec and spec.wheres) then for i = 1, #spec.wheres do state.wheres[#state.wheres + 1] = spec.wheres[i]; end end
         utils.soft_scope(state, target); -- exclude soft-deleted related rows
         local statement, params = sqlmod.select(state, d);
@@ -450,7 +450,7 @@ function NormOrm:_load_include_batch(model, mains, name, spec, cb)
     end
 
     -- has_one / has_many: group target rows by their foreign key.
-    local state = { table = target.table, wheres = { { column = rel.key, op = "IN", value = keys } } };
+    local state = { table = target.table, wheres = { { column = rel.key, op = "IN", value = keys, system = true } } };
     if (spec and spec.wheres) then for i = 1, #spec.wheres do state.wheres[#state.wheres + 1] = spec.wheres[i]; end end
     if (spec and spec.orders and #spec.orders > 0) then state.orders = spec.orders; end
     utils.soft_scope(state, target); -- exclude soft-deleted related rows
