@@ -1342,7 +1342,10 @@ function NormModel:sync()
             orm:_trace(statement, {});
             orm.adapter:raw_execute(statement, {}, function(err)
                 if (err ~= nil) then
-                    if (not optional) then return reject(err); end
+                    if (not optional) then
+                        orm:_fail_queue(err);
+                        return reject(err);
+                    end
                     orm._logger("DB", ("index statement skipped: %s"):format(tostring(err)));
                 end
                 step();

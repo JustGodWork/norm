@@ -1950,6 +1950,33 @@ local okdb = orm.new({ adapter = okm, promise = orm.promise.builtin(),
     logger = function(level, msg) lines[#lines + 1] = msg; end });
 okdb:define("fine", { id = orm.types.id() }):find(1);
 check("a successful statement logs nothing", #lines == 0, table.concat(lines, " | "));
+print("== Test group 38: a failed sync settles the queued operations ==");
+local FailSync = class.extend("FailSyncAdapter", orm.Adapter);
+function FailSync:__init(o) orm.Adapter.__init(self, o); self.calls = {}; end
+function FailSync:raw_query(q, p, cb) self.calls[#self.calls + 1] = q; cb(nil, {}); end
+function FailSync:raw_execute(q, p, cb)
+    self.calls[#self.calls + 1] = q;
+    if (q:find("CREATE TABLE", 1, true)) then return cb("disk is full"); end
+    cb(nil, { affectedRows = 1 });
+end
+
+local qdb2 = orm.new({
+    adapter = FailSync({ dialect = "mysql" }),
+    promise = orm.promise.builtin(),
+    queue_until_ready = true,
+    logger = function() end,
+});
+local QM = qdb2:define("queued", { id = orm.types.id(), name = orm.types.string({ length = 10 }) });
+
+local find_err, find_done = nil, false;
+QM:find(1):next(function() find_done = true; end, function(e) find_err = e; end);
+check("the operation is still queued", find_err == nil and not find_done);
+
+local sync_err = nil;
+qdb2:sync():next(function() end, function(e) sync_err = e; end);
+check("sync rejects", sync_err ~= nil, tostring(sync_err));
+check("the queued operation is rejected too", find_err ~= nil, tostring(find_err));
+check("the ORM is still not ready", qdb2:is_ready() == false);
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));

@@ -194,6 +194,22 @@ function NormOrm:_flush_ready()
     end
 end
 
+--- Fail every queued operation with `err` and clear the queue, leaving the ORM
+--- not ready (a later successful sync/migrate can still flush new work). Called
+--- when schema preparation fails: without it those callbacks are never invoked,
+--- so their promises stay pending and any awaiting coroutine hangs for good.
+---@private
+---@param err any
+function NormOrm:_fail_queue(err)
+    local queue = self._queue;
+    if (#queue == 0) then return; end
+    self._queue = {};
+    self._logger("DB", ("schema preparation failed: rejecting %d queued operation(s)"):format(#queue));
+    for i = 1, #queue do
+        queue[i].callback(err);
+    end
+end
+
 --- Whether operations run immediately. With `queue_until_ready`, false until the
 --- first successful `sync()`/`migrate()`; otherwise always true.
 ---@return boolean
@@ -754,7 +770,10 @@ function NormOrm:sync()
                 if (err ~= nil) then
                     -- Without IF NOT EXISTS support, re-creating an existing index is
                     -- the expected outcome of a second sync(), not a schema failure.
-                    if (not optional) then return reject(err); end
+                    if (not optional) then
+                        self:_fail_queue(err);
+                        return reject(err);
+                    end
                     self._logger("DB", ("index statement skipped: %s"):format(tostring(err)));
                 end
                 step();
