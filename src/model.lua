@@ -89,7 +89,11 @@ function NormRecord:__init(model, row, persisted)
             local col = model.columns[i];
             local value = row[col.name];
             if (value ~= nil) then
-                self[col.name] = self.__persisted and model:parse(col, value) or value;
+                if (self.__persisted) then
+                    self[col.name] = model:parse(col, value);
+                else
+                    self[col.name] = value;
+                end
             end
         end
     end

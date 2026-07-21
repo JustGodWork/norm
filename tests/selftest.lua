@@ -1733,6 +1733,24 @@ fdb:define("t", { id = orm.types.id(), code = orm.types.string({ length = 8, ind
 local synced, sync_err = nil, nil;
 fdb:sync():next(function(v) synced = v; end, function(e) sync_err = e; end);
 check("a duplicate index does not fail sync on mysql", synced == true and sync_err == nil, tostring(sync_err));
+print("== Test group 41: boolean decoding ==");
+local bm = Mock({ dialect = "mysql" });
+local bdb = orm.new({ adapter = bm, promise = orm.promise.builtin() });
+local B = bdb:define("flags", { id = orm.types.id(), admin = orm.types.boolean() });
+
+bm.query_result = { { id = 1, admin = 0 } };
+local off = B:find(1):await();
+check("admin 0 decodes to boolean false", off.admin == false, tostring(off.admin));
+check("admin 0 is not truthy", not off.admin, type(off.admin));
+
+bm.query_result = { { id = 2, admin = 1 } };
+local on = B:find(2):await();
+check("admin 1 decodes to boolean true", on.admin == true, tostring(on.admin));
+
+bm.query_result = { { id = 3, admin = 0 } };
+local rel = B:find(3):await();
+rel:reload();
+check("reload keeps boolean false", rel.admin == false, tostring(rel.admin));
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
