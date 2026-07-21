@@ -1622,6 +1622,33 @@ N:query():where_between("views", 1, 9):where("name", "z"):all();
 local p2 = nm.calls[#nm.calls].params;
 check("between binds both bounds then the next value",
     #p2 == 3 and p2[1] == 1 and p2[2] == 9 and p2[3] == "z", tostring(#p2));
+print("== Test group 37: count and aggregates keep their joins ==");
+local jm = Mock({ dialect = "mysql" });
+local jdb = orm.new({ adapter = jm, promise = orm.promise.builtin() });
+local J = jdb:define("jposts", { id = orm.types.id(), user_id = orm.types.integer(), views = orm.types.integer() });
+jdb:define("jusers", { id = orm.types.id(), admin = orm.types.boolean() });
+
+J:query():join("jusers", "jusers.id", "jposts.user_id"):where("jusers.admin", true):count();
+check("count keeps the JOIN",
+    last_sql(jm) == "SELECT COUNT(*) AS `count` FROM `jposts` INNER JOIN `jusers` ON `jusers`.`id` = `jposts`.`user_id` WHERE `jusers`.`admin` = ?",
+    last_sql(jm));
+
+J:query():join("jusers", "jusers.id", "jposts.user_id"):where("jusers.admin", true):sum("views");
+check("aggregate keeps the JOIN",
+    last_sql(jm):find("FROM `jposts` INNER JOIN `jusers` ON", 1, true) ~= nil, last_sql(jm));
+
+jm.query_result = { { count = 0 } };
+J:query():join("jusers", "jusers.id", "jposts.user_id"):where("jusers.admin", true):paginate(1, 10);
+local count_stmt;
+for _, c in ipairs(jm.calls) do
+    if (c.sql:find("COUNT(*)", 1, true)) then count_stmt = c.sql; end
+end
+check("paginate count keeps the JOIN",
+    count_stmt and count_stmt:find("INNER JOIN `jusers`", 1, true) ~= nil, tostring(count_stmt));
+
+J:query():where("views", ">", 1):count();
+check("count without a join is unchanged",
+    last_sql(jm) == "SELECT COUNT(*) AS `count` FROM `jposts` WHERE `views` > ?", last_sql(jm));
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));

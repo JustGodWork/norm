@@ -657,7 +657,8 @@ function NormQueryBuilder:paginate(page, per_page)
     local d = orm.adapter:get_dialect();
 
     local effective = self:_effective_state();
-    local count_sql, count_params = sqlmod.count({ table = effective.table, wheres = effective.wheres }, d);
+    local count_sql, count_params = sqlmod.count(
+        { table = effective.table, wheres = effective.wheres, joins = effective.joins }, d);
 
     local data_state, counts = self:_prepare_counts(effective);
     local ds = {};

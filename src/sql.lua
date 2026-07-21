@@ -443,6 +443,21 @@ local function compile_where(wheres, d, params)
 end
 sql.compile_where = compile_where;
 
+--- Render the JOIN clauses of a state (empty string when there are none).
+---@param state NormQueryState
+---@param d NormDialect
+---@return string
+local function compile_joins(state, d)
+    if (not state.joins or #state.joins == 0) then return ""; end
+    local out = {};
+    for i = 1, #state.joins do
+        local j = state.joins[i];
+        out[#out + 1] = (" %s JOIN %s ON %s %s %s"):format(
+            j.type, d.quote(j.table), quote_ref(d, j.first), safe_op(j.op), quote_ref(d, j.second));
+    end
+    return table.concat(out);
+end
+
 --- SELECT from a query-builder state.
 ---@param state NormQueryState
 ---@param d NormDialect
@@ -460,13 +475,7 @@ function sql.select(state, d)
 
     local statement = ("SELECT %s FROM %s"):format(columns, d.quote(state.table));
 
-    if (state.joins and #state.joins > 0) then
-        for i = 1, #state.joins do
-            local j = state.joins[i];
-            statement = statement .. (" %s JOIN %s ON %s %s %s"):format(
-                j.type, d.quote(j.table), quote_ref(d, j.first), safe_op(j.op), quote_ref(d, j.second));
-        end
-    end
+    statement = statement .. compile_joins(state, d);
 
     statement = statement .. compile_where(state.wheres, d, params);
 
@@ -513,6 +522,9 @@ end
 function sql.count(state, d)
     local params = {};
     local statement = ("SELECT COUNT(*) AS %s FROM %s"):format(d.quote("count"), d.quote(state.table));
+    -- The joins belong here too: dropping them leaves the WHERE referencing tables
+    -- the statement never joined ("Unknown column 'posts.published'").
+    statement = statement .. compile_joins(state, d);
     statement = statement .. compile_where(state.wheres, d, params);
     return statement, params;
 end
@@ -529,6 +541,7 @@ function sql.aggregate(state, func, column, d)
     local target = column and d.quote(column) or "*";
     local statement = ("SELECT %s(%s) AS %s FROM %s"):format(
         func, target, d.quote("aggregate"), d.quote(state.table));
+    statement = statement .. compile_joins(state, d);
     statement = statement .. compile_where(state.wheres, d, params);
     return statement, params;
 end
