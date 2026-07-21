@@ -64,6 +64,42 @@ local function quote_ref(d, ref)
 end
 sql.quote_ref = quote_ref;
 
+--- Comparison operators allowed in a compiled fragment. Operators are
+--- concatenated verbatim into the statement, so anything outside this set would
+--- be an injection point (`:order`/`:where` arguments routinely come from user
+--- input).
+local ALLOWED_OPS = {
+    ["="] = true, ["!="] = true, ["<>"] = true, ["<"] = true, [">"] = true,
+    ["<="] = true, [">="] = true, ["LIKE"] = true, ["NOT LIKE"] = true,
+    ["IN"] = true, ["NOT IN"] = true, ["BETWEEN"] = true, ["NOT BETWEEN"] = true,
+    ["IS"] = true, ["IS NOT"] = true, ["NOT"] = true,
+};
+
+--- Normalise and validate a comparison operator.
+---@param op? string
+---@return string
+local function safe_op(op)
+    if (op == nil) then return "="; end
+    utils.assert(type(op) == "string", "SQL operator must be a string");
+    local upper = op:upper();
+    utils.assert(ALLOWED_OPS[upper], ("unsupported SQL operator '%s'"):format(op));
+    return upper;
+end
+sql.safe_op = safe_op;
+
+--- Normalise and validate an ORDER BY direction.
+---@param dir? string
+---@return "ASC"|"DESC"
+local function safe_dir(dir)
+    if (dir == nil) then return "ASC"; end
+    utils.assert(type(dir) == "string", "ORDER BY direction must be a string");
+    local upper = dir:upper();
+    utils.assert(upper == "ASC" or upper == "DESC",
+        ("unsupported ORDER BY direction '%s' (expected ASC or DESC)"):format(dir));
+    return upper;
+end
+sql.safe_dir = safe_dir;
+
 --- Render the SQL column type for an `enum` column: native `ENUM('a','b',…)` on
 --- MySQL, `TEXT CHECK (col IN ('a','b',…))` on SQLite (which has no ENUM). The
 --- value list is single-quoted with `'` doubled, so both engines reject anything
@@ -307,7 +343,7 @@ local function compile_condition(cond, d, params)
     end
 
     local col = quote_ref(d, cond.column);
-    local op = (cond.op or "="):upper();
+    local op = safe_op(cond.op);
 
     if (cond.value == nil) then
         local negated = (op == "!=" or op == "<>" or op == "NOT");
@@ -422,7 +458,7 @@ function sql.select(state, d)
         for i = 1, #state.joins do
             local j = state.joins[i];
             statement = statement .. (" %s JOIN %s ON %s %s %s"):format(
-                j.type, d.quote(j.table), quote_ref(d, j.first), (j.op or "="), quote_ref(d, j.second));
+                j.type, d.quote(j.table), quote_ref(d, j.first), safe_op(j.op), quote_ref(d, j.second));
         end
     end
 
@@ -440,7 +476,7 @@ function sql.select(state, d)
             local h = state.havings[i];
             params[#params + 1] = normalize(h.value);
             -- expr is a raw aggregate expression (e.g. COUNT(*)), intentionally unquoted.
-            frags[#frags + 1] = ("%s %s %s"):format(h.expr, (h.op or "="):upper(), d.placeholder(#params));
+            frags[#frags + 1] = ("%s %s %s"):format(h.expr, safe_op(h.op), d.placeholder(#params));
         end
         statement = statement .. " HAVING " .. table.concat(frags, " AND ");
     end
@@ -449,7 +485,7 @@ function sql.select(state, d)
         local parts = {};
         for i = 1, #state.orders do
             local o = state.orders[i];
-            parts[#parts + 1] = quote_ref(d, o.column) .. " " .. (o.dir or "ASC");
+            parts[#parts + 1] = quote_ref(d, o.column) .. " " .. safe_dir(o.dir);
         end
         statement = statement .. " ORDER BY " .. table.concat(parts, ", ");
     end

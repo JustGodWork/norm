@@ -1578,6 +1578,26 @@ IU:query():include("posts", function(q) q:where("title", "a"):or_where("views", 
 check("include keeps the parent key set outside the OR group",
     im.queries[#im.queries]:find("WHERE `user_id` IN (?) AND (`title` = ? OR `views` > ?)", 1, true) ~= nil,
     im.queries[#im.queries]);
+print("== Test group 35: operator and direction whitelists ==");
+local sm = Mock({ dialect = "mysql" });
+local sdb = orm.new({ adapter = sm, promise = orm.promise.builtin() });
+local S = sdb:define("items", { id = orm.types.id(), name = orm.types.string({ length = 20 }), qty = orm.types.integer() });
+
+check("injected ORDER BY direction is rejected",
+    select(1, pcall(function() S:query():order("id", "DESC, (SELECT 1)"):all(); end)) == false);
+check("injected operator is rejected",
+    select(1, pcall(function() S:query():where("qty", "> 0 OR 1=1 -- ", 5):all(); end)) == false);
+check("injected join operator is rejected",
+    select(1, pcall(function() S:query():join("others", "others.id", "= 1 OR 1=1 -- ", "items.id"):all(); end)) == false);
+check("injected having operator is rejected",
+    select(1, pcall(function() S:query():select_raw("COUNT(*) AS n"):having("COUNT(*)", ") OR 1=1 -- ", 2):rows(); end)) == false);
+
+S:query():order("qty", "desc"):all();
+check("lowercase desc still works", last_sql(sm):find("ORDER BY `qty` DESC", 1, true) ~= nil, last_sql(sm));
+S:query():order("qty"):all();
+check("default direction is ASC", last_sql(sm):find("ORDER BY `qty` ASC", 1, true) ~= nil, last_sql(sm));
+S:query():where("qty", ">=", 3):all();
+check("allowed operator still works", last_sql(sm):find("`qty` >= ?", 1, true) ~= nil, last_sql(sm));
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
