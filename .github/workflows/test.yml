@@ -1,0 +1,55 @@
+name: Tests
+
+# Runs on every pull request and on pushes to the integration branches. This
+# workflow never publishes anything: it only proves the sources still build and
+# the suites still pass. Publishing dist/ stays in build.yml, on master.
+on:
+  push:
+    branches: [master, develop]
+  pull_request:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULES_PAT }}
+
+      - name: Install Lua 5.4
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lua5.4
+          lua5.4 -v
+
+      - name: Build the bundle
+        run: lua5.4 build.lua
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install lupa
+        run: pip install lupa
+
+      - name: Self-test
+        run: python tests/run.py
+
+      - name: Nanos adapter test
+        run: python tests/run_nanos.py
+
+      - name: Fail if the committed dist is stale
+        run: |
+          if ! git diff --quiet -- dist/; then
+            echo "dist/ differs from a fresh build of src/."
+            echo "That is expected on a PR (the bot rebuilds it on master), so this is a warning only."
+            git diff --stat -- dist/
+          fi
