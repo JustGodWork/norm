@@ -1779,6 +1779,29 @@ em.rows.eposts = {};
 local orphans = EU:query():include("posts"):all():await();
 table.insert(orphans[1].posts, "x");
 check("empty collections are not shared between parents", #orphans[2].posts == 0, tostring(#orphans[2].posts));
+print("== Test group 36: find_or_* honour the soft-delete scope ==");
+local fm = Mock({ dialect = "mysql" });
+local fdb2 = orm.new({ adapter = fm, promise = orm.promise.builtin() });
+local F = fdb2:define("faccounts", { id = orm.types.id(), email = orm.types.string({ length = 40 }) },
+    { soft_deletes = true });
+
+fm.query_result = {};
+F:find_or_new({ email = "a@b.c" }, { });
+local lookup;
+for _, c in ipairs(fm.calls) do
+    if (c.kind == "query" and c.sql:find("SELECT", 1, true)) then lookup = c.sql; end
+end
+check("find_or_new excludes trashed rows",
+    lookup:find("`email` = ? AND `deleted_at` IS NULL", 1, true) ~= nil, tostring(lookup));
+
+fm.calls = {};
+F:find_or_create({ email = "c@d.e" }, {});
+local lookup2;
+for _, c in ipairs(fm.calls) do
+    if (c.kind == "query" and c.sql:find("SELECT", 1, true)) then lookup2 = c.sql; break; end
+end
+check("find_or_create excludes trashed rows",
+    lookup2:find("`deleted_at` IS NULL", 1, true) ~= nil, tostring(lookup2));
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
