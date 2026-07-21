@@ -603,10 +603,14 @@ end
 --- ```
 ---@return NormRecordOrNilPromise promise resolving to NormRecord|nil
 function NormQueryBuilder:first()
-    self._state.limit = 1;
     local model = self.model;
     local includes = self._state.includes;
-    local state, counts = self:_prepare_counts(self:_effective_state());
+    local prepared, counts = self:_prepare_counts(self:_effective_state());
+    -- LIMIT 1 belongs to this call only. Writing it into _state made it stick, so
+    -- a later :all() on the same builder silently returned a single row.
+    local state = {};
+    for k, v in pairs(prepared) do state[k] = v; end
+    state.limit = 1;
     if (includes and next(includes) ~= nil) then
         return model.orm:_query_with_includes(model, state, includes, true);
     end
