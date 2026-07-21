@@ -1751,7 +1751,7 @@ bm.query_result = { { id = 3, admin = 0 } };
 local rel = B:find(3):await();
 rel:reload();
 check("reload keeps boolean false", rel.admin == false, tostring(rel.admin));
-print("== Test group 35: eager loading with nothing to attach ==");
+print("== Test group 42: eager loading with nothing to attach ==");
 local em = Routed({ dialect = "mysql" });
 local edb = orm.new({ adapter = em, promise = orm.promise.builtin() });
 local EU = edb:define("eusers", {
@@ -1779,7 +1779,7 @@ em.rows.eposts = {};
 local orphans = EU:query():include("posts"):all():await();
 table.insert(orphans[1].posts, "x");
 check("empty collections are not shared between parents", #orphans[2].posts == 0, tostring(#orphans[2].posts));
-print("== Test group 36: find_or_* honour the soft-delete scope ==");
+print("== Test group 43: find_or_* honour the soft-delete scope ==");
 local fm = Mock({ dialect = "mysql" });
 local fdb2 = orm.new({ adapter = fm, promise = orm.promise.builtin() });
 local F = fdb2:define("faccounts", { id = orm.types.id(), email = orm.types.string({ length = 40 }) },
@@ -1802,7 +1802,7 @@ for _, c in ipairs(fm.calls) do
 end
 check("find_or_create excludes trashed rows",
     lookup2:find("`deleted_at` IS NULL", 1, true) ~= nil, tostring(lookup2));
-print("== Test group 37: upsert needs its conflict columns ==");
+print("== Test group 44: upsert needs its conflict columns ==");
 local um = Mock({ dialect = "mysql" });
 local udb = orm.new({ adapter = um, promise = orm.promise.builtin() });
 local U3 = udb:define("uaccounts", {
@@ -1821,6 +1821,30 @@ local rec = U3:upsert({ account_id = "acc-1", name = "Zoe" }, { conflict = { "ac
 check("a valid upsert still reads the row back", rec ~= nil and rec.account_id == "acc-1", tostring(rec));
 check("the read-back filters on the conflict column",
     last_sql(um):find("WHERE `account_id` = ?", 1, true) ~= nil, last_sql(um));
+print("== Test group 45: oxmysql transaction outcome ==");
+local prev_thread = _ENV.CreateThread;
+_ENV.CreateThread = function() end;
+
+local function ox_adapter(commit_result)
+    return orm.adapters.oxmysql.class({
+        oxmysql = {
+            startTransaction = function(_, handler)
+                handler(function() return {}; end);
+                return commit_result;
+            end,
+        },
+    });
+end
+
+local committed_err = "unset";
+ox_adapter(true):transaction(function() return true; end, function(err) committed_err = err; end);
+check("successful commit reports no error", committed_err == nil, tostring(committed_err));
+
+local rolled_err = "unset";
+ox_adapter(false):transaction(function() return false; end, function(err) rolled_err = err; end);
+check("rollback reports an error", type(rolled_err) == "string", tostring(rolled_err));
+
+_ENV.CreateThread = prev_thread;
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));

@@ -120,7 +120,11 @@ function NormOxMySQLAdapter:transaction(body, finish)
             function(q, p, cb) cb(nil, normalize(query(q, p))); end  -- tx_execute (writes)
         );
     end);
-    finish(committed and nil or "[norm] transaction rolled back");
+    if (committed) then
+        finish(nil);
+    else
+        finish("[norm] transaction rolled back");
+    end
 end
 
 ---@class NormOxMySQLAdapterModule
