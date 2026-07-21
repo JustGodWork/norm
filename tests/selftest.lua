@@ -1670,6 +1670,23 @@ check("aggregate splits a qualified reference",
 Q:query():select("id", "views"):all();
 check("unqualified select is unchanged",
     last_sql(qm):find("SELECT `id`, `views`", 1, true) ~= nil, last_sql(qm));
+print("== Test group 39: first() does not pin LIMIT on the builder ==");
+local lm = Mock({ dialect = "mysql" });
+local ldb = orm.new({ adapter = lm, promise = orm.promise.builtin() });
+local L = ldb:define("lrows", { id = orm.types.id(), name = orm.types.string({ length = 10 }) });
+
+local q = L:query():where("name", "a");
+q:first();
+check("first limits to one row", last_sql(lm):find("LIMIT 1", 1, true) ~= nil, last_sql(lm));
+q:all();
+check("a later all() on the same builder is not limited",
+    last_sql(lm):find("LIMIT", 1, true) == nil, last_sql(lm));
+
+local q2 = L:query():limit(5);
+q2:first();
+check("first does not clobber an explicit limit", last_sql(lm):find("LIMIT 1", 1, true) ~= nil, last_sql(lm));
+q2:all();
+check("the explicit limit survives first()", last_sql(lm):find("LIMIT 5", 1, true) ~= nil, last_sql(lm));
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
