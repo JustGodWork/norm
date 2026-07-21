@@ -91,19 +91,26 @@ end
 ---@param params any[]
 ---@param callback NormQueryCallback
 function NormOxMySQLAdapter:raw_query(query, params, callback)
-    -- oxmysql raises errors server-side rather than passing them to the callback.
-    self.ox:query(query, params, function(rows)
-        callback(nil, rows or {});
+    -- oxmysql raises errors server-side rather than passing them to the callback,
+    -- so a synchronous raise is the only failure Norm can observe here.
+    local ok, err = pcall(function()
+        self.ox:query(query, params, function(rows)
+            callback(nil, rows or {});
+        end);
     end);
+    if (not ok) then callback(err); end
 end
 
 ---@param query string
 ---@param params any[]
 ---@param callback NormExecuteCallback
 function NormOxMySQLAdapter:raw_execute(query, params, callback)
-    self.ox:execute(query, params, function(result)
-        callback(nil, normalize(result));
+    local ok, err = pcall(function()
+        self.ox:execute(query, params, function(result)
+            callback(nil, normalize(result));
+        end);
     end);
+    if (not ok) then callback(err); end
 end
 
 --- Run an interactive transaction through the `startTransaction` export (the same
@@ -114,10 +121,21 @@ end
 ---@param body fun(tx_query: fun(q:string,p:any[],cb:function), tx_execute: fun(q:string,p:any[],cb:function)): boolean
 ---@param finish fun(err: any)
 function NormOxMySQLAdapter:transaction(body, finish)
+    -- oxmysql returns nil from query() when the statement failed (that is the
+    -- documented "return false to rollback" signal). Turning it into an empty
+    -- result would let the transaction body keep running on phantom data.
     local committed = self.ox:startTransaction(function(query)
         return body(
-            function(q, p, cb) cb(nil, query(q, p) or {}); end,     -- tx_query (SELECT)
-            function(q, p, cb) cb(nil, normalize(query(q, p))); end  -- tx_execute (writes)
+            function(q, p, cb)                                      -- tx_query (SELECT)
+                local rows = query(q, p);
+                if (rows == nil) then return cb("[norm] query failed inside transaction: " .. tostring(q)); end
+                cb(nil, rows);
+            end,
+            function(q, p, cb)                                      -- tx_execute (writes)
+                local result = query(q, p);
+                if (result == nil) then return cb("[norm] statement failed inside transaction: " .. tostring(q)); end
+                cb(nil, normalize(result));
+            end
         );
     end);
     if (committed) then
