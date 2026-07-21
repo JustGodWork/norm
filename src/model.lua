@@ -1252,6 +1252,15 @@ function NormModel:upsert(data, opts)
     utils.assert(type(conflict) == "table" and #conflict > 0,
         ("upsert on '%s' needs conflict columns (opts.conflict) or a primary key"):format(model.table));
 
+    -- The row is read back by the conflict columns, so a conflict column missing
+    -- from `data` would compile to `WHERE <col> IS NULL` and resolve nil even
+    -- though the write succeeded. That happens by default whenever the model has
+    -- an auto-increment primary key and the caller does not supply it.
+    for _, c in ipairs(conflict) do
+        utils.assert(data[c] ~= nil,
+            ("upsert on '%s': conflict column '%s' is missing from the data"):format(model.table, c));
+    end
+
     -- write payload (+ timestamps for the INSERT branch).
     local write = {};
     for k, v in pairs(data) do write[k] = v; end
@@ -1288,6 +1297,7 @@ function NormModel:upsert(data, opts)
             for _, c in ipairs(conflict) do
                 state.wheres[#state.wheres + 1] = { column = c, op = "=", value = write[c] };
             end
+            utils.soft_scope(state, model);
             local sel, sparams = sqlmod.select(state, d);
             orm:_trace(sel, sparams);
             orm:_raw_query(sel, sparams, function(serr, rows)

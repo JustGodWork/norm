@@ -1802,6 +1802,25 @@ for _, c in ipairs(fm.calls) do
 end
 check("find_or_create excludes trashed rows",
     lookup2:find("`deleted_at` IS NULL", 1, true) ~= nil, tostring(lookup2));
+print("== Test group 37: upsert needs its conflict columns ==");
+local um = Mock({ dialect = "mysql" });
+local udb = orm.new({ adapter = um, promise = orm.promise.builtin() });
+local U3 = udb:define("uaccounts", {
+    id         = orm.types.id(),
+    account_id = orm.types.string({ length = 32, unique = true }),
+    name       = orm.types.string({ length = 20 }),
+});
+
+check("upsert without the default conflict column raises",
+    select(1, pcall(function() U3:upsert({ name = "Zoe" }); end)) == false);
+check("upsert with an explicit conflict column missing from the data raises",
+    select(1, pcall(function() U3:upsert({ name = "Zoe" }, { conflict = { "account_id" } }); end)) == false);
+
+um.query_result = { { id = 1, account_id = "acc-1", name = "Zoe" } };
+local rec = U3:upsert({ account_id = "acc-1", name = "Zoe" }, { conflict = { "account_id" } }):await();
+check("a valid upsert still reads the row back", rec ~= nil and rec.account_id == "acc-1", tostring(rec));
+check("the read-back filters on the conflict column",
+    last_sql(um):find("WHERE `account_id` = ?", 1, true) ~= nil, last_sql(um));
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
