@@ -1919,6 +1919,37 @@ coroutine.resume(cb);
 resolve2("shared");
 check("first waiter is resumed", a == "shared", tostring(a));
 check("second waiter is resumed", b == "shared", tostring(b));
+print("== Test group 37: failed statements are logged ==");
+local Broken = class.extend("BrokenAdapter", orm.Adapter);
+function Broken:__init(o) orm.Adapter.__init(self, o); end
+function Broken:raw_query(q, p, cb) cb("no such table: ghosts"); end
+function Broken:raw_execute(q, p, cb) cb("no such table: ghosts"); end
+
+local lines = {};
+local bdb = orm.new({
+    adapter = Broken({ dialect = "mysql" }),
+    promise = orm.promise.builtin(),
+    logger = function(level, msg) lines[#lines + 1] = level .. " " .. msg; end,
+});
+local G = bdb:define("ghosts", { id = orm.types.id(), name = orm.types.string({ length = 10 }) });
+
+G:find(1);
+check("a failed SELECT is logged once", #lines == 1 and lines[1]:find("no such table", 1, true) ~= nil,
+    table.concat(lines, " | "));
+check("the log carries the statement", lines[1]:find("SELECT", 1, true) ~= nil, lines[1]);
+check("the log goes through the configured logger", lines[1]:find("ERROR", 1, true) == 1, lines[1]);
+
+lines = {};
+G:query():where("id", 1):delete();
+check("a failed write is logged", #lines == 1 and lines[1]:find("DELETE", 1, true) ~= nil,
+    table.concat(lines, " | "));
+
+lines = {};
+local okm = Mock({ dialect = "mysql" });
+local okdb = orm.new({ adapter = okm, promise = orm.promise.builtin(),
+    logger = function(level, msg) lines[#lines + 1] = msg; end });
+okdb:define("fine", { id = orm.types.id() }):find(1);
+check("a successful statement logs nothing", #lines == 0, table.concat(lines, " | "));
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));

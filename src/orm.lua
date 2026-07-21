@@ -131,11 +131,29 @@ function NormOrm:_trace(query, params)
     self._logger("SQL", query .. suffix);
 end
 
+--- Wrap a data-operation callback so a driver error is always reported through
+--- the configured logger. Without this the only trace of a failed statement is
+--- the rejected promise, which the most common call style (no `:catch`, no
+--- `:await`) discards silently.
+---@private
+---@param query string
+---@param callback function
+---@return function
+function NormOrm:_logged(query, callback)
+    return function(err, ...)
+        if (err ~= nil) then
+            self._logger("ERROR", ("statement failed: %s -- %s"):format(tostring(err), query));
+        end
+        return callback(err, ...);
+    end
+end
+
 --- The single gate every data operation goes through. Runs against the adapter
 --- when ready; otherwise holds the call until `sync()`/`migrate()` flushes it.
 --- (sync/migrate themselves bypass this — they're what makes the ORM ready.)
 ---@private
 function NormOrm:_raw_query(query, params, callback)
+    callback = self:_logged(query, callback);
     if (self._tx ~= nil) then return self._tx.query(query, params, callback); end
     if (self._ready) then return self.adapter:raw_query(query, params, callback); end
     if (#self._queue == 0) then
@@ -146,6 +164,7 @@ end
 
 ---@private
 function NormOrm:_raw_execute(query, params, callback)
+    callback = self:_logged(query, callback);
     if (self._tx ~= nil) then return self._tx.execute(query, params, callback); end
     if (self._ready) then return self.adapter:raw_execute(query, params, callback); end
     if (#self._queue == 0) then
