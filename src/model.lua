@@ -1135,6 +1135,7 @@ function NormModel:_find_by_attrs(attributes, cb)
     for _, k in ipairs(utils.sorted_keys(attributes)) do
         state.wheres[#state.wheres + 1] = { column = k, op = "=", value = attributes[k] };
     end
+    utils.soft_scope(state, self); -- a trashed row must not satisfy a find_or_* lookup
     local statement, params = sqlmod.select(state, d);
     orm:_trace(statement, params);
     orm:_raw_query(statement, params, function(err, rows)
