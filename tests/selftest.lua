@@ -2107,6 +2107,35 @@ check("two parents on the same key get their own table",
     not rawequal(tenants[1].items, tenants[2].items));
 table.insert(tenants[1].items, "x");
 check("appending to one does not affect the other", #tenants[2].items == 1, tostring(#tenants[2].items));
+end do
+print("== Test group 48: referential action whitelist ==");
+local function fk_schema(action)
+    return {
+        id      = orm.types.id(),
+        user_id = orm.types.integer(),
+        owner   = orm.types.belongsTo("fkusers", { key = "user_id", onDelete = action }),
+    };
+end
+local function sync_with(action)
+    local m = Mock({ dialect = "mysql" });
+    local d = orm.new({ adapter = m, promise = orm.promise.builtin(), foreignKeys = true });
+    d:define("fkusers", { id = orm.types.id() });
+    d:define("fkposts", fk_schema(action));
+    d:sync();
+    for _, c in ipairs(m.calls) do
+        if (c.sql:find("`fkposts`", 1, true)) then return c.sql; end
+    end
+    return "";
+end
+
+check("an injected referential action is rejected",
+    select(1, pcall(sync_with, "cascade, add x int")) == false);
+check("an unknown action is rejected", select(1, pcall(sync_with, "DROP TABLE")) == false);
+check("CASCADE is emitted", sync_with("CASCADE"):find("ON DELETE CASCADE", 1, true) ~= nil);
+check("lowercase cascade is normalised", sync_with("cascade"):find("ON DELETE CASCADE", 1, true) ~= nil);
+check("SET NULL is accepted", sync_with("SET NULL"):find("ON DELETE SET NULL", 1, true) ~= nil);
+check("set_null is normalised", sync_with("set_null"):find("ON DELETE SET NULL", 1, true) ~= nil);
+check("NO ACTION is accepted", sync_with("no action"):find("ON DELETE NO ACTION", 1, true) ~= nil);
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));
