@@ -354,6 +354,11 @@ local function compile_condition(cond, d, params)
     local op = safe_op(cond.op);
 
     if (cond.value == nil) then
+        -- Only the equality operators have a meaningful NULL form. Letting a nil
+        -- through here would compile where_in(col, nil) and where_not_in(col, nil),
+        -- which mean opposite things, to the very same `col IS NULL`.
+        utils.assert(op == "=" or op == "!=" or op == "<>" or op == "NOT",
+            ("%s on column '%s' needs a value (got nil)"):format(op, tostring(cond.column)));
         local negated = (op == "!=" or op == "<>" or op == "NOT");
         return col .. (negated and " IS NOT NULL" or " IS NULL");
     end

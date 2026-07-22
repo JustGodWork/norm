@@ -68,6 +68,48 @@ function utils.soft_scope(state, model)
     end
 end
 
+--- Call the driver under a pcall while guaranteeing `callback` runs exactly once
+--- (the contract every NormAdapter callback relies on).
+---
+--- `fn` receives a guarded `finish(err, result)`. A driver that invokes its
+--- callback synchronously runs it inside this pcall, so an error raised by the
+--- continuation would come back as `ok == false` and, without the guard, be
+--- reported as a second call. Worse, `error(nil)` yields `perr == nil`, so that
+--- second call would take the success branch and re-enter the caller's state
+--- machine. Such an error belongs to the continuation, not to the query, so it
+--- is logged rather than turned into a query failure.
+---@param callback fun(err: any, result?: any)
+---@param fn fun(finish: fun(err: any, result?: any))
+function utils.protected(callback, fn)
+    local done = false;
+    local function finish(err, result)
+        if (done) then return; end
+        done = true;
+        return callback(err, result);
+    end
+    local ok, perr = pcall(fn, finish);
+    if (ok) then return; end
+    if (done) then
+        utils.log("ERROR", "callback raised after the driver returned: %s", tostring(perr));
+    else
+        finish(perr);
+    end
+end
+
+--- Whether a driver error means "this index already exists". On dialects without
+--- `CREATE INDEX IF NOT EXISTS`, that is the expected outcome of running `sync()`
+--- a second time and is safe to skip. Any OTHER index failure (unknown column,
+--- duplicate values on a UNIQUE index) is a real schema problem and must not be
+--- swallowed: it would silently drop the uniqueness guarantee that `upsert` and
+--- `find_or_create` rely on.
+---@param err any
+---@return boolean
+function utils.is_duplicate_index(err)
+    local msg = tostring(err):lower();
+    return msg:find("duplicate key name", 1, true) ~= nil
+        or msg:find("already exists", 1, true) ~= nil;
+end
+
 --- Sorted array of a dictionary's keys (stable SQL output).
 ---@param dict table<string, any>
 ---@return string[]

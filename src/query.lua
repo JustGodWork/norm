@@ -559,6 +559,10 @@ function NormQueryBuilder:having(expr, op, ...)
     if (select("#", ...) == 0) then
         value = op;
         op = "=";
+        -- HAVING always binds its value, so a nil here would emit a placeholder
+        -- with no parameter and shift every later binding by one.
+        utils.assert(value ~= nil,
+            ("having('%s', nil): a nil value cannot be bound"):format(tostring(expr)));
     else
         utils.assert(value ~= nil,
             ("having('%s', '%s', nil): a nil value cannot be bound"):format(tostring(expr), tostring(op)));

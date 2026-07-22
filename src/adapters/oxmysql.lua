@@ -93,24 +93,22 @@ end
 function NormOxMySQLAdapter:raw_query(query, params, callback)
     -- oxmysql raises errors server-side rather than passing them to the callback,
     -- so a synchronous raise is the only failure Norm can observe here.
-    local ok, err = pcall(function()
+    utils.protected(callback, function(finish)
         self.ox:query(query, params, function(rows)
-            callback(nil, rows or {});
+            finish(nil, rows or {});
         end);
     end);
-    if (not ok) then callback(err); end
 end
 
 ---@param query string
 ---@param params any[]
 ---@param callback NormExecuteCallback
 function NormOxMySQLAdapter:raw_execute(query, params, callback)
-    local ok, err = pcall(function()
+    utils.protected(callback, function(finish)
         self.ox:execute(query, params, function(result)
-            callback(nil, normalize(result));
+            finish(nil, normalize(result));
         end);
     end);
-    if (not ok) then callback(err); end
 end
 
 --- Run an interactive transaction through the `startTransaction` export (the same
