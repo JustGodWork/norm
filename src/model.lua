@@ -1297,7 +1297,10 @@ function NormModel:upsert(data, opts)
             for _, c in ipairs(conflict) do
                 state.wheres[#state.wheres + 1] = { column = c, op = "=", value = write[c] };
             end
-            utils.soft_scope(state, model);
+            -- No soft-delete scope here: the upsert itself is not scoped, so the
+            -- engine happily updates a trashed row through ON DUPLICATE KEY /
+            -- ON CONFLICT. Filtering the read-back would resolve nil for a write
+            -- that did happen, and a caller retrying on nil would loop.
             local sel, sparams = sqlmod.select(state, d);
             orm:_trace(sel, sparams);
             orm:_raw_query(sel, sparams, function(serr, rows)
@@ -1340,15 +1343,17 @@ function NormModel:sync()
             local statement = (type(entry) == "table") and entry.sql or entry;
             local optional = (type(entry) == "table") and entry.optional;
             orm:_trace(statement, {});
-            orm.adapter:raw_execute(statement, {}, function(err)
+            utils.protected(function(err)
                 if (err ~= nil) then
-                    if (not optional) then
+                    if (not (optional and utils.is_duplicate_index(err))) then
                         orm:_fail_queue(err);
                         return reject(err);
                     end
-                    orm._logger("DB", ("index statement skipped: %s"):format(tostring(err)));
+                    orm._logger("DB", ("index already present, skipped: %s"):format(tostring(err)));
                 end
                 step();
+            end, function(finish)
+                orm.adapter:raw_execute(statement, {}, finish);
             end);
         end
         step();

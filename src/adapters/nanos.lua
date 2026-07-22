@@ -205,13 +205,12 @@ local function do_select(db, query, params, callback)
         -- Nanos signature: SelectAsync(query, callback?, parameters...) -- params are VARARGS.
         -- The callback may carry a driver error as a second argument; passing nil as
         -- the error unconditionally would report a failed query as an empty result set.
-        local ok, err = pcall(function()
+        utils.protected(callback, function(finish)
             db:SelectAsync(query, function(rows, cb_err)
-                if (cb_err ~= nil) then return callback(cb_err); end
-                callback(nil, rows or {});
+                if (cb_err ~= nil) then return finish(cb_err); end
+                finish(nil, rows or {});
             end, table.unpack(params));
         end);
-        if (not ok) then callback(err); end
     else
         local ok, rows = pcall(function() return db:Select(query, table.unpack(params)); end);
         if (ok) then callback(nil, rows or {}); else callback(rows); end
@@ -228,13 +227,12 @@ local function do_execute(db, query, params, callback)
     query = to_nanos_placeholders(query);
     if (type(db.ExecuteAsync) == "function") then
         -- Nanos signature: ExecuteAsync(query, callback?, parameters...) -- params are VARARGS.
-        local ok, err = pcall(function()
+        utils.protected(callback, function(finish)
             db:ExecuteAsync(query, function(affected, cb_err)
-                if (cb_err ~= nil) then return callback(cb_err); end
-                callback(nil, affected);
+                if (cb_err ~= nil) then return finish(cb_err); end
+                finish(nil, affected);
             end, table.unpack(params));
         end);
-        if (not ok) then callback(err); end
     else
         local ok, affected = pcall(function() return db:Execute(query, table.unpack(params)); end);
         if (ok) then callback(nil, affected); else callback(affected); end
@@ -271,7 +269,7 @@ function NormNanosAdapter:raw_execute(query, params, callback)
             return callback(nil, { affectedRows = affected });
         end
         do_select(db, last_id_sql, {}, function(select_err, rows)
-            local id = (not select_err) and rows[1] and rows[1].id or nil;
+            local id = (not select_err) and rows and rows[1] and rows[1].id or nil;
             callback(nil, { affectedRows = affected, insertId = id });
         end);
     end);

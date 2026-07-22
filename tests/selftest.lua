@@ -1998,6 +1998,115 @@ check("an explicit dialect bypasses the engine mapping",
 
 _ENV.DatabaseEngine = prev_engines;
 _ENV.Database = prev_database;
+end do
+print("== Test group 47: pre-production audit follow-up ==");
+
+-- a driver calling back synchronously must not get the callback invoked twice
+-- when the continuation raises
+local sync_db = {
+    SelectAsync  = function(_, q, cb) cb({ { id = 1 } }); end,
+    ExecuteAsync = function(_, q, cb) cb(1); end,
+};
+local sa = orm.adapters.nanos.class({ database = sync_db, dialect = "sqlite" });
+local hits = 0;
+sa:raw_execute("INSERT INTO t VALUES (1)", {}, function()
+    hits = hits + 1;
+    if (hits == 1) then error("raised by the continuation"); end
+end);
+check("callback runs once when the continuation raises", hits == 1, tostring(hits));
+
+local hits2 = 0;
+orm.adapters.nanos.class({ database = sync_db, dialect = "sqlite" })
+    :raw_query("SELECT 1", {}, function()
+        hits2 = hits2 + 1;
+        if (hits2 == 1) then error(nil); end
+    end);
+check("callback runs once on error(nil) too", hits2 == 1, tostring(hits2));
+
+-- upsert must read back the row it actually wrote, trashed or not
+local um2 = Mock({ dialect = "mysql" });
+local udb2 = orm.new({ adapter = um2, promise = orm.promise.builtin() });
+local SU = udb2:define("supserts", { id = orm.types.id(), email = orm.types.string({ length = 40 }) },
+    { soft_deletes = true });
+um2.query_result = { { id = 3, email = "a@b.c", deleted_at = "2020-01-01 00:00:00" } };
+local revived = SU:upsert({ email = "a@b.c" }, { conflict = { "email" } }):await();
+check("upsert resolves the written row on a soft-delete model", revived ~= nil, tostring(revived));
+check("upsert read-back is not soft-scoped",
+    last_sql(um2):find("deleted_at", 1, true) == nil, last_sql(um2));
+
+-- sync must settle the queue even when the adapter raises instead of calling back
+local Raiser = class.extend("RaiserAdapter", orm.Adapter);
+function Raiser:__init(o) orm.Adapter.__init(self, o); end
+function Raiser:raw_query(q, p, cb) cb(nil, {}); end
+function Raiser:raw_execute(q, p, cb) error("driver exploded"); end
+local rdb = orm.new({ adapter = Raiser({ dialect = "mysql" }), promise = orm.promise.builtin(),
+    queue_until_ready = true, logger = function() end });
+local RM = rdb:define("rq", { id = orm.types.id(), v = orm.types.integer() });
+local qerr2 = nil;
+RM:find(1):next(function() end, function(e) qerr2 = e; end);
+local serr2 = nil;
+rdb:sync():next(function() end, function(e) serr2 = e; end);
+check("sync rejects when the adapter raises", serr2 ~= nil, tostring(serr2));
+check("the queued operation is settled too", qerr2 ~= nil, tostring(qerr2));
+
+-- only a duplicate-index error may be skipped
+local IdxAdapter = class.extend("IdxAdapter", orm.Adapter);
+function IdxAdapter:__init(o) orm.Adapter.__init(self, o); self.index_error = o.index_error; end
+function IdxAdapter:raw_query(q, p, cb) cb(nil, {}); end
+function IdxAdapter:raw_execute(q, p, cb)
+    if (q:find("CREATE INDEX", 1, true)) then return cb(self.index_error); end
+    cb(nil, { affectedRows = 0 });
+end
+local function index_adapter(message)
+    return IdxAdapter({ dialect = "mysql", index_error = message });
+end
+local dup_ok, dup_err = nil, nil;
+local ddb2 = orm.new({ adapter = index_adapter("Duplicate key name 'idx_x'"),
+    promise = orm.promise.builtin(), logger = function() end });
+ddb2:define("ix", { id = orm.types.id(), c = orm.types.string({ length = 8, index = true }) });
+ddb2:sync():next(function(v) dup_ok = v; end, function(e) dup_err = e; end);
+check("a duplicate index does not fail sync", dup_ok == true and dup_err == nil, tostring(dup_err));
+
+local bad_ok, bad_err = nil, nil;
+local bdb2 = orm.new({ adapter = index_adapter("Error 1072: key column 'nope' doesn't exist"),
+    promise = orm.promise.builtin(), logger = function() end });
+bdb2:define("ix2", { id = orm.types.id(), c = orm.types.string({ length = 8, index = true }) });
+bdb2:sync():next(function(v) bad_ok = v; end, function(e) bad_err = e; end);
+check("any other index failure still fails sync", bad_err ~= nil and bad_ok == nil, tostring(bad_err));
+
+-- nil values that used to slip through
+local nm2 = Mock({ dialect = "mysql" });
+local ndb2 = orm.new({ adapter = nm2, promise = orm.promise.builtin() });
+local NN = ndb2:define("nrows", { id = orm.types.id(), role = orm.types.string({ length = 10 }),
+    coins = orm.types.integer() });
+check("having with a nil value in the two-arg form raises",
+    select(1, pcall(function() NN:query():select_raw("COUNT(*) AS n"):having("COUNT(*)", nil):rows(); end)) == false);
+check("where_in with a nil list raises",
+    select(1, pcall(function() NN:query():where_in("role", nil):all(); end)) == false);
+check("where_not_in with a nil list raises",
+    select(1, pcall(function() NN:query():where_not_in("role", nil):all(); end)) == false);
+check("where_like with a nil pattern raises",
+    select(1, pcall(function() NN:query():where_like("role", nil):all(); end)) == false);
+NN:query():where_null("role"):all();
+check("where_null still compiles to IS NULL",
+    last_sql(nm2):find("`role` IS NULL", 1, true) ~= nil, last_sql(nm2));
+NN:query():where_not_null("role"):all();
+check("where_not_null still compiles to IS NOT NULL",
+    last_sql(nm2):find("`role` IS NOT NULL", 1, true) ~= nil, last_sql(nm2));
+
+-- parents sharing a source key must not share their collection
+local sm3 = Routed({ dialect = "mysql" });
+local sdb3 = orm.new({ adapter = sm3, promise = orm.promise.builtin() });
+local ST = sdb3:define("stenants", { id = orm.types.id(), gid = orm.types.integer(),
+    items = orm.types.hasMany("sitems", { key = "owner", localKey = "gid" }) });
+sdb3:define("sitems", { id = orm.types.id(), owner = orm.types.integer() });
+sm3.rows.stenants = { { id = 1, gid = 7 }, { id = 2, gid = 7 } };
+sm3.rows.sitems = { { id = 100, owner = 7 } };
+local tenants = ST:query():include("items"):all():await();
+check("two parents on the same key get their own table",
+    not rawequal(tenants[1].items, tenants[2].items));
+table.insert(tenants[1].items, "x");
+check("appending to one does not affect the other", #tenants[2].items == 1, tostring(#tenants[2].items));
 end -- close the last group's scope
 
 print(("\n== RESULT: %d passed, %d failed =="):format(passed, failed));

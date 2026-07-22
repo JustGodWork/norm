@@ -507,7 +507,16 @@ function NormOrm:_load_include_batch(model, mains, name, spec, cb)
         end
         for i = 1, #mains do
             local g = groups[mains[i][source_key]] or {};
-            if (spec and spec.limit and rel.kind == "has_many") then g = slice(g, spec.offset, spec.limit); end
+            if (spec and spec.limit and rel.kind == "has_many") then
+                g = slice(g, spec.offset, spec.limit);
+            else
+                -- Copy: two parents sharing a source key (legal with a non-unique
+                -- localKey) would otherwise share one table, so appending to one
+                -- parent's collection would show up on the other.
+                local copy = {};
+                for j = 1, #g do copy[j] = g[j]; end
+                g = copy;
+            end
             if (rel.kind == "has_one") then
                 mains[i][name] = g[1];
             else
@@ -766,17 +775,19 @@ function NormOrm:sync()
             local statement = (type(entry) == "table") and entry.sql or entry;
             local optional = (type(entry) == "table") and entry.optional;
             self:_trace(statement, {});
-            self.adapter:raw_execute(statement, {}, function(err)
+            -- protected: an adapter that raises instead of calling back would
+            -- otherwise skip _fail_queue and strand every queued operation.
+            utils.protected(function(err)
                 if (err ~= nil) then
-                    -- Without IF NOT EXISTS support, re-creating an existing index is
-                    -- the expected outcome of a second sync(), not a schema failure.
-                    if (not optional) then
+                    if (not (optional and utils.is_duplicate_index(err))) then
                         self:_fail_queue(err);
                         return reject(err);
                     end
-                    self._logger("DB", ("index statement skipped: %s"):format(tostring(err)));
+                    self._logger("DB", ("index already present, skipped: %s"):format(tostring(err)));
                 end
                 step();
+            end, function(finish)
+                self.adapter:raw_execute(statement, {}, finish);
             end);
         end
         step();
