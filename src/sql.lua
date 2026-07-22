@@ -190,11 +190,34 @@ end
 ---@param fk NormForeignKey
 ---@param d NormDialect
 ---@return string
+--- Referential actions accepted in a FOREIGN KEY clause. Like operators, they are
+--- concatenated verbatim into the DDL, so anything outside this set is an
+--- injection point on a schema built from configuration.
+local REFERENTIAL_ACTIONS = {
+    ["CASCADE"] = true, ["RESTRICT"] = true, ["NO ACTION"] = true,
+    ["SET NULL"] = true, ["SET DEFAULT"] = true,
+};
+
+--- Normalise and validate a referential action (`onDelete` / `onUpdate`).
+---@param action string
+---@param clause string Clause name, for the error message.
+---@return string
+local function safe_action(action, clause)
+    utils.assert(type(action) == "string", ("%s must be a string"):format(clause));
+    -- accept "set null", "SET  NULL" and "set_null" alike
+    local upper = action:upper():gsub("[_%s]+", " "):gsub("^ ", ""):gsub(" $", "");
+    utils.assert(REFERENTIAL_ACTIONS[upper],
+        ("unsupported %s action '%s' (expected CASCADE, RESTRICT, NO ACTION, SET NULL or SET DEFAULT)")
+        :format(clause, action));
+    return upper;
+end
+sql.safe_action = safe_action;
+
 local function foreign_key_def(fk, d)
     local frag = ("FOREIGN KEY (%s) REFERENCES %s (%s)"):format(
         d.quote(fk.column), d.quote(fk.ref_table), d.quote(fk.ref_column));
-    if (fk.on_delete) then frag = frag .. " ON DELETE " .. tostring(fk.on_delete):upper(); end
-    if (fk.on_update) then frag = frag .. " ON UPDATE " .. tostring(fk.on_update):upper(); end
+    if (fk.on_delete) then frag = frag .. " ON DELETE " .. safe_action(fk.on_delete, "onDelete"); end
+    if (fk.on_update) then frag = frag .. " ON UPDATE " .. safe_action(fk.on_update, "onUpdate"); end
     return frag;
 end
 sql.foreign_key_def = foreign_key_def;
