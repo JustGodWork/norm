@@ -1,41 +1,30 @@
 name: Build dist
 
-# Triggers on direct push to master AND on a PR merged into master.
-# (Merging a PR into master is itself a push to master, so the push
-#  trigger already covers it; the pull_request block is kept so the
-#  build also shows up as a check on the PR itself.)
+# Publishes dist/ on master. Nothing else triggers it: merging a PR into
+# master IS a push to master, so a pull_request trigger would only duplicate
+# the run. Checks on open PRs live in test.yml, which publishes nothing.
 on:
   push:
     branches: [master]
-  pull_request:
-    branches: [master]
-    types: [closed]
 
 # Allow the workflow to commit the built dist/ back to the repo.
 permissions:
   contents: write
 
-# Prevent two concurrent builds on the same ref (e.g. fast push + merge).
+# One publishing run at a time. The group is a constant, not github.ref, so
+# concurrent runs really do collapse.
 concurrency:
-  group: build-dist-${{ github.ref }}
-  cancel-in-progress: true
+  group: build-dist
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
-    # Run only when ALL of the following hold:
-    #   - the event is a push to master, OR a PR that was actually merged
-    #     (not just closed without merging);
-    #   - the triggering commit was NOT authored by the bot itself.
-    # The author check is the primary guard against the bot re-triggering
-    # itself; the "[skip ci]" in the commit message is a second safety net.
-    if: >
-      (
-        github.event_name == 'push' ||
-        (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
-      ) &&
-      github.actor != 'github-actions[bot]'
+    # The bot's own push carries "[skip ci]", which GitHub honours by not
+    # creating a workflow run at all: that is what breaks the loop. An actor
+    # check would not, because actions/checkout persists SUBMODULES_PAT and the
+    # push is therefore attributed to the PAT owner, never to the bot.
 
     steps:
       # 1. Checkout WITH submodules (the build needs them).
@@ -93,4 +82,7 @@ jobs:
           fi
 
           git commit -m "build(dist): rebuild distribution files [skip ci]"
-          git push
+
+          # Explicit refspec: works whether or not the checkout left us on a
+          # named branch, instead of failing with "not currently on a branch".
+          git push origin HEAD:master
